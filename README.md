@@ -112,6 +112,11 @@ Exit codes follow the Terraform convention agents already know:
 State is a deterministic, git-diffable `state.json` in the working directory
 (flock-protected, `state.json.backup` written before every mutation).
 
+Provider responses are stored verbatim in `state.json` and `plan.json`, so
+values a provider *derives* from env-sourced secrets can end up recorded
+there too — treat both files as sensitive (redaction is a recorded post-MVP
+item, not yet implemented).
+
 ## MCP server
 
 `tchori mcp` serves MCP over stdio from the directory holding your config and
@@ -125,7 +130,10 @@ state. Exactly four tools:
 | `provider_schema(name)` | a provider's resource-type schemas |
 
 There is **no apply tool**: applying stays in the CLI/CI, so "merge = apply"
-governance is encoded in the binary itself. With Claude Code:
+governance is encoded in the binary itself. `tchori mcp` does not currently
+honor `--plugin-dir`: providers it serves must already be installed to the
+registry cache (`tchori providers install`), not a locally built binary.
+With Claude Code:
 
 ```sh
 claude mcp add tchori -- tchori mcp
