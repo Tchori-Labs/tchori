@@ -1,0 +1,4 @@
+# tchori build artifacts
+/tchori
+/dist/
+*.test
