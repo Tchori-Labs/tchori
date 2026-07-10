@@ -238,6 +238,103 @@ func TestApplyPartialFailure(t *testing.T) {
 	}
 }
 
+// TestApplyRefOrderBeatsAddressOrder guards the fix for the bug where Apply
+// executed changes in pl.Changes' document order (alphabetical by address,
+// per plan.finalize) instead of dependency order. a_first sorts before
+// z_second, but a_first's tags reference z_second's id, so a_first depends
+// on z_second. If Apply still executed in address order, a_first would run
+// first and resolveRef would fail with "reference to missing resource"
+// because z_second has no state yet.
+func TestApplyRefOrderBeatsAddressOrder(t *testing.T) {
+	aFirst := thing("a_first", "a_first")
+	aFirst.Config["tags"] = map[string]any{"ref": "${tchoritest_thing.z_second.id}"}
+	h := newHarness(t, map[string]*config.Resource{
+		"tchoritest_thing.a_first":  aFirst,
+		"tchoritest_thing.z_second": thing("z_second", "z_second"),
+	})
+	ctx := context.Background()
+
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	if len(pl.Changes) != 2 {
+		t.Fatalf("plan has %d changes, want 2: %+v", len(pl.Changes), pl.Changes)
+	}
+	// The plan document itself is still address-sorted (a_first, z_second):
+	// it carries no dependency information. Apply must derive execution
+	// order from cfg.Order() instead of trusting this order.
+	if pl.Changes[0].Address != "tchoritest_thing.a_first" || pl.Changes[1].Address != "tchoritest_thing.z_second" {
+		t.Fatalf("plan changes not in address order: %s, %s", pl.Changes[0].Address, pl.Changes[1].Address)
+	}
+
+	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("Apply: %+v", ds)
+	}
+
+	zAttrs := stateAttrs(t, h.statePath, "tchoritest_thing.z_second")
+	if got := zAttrs["id"]; got != "id-z_second" {
+		t.Fatalf(`z_second id = %v, want "id-z_second"`, got)
+	}
+
+	aAttrs := stateAttrs(t, h.statePath, "tchoritest_thing.a_first")
+	tags, ok := aAttrs["tags"].(map[string]any)
+	if !ok {
+		t.Fatalf("a_first tags = %#v, want a map", aAttrs["tags"])
+	}
+	if got := tags["ref"]; got != "id-z_second" {
+		t.Errorf(`a_first tags["ref"] = %v, want "id-z_second" (z_second's applied id, proving z_second applied first)`, got)
+	}
+
+	saved := loadState(t, h.statePath)
+	if len(saved.Resources) != 2 {
+		t.Errorf("state has %d resources, want 2", len(saved.Resources))
+	}
+}
+
+// TestApplyReplace closes a coverage gap: no existing test drove the
+// destroy-then-create "replace" branch of applyChange. It seeds state via a
+// create apply, changes replace_me (which the fake provider's
+// PlanResourceChange marks as forcing replacement), plans (expecting a
+// "replace" action), applies, and asserts the resource was destroyed and
+// recreated: a fresh id (still deterministically "id-<name>"), the state
+// serial advanced by two saves (destroy leg + create leg), and exactly one
+// resource left in state.
+func TestApplyReplace(t *testing.T) {
+	h := newHarness(t, map[string]*config.Resource{
+		"tchoritest_thing.foo": thing("foo", "foo"),
+	})
+	ctx := context.Background()
+
+	st := loadState(t, h.statePath) // empty: serial 0
+	if ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("create Apply: %+v", ds)
+	}
+
+	// Reload (as the CLI would) so the replace plan captures serial 1, then
+	// change replace_me to force a replace.
+	st2 := loadState(t, h.statePath)
+	h.cfg.Resources["tchoritest_thing.foo"].Config["replace_me"] = "new-value"
+	pl := h.plan(t, st2, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "replace" {
+		t.Fatalf("plan = %+v, want exactly one replace change", pl.Changes)
+	}
+
+	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st2, h.statePath); ds.HasErrors() {
+		t.Fatalf("replace Apply: %+v", ds)
+	}
+
+	saved := loadState(t, h.statePath)
+	if len(saved.Resources) != 1 {
+		t.Fatalf("state has %d resources after replace, want 1", len(saved.Resources))
+	}
+	attrs := stateAttrs(t, h.statePath, "tchoritest_thing.foo")
+	if got := attrs["id"]; got != "id-foo" {
+		t.Errorf(`id after replace = %v, want "id-foo" (destroy-then-create still yields the deterministic fake id)`, got)
+	}
+	if saved.Serial != 3 {
+		t.Errorf("state serial = %d, want 3 (create save + destroy save + create save)", saved.Serial)
+	}
+}
+
 func TestApplyDestroy(t *testing.T) {
 	h := newHarness(t, map[string]*config.Resource{
 		"tchoritest_thing.foo": thing("foo", "foo"),
