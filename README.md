@@ -111,6 +111,7 @@ Exit codes follow the Terraform convention agents already know:
 
 State is a deterministic, git-diffable `state.json` in the working directory
 (flock-protected, `state.json.backup` written before every mutation).
+Format reference: [docs/formats.md](docs/formats.md).
 
 Provider responses are stored verbatim in `state.json` and `plan.json`, so
 values a provider *derives* from env-sourced secrets can end up recorded
