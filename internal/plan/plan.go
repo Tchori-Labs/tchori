@@ -13,10 +13,10 @@ const FormatVersion = "1.0"
 
 type Change struct {
 	Address         string          `json:"address"`
-	Action          string          `json:"action"` // "create","update","delete","replace","no-op"
-	Before          json.RawMessage `json:"before"` // JSON null for create
-	After           json.RawMessage `json:"after"`  // unknowns rendered as JSON null; JSON null for delete
-	UnknownAfter    []string        `json:"unknown_after,omitempty"`    // dotted attr paths
+	Action          string          `json:"action"`                  // "create","update","delete","replace","no-op"
+	Before          json.RawMessage `json:"before"`                  // JSON null for create
+	After           json.RawMessage `json:"after"`                   // unknowns rendered as JSON null; JSON null for delete
+	UnknownAfter    []string        `json:"unknown_after,omitempty"` // dotted attr paths
 	RequiresReplace []string        `json:"requires_replace,omitempty"`
 	PlannedRaw      []byte          `json:"planned_raw,omitempty"` // msgpack of planned state incl. unknowns
 	Private         []byte          `json:"private,omitempty"`
@@ -53,12 +53,12 @@ func Write(pl *Plan, path string) error {
 		return err
 	}
 	b = append(b, '\n')
-	return os.WriteFile(path, b, 0o644)
+	return os.WriteFile(path, b, 0o600)
 }
 
 // Read loads a plan.json written by Write, rejecting unknown format versions.
 func Read(path string) (*Plan, error) {
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed plan.json location), not attacker-controlled
 	if err != nil {
 		return nil, err
 	}
