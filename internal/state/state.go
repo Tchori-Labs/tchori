@@ -38,7 +38,11 @@ type State struct {
 }
 
 // Load returns an empty state (FormatVersion "1.0", Serial 0, empty map)
-// when path does not exist.
+// when path does not exist. When path does exist, its format_version must be
+// "1.0" (matching plan.Read's rejection of unsupported plan format
+// versions) — this includes a missing/empty format_version, since a state
+// file we ourselves wrote always carries "1.0" (see Save); anything else is
+// a state file this engine did not write and should not guess about.
 func Load(path string) (*State, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
 	if err != nil {
@@ -54,6 +58,9 @@ func Load(path string) (*State, error) {
 	var s State
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("parse state %s: %w", path, err)
+	}
+	if s.FormatVersion != formatVersion {
+		return nil, fmt.Errorf("unsupported state format_version %q (want %q)", s.FormatVersion, formatVersion)
 	}
 	if s.Resources == nil {
 		s.Resources = map[string]*ResourceState{}

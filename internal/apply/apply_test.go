@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/zclconf/go-cty/cty"
+	ctymsgpack "github.com/zclconf/go-cty/cty/msgpack"
 
 	"github.com/tchori-labs/tchori/internal/apply"
 	"github.com/tchori-labs/tchori/internal/config"
@@ -407,5 +408,102 @@ func TestApplyDestroy(t *testing.T) {
 	}
 	if saved.Serial != 2 {
 		t.Errorf("state serial = %d, want 2 (create save + destroy save)", saved.Serial)
+	}
+}
+
+// TestApplyCreateIgnoresStalePriorState guards the fix for the bug where
+// createOrUpdate always decoded "prior" from whatever state.json happened to
+// hold for the address, even when ch.Action == "create". A plan's "create"
+// action is only produced when the planner considered there to be no live
+// prior object (see plan.Planner.Plan / classify) — but refresh mutates only
+// the planner's in-memory state.State, and `plan` never re-saves it, so a
+// resource that vanished out of band and was detected during a --refresh
+// plan run leaves a stale, non-null entry sitting in state.json for a
+// separate `apply` invocation to load. Before the fix, that stale entry
+// still got decoded and handed to the provider as "prior" (and, if its
+// shape no longer matches the current schema, decoding it can itself fail)
+// even though the plan document says "create". This test manufactures
+// exactly that situation by hand (the fake provider's ReadResource always
+// echoes state back, so it can never itself surface an out-of-band
+// deletion): state.json is seeded with an entry for the address whose
+// "tags" attribute is a JSON string rather than the map the schema
+// declares — a stand-in for "state we can no longer make sense of" — paired
+// with a genuine create-shaped plan.Change (built via a real, prior-null
+// PlanResourceChange call, so PlannedRaw carries unknown id/echo exactly as
+// a real create would). Pre-fix, applyChange's unconditional decode of that
+// stale entry errors out ("corrupt state attributes") before the create
+// ever reaches the provider — permanent non-convergence, as described in
+// the finding. Post-fix, ch.Action == "create" skips the decode entirely
+// (cty.NullVal(ty) instead), so the create proceeds normally: the provider
+// mints a fresh id, observable in the saved state.
+func TestApplyCreateIgnoresStalePriorState(t *testing.T) {
+	h := newHarness(t, map[string]*config.Resource{
+		"tchoritest_thing.foo": thing("foo", "foo"),
+	})
+	ctx := context.Background()
+	addr := "tchoritest_thing.foo"
+	ty := h.schemas["tchoritest"].ResourceTypes["tchoritest_thing"].Block.ImpliedType()
+
+	// A create-shaped planned value: the same RPC call the planner itself
+	// would make for a resource whose prior is null.
+	proposed, cds := provider.Compose(h.cfg.Resources[addr].Config, ty, false, nil)
+	if cds.HasErrors() {
+		t.Fatalf("Compose: %+v", cds)
+	}
+	pc, pds := h.providers["tchoritest"].PlanResource(ctx, "tchoritest_thing", cty.NullVal(ty), proposed, proposed, nil)
+	if pds.HasErrors() {
+		t.Fatalf("PlanResource: %+v", pds)
+	}
+	raw, err := ctymsgpack.Marshal(pc.State, ty)
+	if err != nil {
+		t.Fatalf("marshal planned: %v", err)
+	}
+
+	pl := &plan.Plan{
+		FormatVersion: "1.0",
+		EngineVersion: "0.1.0-dev",
+		StateSerial:   0,
+		Changes: []*plan.Change{{
+			Address:    addr,
+			Action:     "create",
+			Before:     json.RawMessage("null"),
+			PlannedRaw: raw,
+			Private:    pc.Private,
+		}},
+		Summary: plan.Summary{Create: 1},
+	}
+
+	// A stale state entry for the same address, whose "tags" attribute no
+	// longer matches the schema's map type — stands in for state the
+	// engine can no longer make sense of, e.g. after out-of-band deletion
+	// and drift. A conforming-but-stale entry (matching id/name/echo, just
+	// out of date) would decode without error and — since this fake
+	// provider's ApplyResourceChange ignores PriorState entirely and
+	// derives new state solely from planned's already-unknown id/echo —
+	// would not actually distinguish the buggy and fixed code paths; this
+	// shape does, by making the pre-fix unconditional decode itself fail.
+	st := &state.State{
+		FormatVersion: "1.0",
+		Serial:        0,
+		Resources: map[string]*state.ResourceState{
+			addr: {
+				Type:       "tchoritest_thing",
+				Provider:   "tchoritest",
+				Attributes: json.RawMessage(`{"echo":"stale","id":"stale-id","name":"stale","replace_me":null,"tags":"not-a-map"}`),
+			},
+		},
+	}
+
+	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if ds.HasErrors() {
+		t.Fatalf("Apply: %+v", ds)
+	}
+
+	attrs := stateAttrs(t, h.statePath, addr)
+	if got := attrs["id"]; got != "id-foo" {
+		t.Errorf(`saved id = %v, want "id-foo" (provider-generated create id, not anything derived from the stale prior)`, got)
+	}
+	if got := attrs["echo"]; got != "foo" {
+		t.Errorf(`saved echo = %v, want "foo"`, got)
 	}
 }
