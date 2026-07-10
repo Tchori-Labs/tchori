@@ -202,16 +202,31 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	}
 	ty := ps.ResourceTypes[typeName].Block.ImpliedType()
 
-	// Prior value and private bytes come from state (null/nil if absent).
+	// Prior value and private bytes come from state (null/nil if absent) —
+	// except for "create", where the plan document is trusted over state
+	// instead. A "create" action means the planner determined there is no
+	// live prior object (classify: prior.IsNull() => "create"); state.json
+	// can still hold a stale entry for addr if that determination happened
+	// during refresh in a separate `plan` invocation, since refresh mutates
+	// only the planner's in-memory state.State and plan never re-saves it
+	// (see plan.Planner.Plan's out-of-band-deletion branch). Decoding that
+	// stale entry here and handing the provider a non-null prior would make
+	// it treat the apply as an Update against an object that no longer
+	// exists — nothing to converge toward, so the apply can never succeed.
+	// Delete/replace/update all still decode from state: they need the real
+	// recorded object to destroy or diff against. See
+	// TestApplyCreateIgnoresStalePriorState.
 	prior := cty.NullVal(ty)
 	var priorPrivate []byte
-	if rs := ex.st.Resources[addr]; rs != nil {
-		v, err := ctyjson.Unmarshal(rs.Attributes, ty)
-		if err != nil {
-			return diag.Diagnostics{diag.Errorf(addr, "corrupt state attributes", err.Error())}
+	if ch.Action != "create" {
+		if rs := ex.st.Resources[addr]; rs != nil {
+			v, err := ctyjson.Unmarshal(rs.Attributes, ty)
+			if err != nil {
+				return diag.Diagnostics{diag.Errorf(addr, "corrupt state attributes", err.Error())}
+			}
+			prior = v
+			priorPrivate = rs.Private
 		}
-		prior = v
-		priorPrivate = rs.Private
 	}
 
 	switch ch.Action {
