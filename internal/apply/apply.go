@@ -1,13 +1,16 @@
 // Package apply executes a saved plan against live providers: creates,
-// updates and replaces run in plan order, deletes run last in reverse plan
-// order. The state file is re-saved after every successful provider call so
-// a mid-sequence failure never loses the resources already applied
-// (partial-state safety).
+// updates and replaces run in dependency order (the config's topological
+// sort, cfg.Order() — NOT pl.Changes' document order, which is merely
+// sorted alphabetically by address for plan.json determinism), deletes run
+// last in reverse dependency order. The state file is re-saved after every
+// successful provider call so a mid-sequence failure never loses the
+// resources already applied (partial-state safety).
 package apply
 
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/zclconf/go-cty/cty"
@@ -22,12 +25,22 @@ import (
 )
 
 // Apply verifies pl.StateSerial == st.Serial (else stale-plan error diag),
-// then executes changes: creates/updates/replaces in plan order, deletes
-// last in reverse order. After EVERY successful ApplyResource the state is
-// updated in memory AND saved to statePath (partial-state safety). First
-// error aborts remaining changes but keeps completed ones saved.
+// then executes changes: creates/updates/replaces in dependency order,
+// deletes last in reverse dependency order. After EVERY successful
+// ApplyResource the state is updated in memory AND saved to statePath
+// (partial-state safety). First error aborts remaining changes but keeps
+// completed ones saved.
 //
-// Ordering note: state.Save increments Serial on every call, so staleness
+// Ordering note: pl.Changes is sorted alphabetically by address (see
+// plan.finalize) purely so plan.json is byte-for-byte deterministic — that
+// order carries no dependency information and must never drive execution.
+// A dependent whose address sorts before its dependency (e.g.
+// tchoritest_thing.a_first referencing ${tchoritest_thing.z_second.id})
+// would otherwise be applied before the resource it depends on exists.
+// Execution order is instead derived from cfg.Order(), the same
+// topological sort the planner itself uses.
+//
+// Ordering note 2: state.Save increments Serial on every call, so staleness
 // MUST be (and is) validated before the first save — the plan's
 // state_serial is compared against the serial captured at plan time, which
 // only matches the pre-apply state.
@@ -40,21 +53,70 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 
 	ex := &executor{cfg: cfg, providers: providers, schemas: schemas, st: st, statePath: statePath}
 
-	// Creates, updates and replaces first, in plan order …
-	var ordered []*plan.Change
+	byAddr := make(map[string]*plan.Change, len(pl.Changes))
 	for _, ch := range pl.Changes {
+		byAddr[ch.Address] = ch
+	}
+
+	// order is the config's topological sort (dependencies before
+	// dependents). A nil cfg (defensively supported by applyChange below)
+	// yields an empty order, same as an empty config.
+	var order []string
+	if cfg != nil {
+		var ods diag.Diagnostics
+		order, ods = cfg.Order()
+		if ods.HasErrors() {
+			// Should be unreachable in practice: a config that already
+			// produced this plan necessarily passed Order() during planning
+			// too (see plan.Planner.Plan). Surfacing rather than assuming
+			// keeps this defensive.
+			return ods
+		}
+	}
+	inConfigOrder := make(map[string]bool, len(order))
+	for _, addr := range order {
+		inConfigOrder[addr] = true
+	}
+
+	// Creates, updates and replaces first, in cfg.Order() sequence.
+	// Addresses in order with no corresponding plan change (no-op, or the
+	// plan simply predates them) are skipped.
+	var ordered []*plan.Change
+	for _, addr := range order {
+		ch := byAddr[addr]
+		if ch == nil {
+			continue
+		}
 		switch ch.Action {
 		case "create", "update", "replace":
 			ordered = append(ordered, ch)
 		}
 	}
-	// … then deletes, last, in reverse plan order (dependents first). No-op
-	// changes are skipped entirely.
-	for i := len(pl.Changes) - 1; i >= 0; i-- {
-		if pl.Changes[i].Action == "delete" {
-			ordered = append(ordered, pl.Changes[i])
+
+	// … then deletes, last, so nothing is destroyed while a resource that
+	// still references it is being created or updated. Addresses present in
+	// cfg.Order() (e.g. `tchori destroy` on a config that still declares the
+	// resource) run in reverse topological order — dependents destroyed
+	// before their dependencies. Addresses absent from config (resources
+	// removed from the config file) carry no dependency information —
+	// Order() only walks config resources — so they run in reverse-lexical
+	// order, after the config-known deletes. No-op changes are skipped
+	// entirely.
+	for i := len(order) - 1; i >= 0; i-- {
+		if ch := byAddr[order[i]]; ch != nil && ch.Action == "delete" {
+			ordered = append(ordered, ch)
 		}
 	}
+	var stateOnlyDeletes []*plan.Change
+	for _, ch := range pl.Changes {
+		if ch.Action == "delete" && !inConfigOrder[ch.Address] {
+			stateOnlyDeletes = append(stateOnlyDeletes, ch)
+		}
+	}
+	sort.Slice(stateOnlyDeletes, func(i, j int) bool {
+		return stateOnlyDeletes[i].Address > stateOnlyDeletes[j].Address
+	})
+	ordered = append(ordered, stateOnlyDeletes...)
 
 	var ds diag.Diagnostics
 	for _, ch := range ordered {
@@ -181,6 +243,20 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 		return ds
 	}
 
+	// ch.PlannedRaw was captured at plan time: an attribute whose raw config
+	// is a ${..} reference to a resource that had not yet applied within
+	// that same plan (e.g. two new resources created together, one
+	// referencing the other's computed id) is still unknown there — the
+	// referenced resource's real value did not exist yet. By now,
+	// dependency-ordered execution (see Apply) guarantees any resource
+	// addr's config references has already applied, so cfgVal — recomposed
+	// above against current state — holds the concrete value. Overlay it
+	// onto planned's unknown leaves before applying; leaves the provider's
+	// own computed attributes (absent from raw config, hence null in
+	// cfgVal, e.g. "id") unknown for the provider itself to resolve, same
+	// as before.
+	planned = resolvePlannedUnknowns(planned, cfgVal)
+
 	newState, newPrivate, applyDs := client.ApplyResource(ctx, typeName, prior, planned, cfgVal, ch.Private)
 	ds = append(ds, applyDs...)
 	if ds.HasErrors() {
@@ -203,10 +279,70 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	return ds
 }
 
+// resolvePlannedUnknowns walks planned and cfgVal together (both at the same
+// schema type) and replaces any unknown leaf in planned with the
+// corresponding value from cfgVal, provided cfgVal actually has a concrete
+// (known, non-null) value there. Composite values (objects, maps) recurse
+// per-element; lists, sets and primitives are returned unchanged since
+// nothing in this MVP nests a forward reference inside an ordered
+// collection and per-index merging would be unsound without a stronger
+// correspondence guarantee.
+func resolvePlannedUnknowns(planned, cfgVal cty.Value) cty.Value {
+	if !planned.IsKnown() {
+		if cfgVal.IsKnown() && !cfgVal.IsNull() {
+			return cfgVal
+		}
+		return planned
+	}
+	if planned.IsNull() {
+		return planned
+	}
+
+	ty := planned.Type()
+	switch {
+	case ty.IsObjectType():
+		atys := ty.AttributeTypes()
+		attrs := make(map[string]cty.Value, len(atys))
+		for name, aty := range atys {
+			sub := cty.NullVal(aty)
+			if cfgVal.IsKnown() && !cfgVal.IsNull() {
+				sub = cfgVal.GetAttr(name)
+			}
+			attrs[name] = resolvePlannedUnknowns(planned.GetAttr(name), sub)
+		}
+		return cty.ObjectVal(attrs)
+
+	case ty.IsMapType():
+		if planned.LengthInt() == 0 {
+			return planned
+		}
+		cfgElems := map[string]cty.Value{}
+		if cfgVal.IsKnown() && !cfgVal.IsNull() {
+			cfgElems = cfgVal.AsValueMap()
+		}
+		elems := make(map[string]cty.Value, planned.LengthInt())
+		for it := planned.ElementIterator(); it.Next(); {
+			k, v := it.Element()
+			key := k.AsString()
+			sub, ok := cfgElems[key]
+			if !ok {
+				sub = cty.NullVal(ty.ElementType())
+			}
+			elems[key] = resolvePlannedUnknowns(v, sub)
+		}
+		return cty.MapVal(elems)
+
+	default:
+		return planned
+	}
+}
+
 // resolveRef resolves a ${type.name.attr} reference against the current
-// in-memory state. Plan order puts dependencies before their dependents, so
-// by the time a dependent applies, the referenced resource's post-apply
-// value has already been recorded (and saved).
+// in-memory state. Apply executes creates/updates/replaces in cfg.Order()'s
+// topological order (not pl.Changes' address-sorted document order — see
+// Apply), so by the time a dependent applies, the resource it references
+// has already applied and its post-apply value already recorded in state
+// (and saved).
 func (ex *executor) resolveRef(ref config.Ref) (cty.Value, diag.Diagnostics) {
 	rs := ex.st.Resources[ref.Address]
 	if rs == nil {
