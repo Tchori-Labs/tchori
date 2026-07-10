@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 
 	hclog "github.com/hashicorp/go-hclog"
 	plugin "github.com/hashicorp/go-plugin"
@@ -92,6 +93,17 @@ func Launch(ctx context.Context, binary string) (*Client, error) {
 	rpcClient, err := pc.Client()
 	if err != nil {
 		pc.Kill()
+		// go-plugin reports a failed protocol negotiation as
+		// "incompatible API version with plugin. Plugin version: 5,
+		// Client versions: [6]" (capitalization varies across go-plugin
+		// releases, hence the case-insensitive match). Name the mismatch
+		// in tchori's own words: this is the engine's documented graceful
+		// failure for protocol-5-only providers (the classic
+		// null/random/time/local); a tfplugin5 adapter is a recorded
+		// post-MVP roadmap item.
+		if strings.Contains(strings.ToLower(err.Error()), "incompatible api version with plugin") {
+			return nil, fmt.Errorf("provider protocol unsupported: tchori speaks plugin protocol 6 (tfplugin6) only, and %q does not offer it: %w", binary, err)
+		}
 		return nil, fmt.Errorf("provider: connecting to %q: %w", binary, err)
 	}
 
