@@ -257,6 +257,8 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 	// a "thing" named "explode" always fails to apply.
 	if name == "explode" {
 		return &tfprotov6.ApplyResourceChangeResponse{
+			// A nil NewState alongside an apply error reads as deletion to the client; keep prior state to disambiguate.
+			NewState: req.PriorState,
 			Diagnostics: []*tfprotov6.Diagnostic{{
 				Severity: tfprotov6.DiagnosticSeverityError,
 				Summary:  "apply exploded",
