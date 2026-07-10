@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"os"
+	"os/signal"
 	"slices"
 	"strings"
 
@@ -18,6 +20,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/apply"
 	"github.com/tchori-labs/tchori/internal/config"
 	"github.com/tchori-labs/tchori/internal/diag"
+	"github.com/tchori-labs/tchori/internal/mcpserv"
 	"github.com/tchori-labs/tchori/internal/plan"
 	"github.com/tchori-labs/tchori/internal/provider"
 	"github.com/tchori-labs/tchori/internal/registry"
@@ -440,17 +443,23 @@ func runProvidersList(cmd *cobra.Command, _ []string) (int, error) {
 
 // --- mcp ---------------------------------------------------------------------
 
+// newMCPCmd serves the four read/plan MCP tools over stdio until the client
+// disconnects (stdin EOF) or the process receives SIGINT. Serve returns
+// ctx.Err() after a clean session close on cancellation, so context.Canceled
+// is a clean shutdown: (0, nil) through the same exitRun pattern every
+// sibling command uses; anything else is (1, err).
 func newMCPCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "mcp",
 		Short: "Serve state_list/state_show/plan/provider_schema over MCP stdio",
 		Args:  cobra.NoArgs,
 		RunE: exitRun(func(cmd *cobra.Command, _ []string) (int, error) {
-			// Task 14 replaces this body with:
-			//   return 1-on-error wiring around mcpserv.Serve(cmd.Context(), ".")
-			// The command (and the global flags, --plugin-dir included) is
-			// registered here so the CLI surface is complete.
-			return 1, errors.New("the MCP server is not wired yet (Task 14)")
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
+			defer stop()
+			if err := mcpserv.Serve(ctx, "."); err != nil && !errors.Is(err, context.Canceled) {
+				return 1, err
+			}
+			return 0, nil
 		}),
 	}
 }
