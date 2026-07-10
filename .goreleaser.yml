@@ -1,0 +1,47 @@
+version: 2
+
+project_name: tchori
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: tchori
+    main: ./cmd/tchori
+    binary: tchori
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/tchori-labs/tchori/internal/version.Version={{.Version}}
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: tchori
+    ids: [tchori]
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+# Pinned explicitly: the repo has no git remote until Task 16 pushes it, and
+# goreleaser would otherwise fail trying to infer the release target from the
+# remote ("scm releases: no remote configured to list refs from").
+release:
+  github:
+    owner: tchori-labs
+    name: tchori
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  disable: true
