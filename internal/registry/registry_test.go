@@ -197,6 +197,125 @@ func TestInstall_ChecksumMismatch(t *testing.T) {
 	}
 }
 
+// TestInstall_OversizedEntryRejected pins the bomb-guard behavior: an entry
+// larger than maxZipEntryBytes must make Install fail hard, not silently
+// truncate the binary and report success. maxZipEntryBytes is temporarily
+// lowered so the test doesn't need to generate a real gigabyte-sized fixture.
+func TestInstall_OversizedEntryRejected(t *testing.T) {
+	orig := maxZipEntryBytes
+	maxZipEntryBytes = 16
+	t.Cleanup(func() { maxZipEntryBytes = orig })
+
+	// Content well past the lowered cap: prior to the fix, io.CopyN would
+	// silently stop at maxZipEntryBytes and Install would return success
+	// with a truncated binary on disk.
+	content := strings.Repeat("A", 64)
+	fr := newFakeRegistry(t, "opentofu", "bigbin", "1.0.0", content)
+	cacheDir := t.TempDir()
+
+	_, err := Install(context.Background(), "opentofu/bigbin", "1.0.0", fr.srv.URL, cacheDir)
+	if err == nil {
+		t.Fatal("Install: want error for a zip entry exceeding the size limit, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds") || !strings.Contains(err.Error(), "byte limit") {
+		t.Errorf("error = %q, want it to mention the byte limit", err)
+	}
+
+	destDir := filepath.Join(cacheDir, "opentofu", "bigbin", "1.0.0", runtime.GOOS+"_"+runtime.GOARCH)
+	binPath := filepath.Join(destDir, "terraform-provider-bigbin")
+	if _, statErr := os.Stat(binPath); !os.IsNotExist(statErr) {
+		t.Errorf("no (truncated) binary should be left behind at %s after an oversized-entry rejection", binPath)
+	}
+}
+
+// buildZipWithEntry returns zip bytes containing a single entry with the
+// given raw (untrusted) name and content. Unlike buildFakeProviderZip, the
+// name is used exactly as given so tests can construct zip-slip attempts.
+func buildZipWithEntry(t *testing.T, entryName, content string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	w, err := zw.Create(entryName)
+	if err != nil {
+		t.Fatalf("zip.Create(%q): %v", entryName, err)
+	}
+	if _, err := w.Write([]byte(content)); err != nil {
+		t.Fatalf("zip Write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip Close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// TestExtract_ZipSlipRejected pins the zip-slip guard: an entry name that
+// escapes the destination directory via ".." traversal must be rejected
+// outright, never sanitized-and-extracted. The entry name is given the
+// required "terraform-provider-" prefix so it actually reaches
+// safeZipEntryName instead of being skipped by the earlier prefix filter.
+func TestExtract_ZipSlipRejected(t *testing.T) {
+	ns, name, version := "opentofu", "evil", "1.0.0"
+	entryName := "terraform-provider-x/../../evil"
+	zipBytes := buildZipWithEntry(t, entryName, "malicious payload")
+	sum := sha256.Sum256(zipBytes)
+	sumHex := hex.EncodeToString(sum[:])
+	filename := fmt.Sprintf("terraform-provider-%s_%s_%s_%s.zip", name, version, runtime.GOOS, runtime.GOARCH)
+
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/providers/{ns}/{name}/versions", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"versions": []map[string]any{{"version": version, "protocols": []string{"5.0"}}},
+		})
+	})
+	mux.HandleFunc("GET /v1/providers/{ns}/{name}/{version}/download/{goos}/{goarch}", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"filename":     filename,
+			"download_url": srv.URL + "/dl/" + filename,
+			"shasums_url":  srv.URL + "/dl/SHA256SUMS",
+			"shasum":       sumHex,
+		})
+	})
+	mux.HandleFunc("GET /dl/"+filename, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(zipBytes)
+	})
+	mux.HandleFunc("GET /dl/SHA256SUMS", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, "%s  %s\n", sumHex, filename)
+	})
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	rootDir := t.TempDir()
+	cacheDir := filepath.Join(rootDir, "cache")
+
+	_, err := Install(context.Background(), ns+"/"+name, version, srv.URL, cacheDir)
+	if err == nil {
+		t.Fatal("Install: want error for a zip-slip entry name, got nil")
+	}
+	if !strings.Contains(err.Error(), "unsafe zip entry name") {
+		t.Errorf("error = %q, want it to report an unsafe zip entry name", err)
+	}
+
+	// Nothing should have been written anywhere under rootDir, whether
+	// inside cacheDir or via traversal outside it.
+	var found []string
+	walkErr := filepath.Walk(rootDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !info.IsDir() {
+			found = append(found, path)
+		}
+		return nil
+	})
+	if walkErr != nil {
+		t.Fatalf("Walk: %v", walkErr)
+	}
+	if len(found) != 0 {
+		t.Errorf("expected no files written anywhere under %s, found %v", rootDir, found)
+	}
+}
+
 func TestDiscover_PluginDirPrecedence(t *testing.T) {
 	cacheDir := t.TempDir()
 	pluginDir := t.TempDir()

@@ -25,8 +25,9 @@ const defaultBaseURL = "https://registry.opentofu.org"
 // disk during extraction. Provider binaries are a few tens of MB at most;
 // this bound exists purely to give io.Copy an upper limit so a malicious or
 // corrupt archive cannot be used to exhaust disk space (G110
-// decompression-bomb guard).
-const maxZipEntryBytes = 1 << 30 // 1 GiB
+// decompression-bomb guard). A var (not const) so tests can lower it to
+// exercise the oversized-entry path without generating a real multi-GB file.
+var maxZipEntryBytes int64 = 1 << 30 // 1 GiB
 
 // defaultCacheDir returns ~/.tchori/providers, used by Install when
 // cacheDir is empty.
@@ -117,9 +118,24 @@ func extractZipFile(f *zip.File, destPath string) error {
 	if err != nil {
 		return fmt.Errorf("registry: creating %s: %w", destPath, err)
 	}
-	if _, err := io.CopyN(out, rc, maxZipEntryBytes); err != nil && err != io.EOF {
+
+	// Ask for one byte more than the cap. io.CopyN silently stops (with a
+	// nil error) once it has copied n bytes even if the source has more to
+	// give, so requesting exactly maxZipEntryBytes can never distinguish an
+	// oversized entry from one that exactly fits: both would come back with
+	// err == nil. Requesting maxZipEntryBytes+1 instead means a nil error
+	// (or n > maxZipEntryBytes) only happens when the entry is too big, and
+	// an entry within the limit still ends the copy via io.EOF as before.
+	n, copyErr := io.CopyN(out, rc, maxZipEntryBytes+1)
+	if copyErr != nil && copyErr != io.EOF {
 		_ = out.Close()
-		return fmt.Errorf("registry: writing %s: %w", destPath, err)
+		_ = os.Remove(destPath)
+		return fmt.Errorf("registry: writing %s: %w", destPath, copyErr)
+	}
+	if copyErr == nil || n > maxZipEntryBytes {
+		_ = out.Close()
+		_ = os.Remove(destPath)
+		return fmt.Errorf("registry: zip entry %q exceeds %d byte limit", f.Name, maxZipEntryBytes)
 	}
 	return out.Close()
 }
