@@ -51,7 +51,7 @@ func TestPlanWriteReadDeterminism(t *testing.T) {
 	if err := plan.Write(pl, path); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	b1, err := os.ReadFile(path)
+	b1, err := os.ReadFile(path) //nolint:gosec // G304: path is inside t.TempDir()
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestPlanWriteReadDeterminism(t *testing.T) {
 	if err := plan.Write(pl, path); err != nil {
 		t.Fatalf("second Write: %v", err)
 	}
-	b2, err := os.ReadFile(path)
+	b2, err := os.ReadFile(path) //nolint:gosec // G304: path is inside t.TempDir()
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
