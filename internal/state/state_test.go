@@ -131,10 +131,10 @@ func TestSaveDeterministicAcrossInsertionOrder(t *testing.T) {
 	dir := t.TempDir()
 	pathA := filepath.Join(dir, "a", "state.json")
 	pathB := filepath.Join(dir, "b", "state.json")
-	if err := os.MkdirAll(filepath.Dir(pathA), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(pathA), 0o750); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Dir(pathB), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(pathB), 0o750); err != nil {
 		t.Fatal(err)
 	}
 
@@ -145,11 +145,11 @@ func TestSaveDeterministicAcrossInsertionOrder(t *testing.T) {
 		t.Fatalf("Save(pathB) = %v", err)
 	}
 
-	bytesA, err := os.ReadFile(pathA)
+	bytesA, err := os.ReadFile(pathA) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
 	if err != nil {
 		t.Fatal(err)
 	}
-	bytesB, err := os.ReadFile(pathB)
+	bytesB, err := os.ReadFile(pathB) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestSaveWritesBackupOnSecondSave(t *testing.T) {
 		t.Fatalf("os.Stat(backup) after first Save: err = %v, want IsNotExist", err)
 	}
 
-	firstSaveContent, err := os.ReadFile(path)
+	firstSaveContent, err := os.ReadFile(path) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ func TestSaveWritesBackupOnSecondSave(t *testing.T) {
 		t.Fatalf("os.Stat(backup) after second Save = %v, want file to exist", err)
 	}
 
-	gotBackup, err := os.ReadFile(backupPath)
+	gotBackup, err := os.ReadFile(backupPath) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
 	if err != nil {
 		t.Fatal(err)
 	}
