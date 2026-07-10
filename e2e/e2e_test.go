@@ -231,13 +231,23 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
+	// Track whether registry_install succeeded, so protocol5_graceful_failure
+	// can skip if the provider isn't available.
+	registrySuccess := false
+
 	t.Run("registry_install", func(t *testing.T) {
 		work := t.TempDir()
 
 		// Real download from registry.opentofu.org: version lookup, zip
 		// fetch, SHA256 verification against the SHA256SUMS document,
 		// extraction into the cache. install never launches the binary.
-		run(t, work, 0, "providers", "install", "opentofu/null", nullVersion)
+		// Skip the subtest (and protocol5) on network failure; fail loudly on
+		// any other error (checksum mismatch, bad layout, etc).
+		installErr := tryInstallProvider(t, bin, work, home)
+		if installErr != nil {
+			t.Skipf("registry unreachable, skipping: %v", installErr)
+		}
+		registrySuccess = true
 
 		// Cache layout asserted via providers list -json.
 		stdout, _ := run(t, work, 0, "-json", "providers", "list")
@@ -278,6 +288,12 @@ func TestEndToEnd(t *testing.T) {
 	})
 
 	t.Run("protocol5_graceful_failure", func(t *testing.T) {
+		// This test depends on the provider installed by registry_install.
+		// If that subtest was skipped due to network failure, skip this one too.
+		if !registrySuccess {
+			t.Skip("skipping because registry_install was skipped")
+		}
+
 		work := t.TempDir()
 		cfg := fmt.Sprintf(protocol5Config, nullVersion)
 		if err := os.WriteFile(filepath.Join(work, "main.tchori.json"), []byte(cfg), 0o644); err != nil {
@@ -300,6 +316,65 @@ func TestEndToEnd(t *testing.T) {
 			t.Errorf("stderr does not say tchori speaks tfplugin6: %q", stderr)
 		}
 	})
+}
+
+// tryInstallProvider attempts to install the null provider from the registry.
+// Returns an error (which may be a network error) if installation fails;
+// returns nil if installation succeeds. isNetworkError() can be used to
+// distinguish network failures from other errors.
+func tryInstallProvider(t *testing.T, bin, work, home string) error {
+	t.Helper()
+	cmd := exec.Command(bin, "providers", "install", "opentofu/null", nullVersion)
+	cmd.Dir = work
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "HOME=") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = append(cmd.Env, "HOME="+home)
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	runErr := cmd.Run()
+	exit := 0
+	if runErr != nil {
+		var ee *exec.ExitError
+		if !errors.As(runErr, &ee) {
+			return fmt.Errorf("unexpected error: %v", runErr)
+		}
+		exit = ee.ExitCode()
+	}
+
+	if exit != 0 {
+		stderr := errBuf.String()
+		if isNetworkError(stderr) {
+			return errors.New(stderr)
+		}
+		// Non-network error: fail loudly in the test.
+		t.Fatalf("providers install opentofu/null %s: exit %d (non-network error)\nstderr:\n%s",
+			nullVersion, exit, stderr)
+	}
+
+	return nil
+}
+
+// isNetworkError returns true if the error message indicates a network problem.
+func isNetworkError(msg string) bool {
+	networkPatterns := []string{
+		"no such host",
+		"connection refused",
+		"i/o timeout",
+		"TLS handshake timeout",
+		"temporary failure in name resolution",
+		"dial tcp",
+	}
+	msg = strings.ToLower(msg)
+	for _, pattern := range networkPatterns {
+		if strings.Contains(msg, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func readJSON(t *testing.T, path string, v any) {
