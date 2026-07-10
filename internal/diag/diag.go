@@ -73,10 +73,10 @@ func Emit(w io.Writer, ds Diagnostics, pretty bool) {
 		if d.Address != "" {
 			line += " (" + d.Address + ")"
 		}
-		fmt.Fprintln(w, line)
+		_, _ = fmt.Fprintln(w, line)
 		if d.Detail != "" {
 			for _, l := range strings.Split(d.Detail, "\n") {
-				fmt.Fprintln(w, "  "+l)
+				_, _ = fmt.Fprintln(w, "  "+l)
 			}
 		}
 	}
