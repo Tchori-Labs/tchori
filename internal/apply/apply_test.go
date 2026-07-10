@@ -195,6 +195,49 @@ func TestApplyStalePlan(t *testing.T) {
 	}
 }
 
+// TestApplyConfigDriftRefused guards the fix for the bug where Apply built
+// its create/update/replace execution list solely by walking cfg.Order()
+// (i.e. cfg.Resources' addresses) and looking up a matching plan change: a
+// change whose address had been removed from the config since the plan was
+// taken never appeared in that walk and so silently vanished from the
+// execution list — "plan, then edit config to remove the resource, then
+// apply" applied nothing and reported zero diagnostics. Like
+// TestApplyStalePlan, no provider is launched: the refusal must happen
+// before Apply ever touches a provider or the state file.
+func TestApplyConfigDriftRefused(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	st := loadState(t, statePath) // empty: serial 0
+
+	pl := &plan.Plan{
+		FormatVersion: "1.0",
+		EngineVersion: "0.1.0-dev",
+		StateSerial:   0,
+		Changes:       []*plan.Change{{Address: "tchoritest_thing.foo", Action: "create"}},
+		Summary:       plan.Summary{Create: 1},
+	}
+
+	// cfg no longer declares tchoritest_thing.foo: the config changed after
+	// the plan was created.
+	cfg := &config.Config{Resources: map[string]*config.Resource{}}
+
+	ds := apply.Apply(context.Background(), pl, cfg, nil, nil, st, statePath)
+	if !ds.HasErrors() {
+		t.Fatal("Apply accepted a plan whose resource is no longer in configuration")
+	}
+	found := false
+	for _, d := range ds {
+		if d.Summary == "plan does not match configuration" && d.Address == "tchoritest_thing.foo" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("diagnostics do not include the config-drift error for tchoritest_thing.foo: %+v", ds)
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Errorf("state file was written during a refused apply (stat err = %v)", err)
+	}
+}
+
 func TestApplyPartialFailure(t *testing.T) {
 	// Changes apply in plan (address) order: ...alpha succeeds first, then
 	// ...boom (name "explode") errors inside the provider's apply. The first
