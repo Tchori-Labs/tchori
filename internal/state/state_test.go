@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -195,5 +196,42 @@ func TestSaveWritesBackupOnSecondSave(t *testing.T) {
 	}
 	if !bytes.Equal(gotBackup, firstSaveContent) {
 		t.Fatalf("backup content = %q, want first save's content %q", gotBackup, firstSaveContent)
+	}
+}
+
+// TestLoadRejectsUnsupportedFormatVersion mirrors plan.Read's rejection of a
+// plan.json whose format_version isn't the one this engine understands:
+// Load must refuse an existing state.json with a foreign format_version
+// rather than silently proceeding against a document it may not be able to
+// interpret correctly.
+func TestLoadRejectsUnsupportedFormatVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(path, []byte(`{"format_version":"2.0","serial":1,"resources":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("Load accepted an unsupported format_version")
+	}
+	if !strings.Contains(err.Error(), `"2.0"`) {
+		t.Errorf("error %q does not name the unsupported format_version", err.Error())
+	}
+}
+
+// TestLoadRejectsMissingFormatVersion verifies an existing state.json with
+// no format_version field at all is also rejected — this is a state file
+// tchori did not write (Save always stamps "1.0"), so Load should not treat
+// it as compatible just because a fresh (nonexistent) state file is fine.
+func TestLoadRejectsMissingFormatVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(path, []byte(`{"serial":1,"resources":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load accepted a state.json with no format_version")
 	}
 }
