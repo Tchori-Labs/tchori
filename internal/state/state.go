@@ -40,7 +40,7 @@ type State struct {
 // Load returns an empty state (FormatVersion "1.0", Serial 0, empty map)
 // when path does not exist.
 func Load(path string) (*State, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &State{
@@ -67,7 +67,7 @@ func Load(path string) (*State, error) {
 // to a temp file in the same directory, followed by os.Rename.
 func (s *State) Save(path string) error {
 	lock := flock.New(path + ".lock")
-	defer lock.Close()
+	defer func() { _ = lock.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), lockTimeout)
 	defer cancel()
@@ -103,16 +103,16 @@ func (s *State) Save(path string) error {
 	}
 	tmpPath := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("write temp state file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("close temp state file: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename temp state file: %w", err)
 	}
 	return nil
@@ -122,21 +122,21 @@ func (s *State) Save(path string) error {
 // it is overwritten. It is a no-op when path does not yet exist — there is
 // nothing to back up on the first save.
 func backupExisting(path string) error {
-	src, err := os.Open(path)
+	src, err := os.Open(path) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return fmt.Errorf("open state for backup %s: %w", path, err)
 	}
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 
-	dst, err := os.Create(path + ".backup")
+	dst, err := os.Create(path + ".backup") //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
 	if err != nil {
 		return fmt.Errorf("create backup %s: %w", path+".backup", err)
 	}
 	if _, err := io.Copy(dst, src); err != nil {
-		dst.Close()
+		_ = dst.Close()
 		return fmt.Errorf("copy backup %s: %w", path+".backup", err)
 	}
 	return dst.Close()
