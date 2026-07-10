@@ -25,11 +25,13 @@ import (
 )
 
 // Apply verifies pl.StateSerial == st.Serial (else stale-plan error diag),
-// then executes changes: creates/updates/replaces in dependency order,
-// deletes last in reverse dependency order. After EVERY successful
-// ApplyResource the state is updated in memory AND saved to statePath
-// (partial-state safety). First error aborts remaining changes but keeps
-// completed ones saved.
+// verifies every non-delete plan change still has a matching address in cfg
+// (else "plan does not match configuration" error diag — see the
+// configuration-drift guard below), then executes changes: creates/updates/
+// replaces in dependency order, deletes last in reverse dependency order.
+// After EVERY successful ApplyResource the state is updated in memory AND
+// saved to statePath (partial-state safety). First error aborts remaining
+// changes but keeps completed ones saved.
 //
 // Ordering note: pl.Changes is sorted alphabetically by address (see
 // plan.finalize) purely so plan.json is byte-for-byte deterministic — that
@@ -117,6 +119,33 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 		return stateOnlyDeletes[i].Address > stateOnlyDeletes[j].Address
 	})
 	ordered = append(ordered, stateOnlyDeletes...)
+
+	// Guard against configuration drift since the plan was created. The
+	// create/update/replace leg above is built by walking cfg.Order() (i.e.
+	// cfg.Resources' addresses) and looking up a matching plan change — see
+	// the "Ordering note" comments — so a non-delete change whose address is
+	// no longer in cfg.Resources (the config file was edited to remove the
+	// resource after the plan was saved) never appears in `order` and would
+	// otherwise silently vanish from `ordered`, applying nothing with zero
+	// diagnostics. Refuse the whole apply instead, before any provider call
+	// or state save, mirroring the stale-plan check's all-or-nothing
+	// posture: a plan that no longer matches configuration is not
+	// partially actionable.
+	var driftDiags diag.Diagnostics
+	for _, ch := range pl.Changes {
+		if ch.Action == "delete" {
+			continue
+		}
+		if cfg == nil || cfg.Resources[ch.Address] == nil {
+			driftDiags = append(driftDiags, diag.Errorf(ch.Address, "plan does not match configuration",
+				fmt.Sprintf(
+					"plan has a %q change for %q, but the address is no longer present in the loaded configuration; the configuration changed since the plan was created — run plan again",
+					ch.Action, ch.Address)))
+		}
+	}
+	if driftDiags.HasErrors() {
+		return driftDiags
+	}
 
 	var ds diag.Diagnostics
 	for _, ch := range ordered {
