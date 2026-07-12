@@ -42,6 +42,34 @@ type Schema struct {
 type ProviderSchemas struct {
 	Provider      *Schema
 	ResourceTypes map[string]*Schema
+	// UnsupportedResources records resource types the provider defines whose
+	// schema tchori could not convert (e.g. nested_type attributes — see
+	// blockFromProto), keyed by type name with the conversion error's detail
+	// text as the value. Schemas() tolerates these instead of failing the
+	// whole provider: a type here is only reported when a config or state
+	// entry actually references it (see LookupResourceType). Providers like
+	// cloudflare/cloudflare expose hundreds of resource types — many unused,
+	// some with nested attributes — and one unused type must not poison the
+	// provider's fully-supported flat resources (issue #5).
+	UnsupportedResources map[string]string
+}
+
+// LookupResourceType resolves typeName against ps, distinguishing the two
+// failure cases callers must report differently:
+//
+//   - schema, "", true: the type is known and its schema converted cleanly.
+//   - nil, detail, true: the type is known (the provider defines it) but its
+//     schema failed to convert — detail is the stored conversion error, e.g.
+//     a nested_type attribute message from blockFromProto.
+//   - nil, "", false: the provider does not define this resource type at all.
+func (ps *ProviderSchemas) LookupResourceType(typeName string) (schema *Schema, unsupportedDetail string, known bool) {
+	if s, ok := ps.ResourceTypes[typeName]; ok {
+		return s, "", true
+	}
+	if detail, ok := ps.UnsupportedResources[typeName]; ok {
+		return nil, detail, true
+	}
+	return nil, "", false
 }
 
 // ImpliedType returns the cty object type a value of this block must
@@ -90,13 +118,19 @@ func (c *Client) Schemas(ctx context.Context) (*ProviderSchemas, diag.Diagnostic
 		return nil, append(ds, diag.Errorf("", "invalid provider config schema", err.Error()))
 	}
 	out := &ProviderSchemas{
-		Provider:      providerSchema,
-		ResourceTypes: make(map[string]*Schema, len(resp.ResourceSchemas)),
+		Provider:             providerSchema,
+		ResourceTypes:        make(map[string]*Schema, len(resp.ResourceSchemas)),
+		UnsupportedResources: map[string]string{},
 	}
 	for typeName, ps := range resp.ResourceSchemas {
 		s, err := schemaFromProto(ps)
 		if err != nil {
-			return nil, append(ds, diag.Errorf("", "invalid schema for resource type "+typeName, err.Error()))
+			// Tolerate until used (issue #5): a resource type this engine
+			// cannot convert must not poison the whole provider. Record the
+			// detail and keep going; LookupResourceType surfaces it only if
+			// something actually references this type.
+			out.UnsupportedResources[typeName] = err.Error()
+			continue
 		}
 		out.ResourceTypes[typeName] = s
 	}

@@ -228,6 +228,14 @@ func renderBlock(b *provider.SchemaBlock) *blockJSON {
 type providerSchemaResult struct {
 	Provider      string                `json:"provider"`
 	ResourceTypes map[string]schemaJSON `json:"resource_types"`
+	// UnsupportedResourceTypes lists resource types the provider defines
+	// whose schema tchori could not convert (e.g. nested_type attributes),
+	// keyed by type name with the conversion error's detail as the value.
+	// Omitted when empty. See issue #5: these types are tolerated at
+	// Schemas() time and simply absent from ResourceTypes; surfacing them
+	// here tells the agent why a type it expected is missing, rather than
+	// leaving it to guess.
+	UnsupportedResourceTypes map[string]string `json:"unsupported_resource_types,omitempty"`
 }
 
 // providerSchema builds the provider runtime and dumps the named provider's
@@ -247,6 +255,9 @@ func (h *handlers) providerSchema(ctx context.Context, _ *mcp.CallToolRequest, i
 	out := providerSchemaResult{Provider: in.Name, ResourceTypes: map[string]schemaJSON{}}
 	for typeName, sch := range ps.ResourceTypes {
 		out.ResourceTypes[typeName] = schemaJSON{Version: sch.Version, Block: renderBlock(sch.Block)}
+	}
+	if len(ps.UnsupportedResources) > 0 {
+		out.UnsupportedResourceTypes = ps.UnsupportedResources
 	}
 	return jsonResult(out)
 }
