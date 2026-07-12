@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zclconf/go-cty/cty"
@@ -103,6 +104,19 @@ func thing(addrName, cfgName string) *config.Resource {
 	return &config.Resource{
 		Address:  "tchoritest_thing." + addrName,
 		Type:     "tchoritest_thing",
+		Name:     addrName,
+		Provider: "tchoritest",
+		Config:   map[string]any{"name": cfgName},
+	}
+}
+
+// brokenThing returns a tchoritest_broken_thing resource: a resource type
+// whose schema tchori cannot convert (nested_type attribute — see
+// testprovider's brokenThingSchema).
+func brokenThing(addrName, cfgName string) *config.Resource {
+	return &config.Resource{
+		Address:  "tchoritest_broken_thing." + addrName,
+		Type:     "tchoritest_broken_thing",
 		Name:     addrName,
 		Provider: "tchoritest",
 		Config:   map[string]any{"name": cfgName},
@@ -505,5 +519,44 @@ func TestApplyCreateIgnoresStalePriorState(t *testing.T) {
 	}
 	if got := attrs["echo"]; got != "foo" {
 		t.Errorf(`saved echo = %v, want "foo"`, got)
+	}
+}
+
+// TestApplyUnsupportedResourceType guards issue #5's fix in apply.go's own
+// schema lookups (applyChange): a plan change addressing
+// tchoritest_broken_thing (a resource type whose schema tchori cannot
+// convert — nested_type attribute, see testprovider's brokenThingSchema)
+// must fail with a diagnostic naming the stored conversion detail, not the
+// generic "missing resource schema" message used for a type the provider
+// never defined at all. The plan document is hand-built (bypassing the
+// planner, which would already refuse this address) so this test isolates
+// apply's own defense-in-depth lookup.
+func TestApplyUnsupportedResourceType(t *testing.T) {
+	h := newHarness(t, map[string]*config.Resource{
+		"tchoritest_broken_thing.boom": brokenThing("boom", "boom"),
+	})
+	st := loadState(t, h.statePath) // empty: serial 0
+
+	pl := &plan.Plan{
+		FormatVersion: "1.0",
+		EngineVersion: "0.1.0-dev",
+		StateSerial:   0,
+		Changes:       []*plan.Change{{Address: "tchoritest_broken_thing.boom", Action: "create"}},
+		Summary:       plan.Summary{Create: 1},
+	}
+
+	ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() {
+		t.Fatal("Apply accepted a resource type with an unsupported (nested_type) schema, want error")
+	}
+	found := false
+	for _, d := range ds {
+		if strings.Contains(d.Summary, "unsupported schema") && strings.Contains(d.Detail, "nested_type") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("diagnostics = %+v, want one with summary containing %q and detail containing %q",
+			ds, "unsupported schema", "nested_type")
 	}
 }

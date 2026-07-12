@@ -4,6 +4,7 @@ import (
 	"context"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,6 +105,66 @@ func TestLaunchAndSchemas(t *testing.T) {
 	}
 	if again != schemas {
 		t.Error("Schemas did not cache: second call returned a different pointer")
+	}
+}
+
+// TestSchemasTolerateUnsupportedResourceType guards the fix for issue #5:
+// one resource type whose schema tchori cannot convert (tchoritest_broken_thing
+// carries a nested_type attribute — see testprovider's brokenThingSchema)
+// must not fail Schemas() for the whole provider. The failure is recorded in
+// UnsupportedResources instead, keyed by type name, so every other
+// (supported) resource type — and the provider's own config schema — remain
+// usable.
+func TestSchemasTolerateUnsupportedResourceType(t *testing.T) {
+	bin := buildTestProvider(t)
+	ctx := context.Background()
+
+	c, err := Launch(ctx, bin)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Logf("Close: %v", err)
+		}
+	})
+
+	schemas, ds := c.Schemas(ctx)
+	if ds.HasErrors() {
+		t.Fatalf("Schemas returned error diagnostics for a provider with one unsupported resource type: %+v", ds)
+	}
+	if schemas == nil {
+		t.Fatal("nil schemas")
+	}
+
+	if thing := schemas.ResourceTypes["tchoritest_thing"]; thing == nil {
+		t.Fatal("tchoritest_thing missing from ResourceTypes; the good resource type must remain usable")
+	}
+	if broken := schemas.ResourceTypes["tchoritest_broken_thing"]; broken != nil {
+		t.Errorf("tchoritest_broken_thing present in ResourceTypes = %+v, want absent (unconvertible schema)", broken)
+	}
+
+	detail, ok := schemas.UnsupportedResources["tchoritest_broken_thing"]
+	if !ok {
+		t.Fatalf("tchoritest_broken_thing missing from UnsupportedResources; got %v", schemas.UnsupportedResources)
+	}
+	if !strings.Contains(detail, "nested_type") {
+		t.Errorf("UnsupportedResources detail = %q, want it to mention nested_type", detail)
+	}
+
+	// LookupResourceType must distinguish "known but unsupported" from
+	// "unknown" (never defined by the provider at all).
+	if s, unsupported, known := schemas.LookupResourceType("tchoritest_broken_thing"); s != nil || unsupported == "" || !known {
+		t.Errorf("LookupResourceType(tchoritest_broken_thing) = (%v, %q, %v), want (nil, <non-empty>, true)",
+			s, unsupported, known)
+	}
+	if s, unsupported, known := schemas.LookupResourceType("tchoritest_thing"); s == nil || unsupported != "" || !known {
+		t.Errorf("LookupResourceType(tchoritest_thing) = (%v, %q, %v), want (<non-nil>, \"\", true)",
+			s, unsupported, known)
+	}
+	if s, unsupported, known := schemas.LookupResourceType("tchoritest_nonexistent"); s != nil || unsupported != "" || known {
+		t.Errorf("LookupResourceType(tchoritest_nonexistent) = (%v, %q, %v), want (nil, \"\", false)",
+			s, unsupported, known)
 	}
 }
 
