@@ -196,11 +196,20 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 			fmt.Sprintf("no launched provider client for %q", providerName))}
 	}
 	ps := ex.schemas[providerName]
-	if ps == nil || ps.ResourceTypes[typeName] == nil {
+	if ps == nil {
 		return diag.Diagnostics{diag.Errorf(addr, "missing resource schema",
 			fmt.Sprintf("provider %q has no schema for resource type %q", providerName, typeName))}
 	}
-	ty := ps.ResourceTypes[typeName].Block.ImpliedType()
+	schema, unsupported, known := ps.LookupResourceType(typeName)
+	if !known {
+		return diag.Diagnostics{diag.Errorf(addr, "missing resource schema",
+			fmt.Sprintf("provider %q has no schema for resource type %q", providerName, typeName))}
+	}
+	if schema == nil {
+		return diag.Diagnostics{diag.Errorf(addr,
+			fmt.Sprintf("unsupported schema for resource type %q", typeName), unsupported)}
+	}
+	ty := schema.Block.ImpliedType()
 
 	// Prior value and private bytes come from state (null/nil if absent) —
 	// except for "create", where the plan document is trusted over state
@@ -394,11 +403,20 @@ func (ex *executor) resolveRef(ref config.Ref) (cty.Value, diag.Diagnostics) {
 			fmt.Sprintf("cannot resolve ${%s.%s}: resource has no state", ref.Address, ref.Attr))}
 	}
 	ps := ex.schemas[rs.Provider]
-	if ps == nil || ps.ResourceTypes[rs.Type] == nil {
+	if ps == nil {
 		return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address, "missing resource schema",
 			fmt.Sprintf("provider %q has no schema for resource type %q", rs.Provider, rs.Type))}
 	}
-	v, err := ctyjson.Unmarshal(rs.Attributes, ps.ResourceTypes[rs.Type].Block.ImpliedType())
+	schema, unsupported, known := ps.LookupResourceType(rs.Type)
+	if !known {
+		return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address, "missing resource schema",
+			fmt.Sprintf("provider %q has no schema for resource type %q", rs.Provider, rs.Type))}
+	}
+	if schema == nil {
+		return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address,
+			fmt.Sprintf("unsupported schema for resource type %q", rs.Type), unsupported)}
+	}
+	v, err := ctyjson.Unmarshal(rs.Attributes, schema.Block.ImpliedType())
 	if err != nil {
 		return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address, "corrupt state attributes", err.Error())}
 	}

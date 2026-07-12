@@ -65,10 +65,16 @@ func runValidate(cmd *cobra.Command, _ []string) (int, error) {
 	failed := false
 	for _, addr := range order {
 		r := rt.Config.Resources[addr]
-		schema := rt.Schemas[r.Provider].ResourceTypes[r.Type]
-		if schema == nil {
+		schema, unsupported, known := rt.Schemas[r.Provider].LookupResourceType(r.Type)
+		if !known {
 			emitDiags(diag.Diagnostics{diag.Errorf(addr, fmt.Sprintf("unknown resource type %q", r.Type),
 				fmt.Sprintf("provider %q does not define resource type %q", r.Provider, r.Type))})
+			failed = true
+			continue
+		}
+		if schema == nil {
+			emitDiags(diag.Diagnostics{diag.Errorf(addr,
+				fmt.Sprintf("unsupported schema for resource type %q", r.Type), unsupported)})
 			failed = true
 			continue
 		}

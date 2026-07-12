@@ -191,10 +191,14 @@ func (p *Planner) lookup(addr, providerName, typeName string) (*provider.Client,
 		return nil, nil, diag.Diagnostics{diag.Errorf(addr, "provider schema missing",
 			fmt.Sprintf("no schemas for provider %q", providerName))}
 	}
-	schema, ok := schemas.ResourceTypes[typeName]
-	if !ok {
+	schema, unsupported, known := schemas.LookupResourceType(typeName)
+	if !known {
 		return nil, nil, diag.Diagnostics{diag.Errorf(addr, "unknown resource type",
 			fmt.Sprintf("provider %q has no resource type %q", providerName, typeName))}
+	}
+	if schema == nil {
+		return nil, nil, diag.Diagnostics{diag.Errorf(addr,
+			fmt.Sprintf("unsupported schema for resource type %q", typeName), unsupported)}
 	}
 	return client, schema, nil
 }
