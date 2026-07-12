@@ -110,11 +110,13 @@ func TestLaunchAndSchemas(t *testing.T) {
 
 // TestSchemasTolerateUnsupportedResourceType guards the fix for issue #5:
 // one resource type whose schema tchori cannot convert (tchoritest_broken_thing
-// carries a nested_type attribute — see testprovider's brokenThingSchema)
-// must not fail Schemas() for the whole provider. The failure is recorded in
-// UnsupportedResources instead, keyed by type name, so every other
-// (supported) resource type — and the provider's own config schema — remain
-// usable.
+// carries a nested_type attribute using a nesting mode blockFromProto does
+// not recognize — see testprovider's brokenThingSchema; nested_type itself
+// is supported as of issue #7) must not fail Schemas() for the whole
+// provider. The failure is recorded in UnsupportedResources instead, keyed
+// by type name, so every other (supported) resource type — including
+// tchoritest_nested_thing, a resource type that DOES use nested_type
+// successfully — and the provider's own config schema, remain usable.
 func TestSchemasTolerateUnsupportedResourceType(t *testing.T) {
 	bin := buildTestProvider(t)
 	ctx := context.Background()
@@ -165,6 +167,57 @@ func TestSchemasTolerateUnsupportedResourceType(t *testing.T) {
 	if s, unsupported, known := schemas.LookupResourceType("tchoritest_nonexistent"); s != nil || unsupported != "" || known {
 		t.Errorf("LookupResourceType(tchoritest_nonexistent) = (%v, %q, %v), want (nil, \"\", false)",
 			s, unsupported, known)
+	}
+}
+
+// TestSchemasConvertsNestedType guards issue #7 end to end through the real
+// protocol client (not just blockFromProto directly, see schema_test.go):
+// tchoritest_nested_thing's "settings" nested_type attribute (SchemaObject,
+// SchemaObjectNestingModeSingle, two optional leaf attributes — see
+// testprovider's nestedThingSchema) must convert successfully and land in
+// ResourceTypes, not UnsupportedResources.
+func TestSchemasConvertsNestedType(t *testing.T) {
+	bin := buildTestProvider(t)
+	ctx := context.Background()
+
+	c, err := Launch(ctx, bin)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Logf("Close: %v", err)
+		}
+	})
+
+	schemas, ds := c.Schemas(ctx)
+	if ds.HasErrors() {
+		t.Fatalf("Schemas: %+v", ds)
+	}
+
+	nested := schemas.ResourceTypes["tchoritest_nested_thing"]
+	if nested == nil {
+		t.Fatalf("tchoritest_nested_thing missing from ResourceTypes (nested_type must convert); UnsupportedResources = %v",
+			schemas.UnsupportedResources)
+	}
+	if _, unsupported := schemas.UnsupportedResources["tchoritest_nested_thing"]; unsupported {
+		t.Errorf("tchoritest_nested_thing present in UnsupportedResources = %q, want absent",
+			schemas.UnsupportedResources["tchoritest_nested_thing"])
+	}
+
+	settings := nested.Block.Attributes["settings"]
+	if settings == nil {
+		t.Fatal("missing attribute \"settings\"")
+	}
+	if !settings.Optional {
+		t.Errorf("settings.Optional = false, want true")
+	}
+	want := cty.ObjectWithOptionalAttrs(map[string]cty.Type{
+		"flag":  cty.Bool,
+		"label": cty.String,
+	}, []string{"flag", "label"})
+	if !settings.Type.Equals(want) {
+		t.Errorf("settings.Type = %#v, want %#v", settings.Type, want)
 	}
 }
 

@@ -110,9 +110,29 @@ func thing(addrName, cfgName string) *config.Resource {
 	}
 }
 
+// nestedThing returns a tchoritest_nested_thing resource (issue #7's
+// acceptance fixture — see testprovider's nestedThingSchema): "settings" is
+// a nested_type (SINGLE) attribute with two optional leaf attributes. A nil
+// settings omits the "settings" key from Config entirely, matching the real
+// acceptance shape (a config that leaves the nested attribute unset).
+func nestedThing(addrName, cfgName string, settings map[string]any) *config.Resource {
+	cfg := map[string]any{"name": cfgName}
+	if settings != nil {
+		cfg["settings"] = settings
+	}
+	return &config.Resource{
+		Address:  "tchoritest_nested_thing." + addrName,
+		Type:     "tchoritest_nested_thing",
+		Name:     addrName,
+		Provider: "tchoritest",
+		Config:   cfg,
+	}
+}
+
 // brokenThing returns a tchoritest_broken_thing resource: a resource type
-// whose schema tchori cannot convert (nested_type attribute — see
-// testprovider's brokenThingSchema).
+// whose schema tchori cannot convert (nested_type attribute using a nesting
+// mode blockFromProto does not recognize — see testprovider's
+// brokenThingSchema).
 func brokenThing(addrName, cfgName string) *config.Resource {
 	return &config.Resource{
 		Address:  "tchoritest_broken_thing." + addrName,
@@ -519,6 +539,86 @@ func TestApplyCreateIgnoresStalePriorState(t *testing.T) {
 	}
 	if got := attrs["echo"]; got != "foo" {
 		t.Errorf(`saved echo = %v, want "foo"`, got)
+	}
+}
+
+// TestApplyCreateNestedTypeOmitted guards issue #7's acceptance shape: a
+// config for a nested_type resource (tchoritest_nested_thing) that leaves
+// the whole nested attribute unset must validate, plan, and apply cleanly,
+// with "settings" round-tripping as null all the way through Compose ->
+// msgpack -> the fake provider -> saved state. This is exactly the real
+// infra shape the issue names (cloudflare_dns_record's TXT-record config
+// never sets the "data" nested attribute).
+func TestApplyCreateNestedTypeOmitted(t *testing.T) {
+	h := newHarness(t, map[string]*config.Resource{
+		"tchoritest_nested_thing.omitted": nestedThing("omitted", "omitted", nil),
+	})
+	ctx := context.Background()
+
+	st := loadState(t, h.statePath) // empty: serial 0
+	pl := h.plan(t, st, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "create" {
+		t.Fatalf("plan = %+v, want exactly one create change", pl.Changes)
+	}
+	if !strings.Contains(string(pl.Changes[0].After), `"settings":null`) {
+		t.Errorf("planned after = %s, want settings:null", pl.Changes[0].After)
+	}
+
+	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("Apply: %+v", ds)
+	}
+
+	attrs := stateAttrs(t, h.statePath, "tchoritest_nested_thing.omitted")
+	if got := attrs["id"]; got != "id-omitted" {
+		t.Errorf(`saved id = %v, want "id-omitted"`, got)
+	}
+	if got, ok := attrs["settings"]; !ok || got != nil {
+		t.Errorf(`saved settings = %#v, want nil (the nested attribute was never set in config)`, got)
+	}
+}
+
+// TestApplyCreateNestedTypePopulated guards issue #7's other required
+// shape: a nested_type SINGLE attribute that IS populated in config must
+// flow its values through Compose -> msgpack -> the fake provider -> saved
+// state unchanged (the fake provider's plan/apply for
+// tchoritest_nested_thing never touches "settings" — see
+// testprovider's planNestedThing/applyNestedThing).
+func TestApplyCreateNestedTypePopulated(t *testing.T) {
+	h := newHarness(t, map[string]*config.Resource{
+		"tchoritest_nested_thing.filled": nestedThing("filled", "filled", map[string]any{
+			"flag":  true,
+			"label": "hello",
+		}),
+	})
+	ctx := context.Background()
+
+	st := loadState(t, h.statePath) // empty: serial 0
+	pl := h.plan(t, st, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "create" {
+		t.Fatalf("plan = %+v, want exactly one create change", pl.Changes)
+	}
+	if !strings.Contains(string(pl.Changes[0].After), `"flag":true`) ||
+		!strings.Contains(string(pl.Changes[0].After), `"label":"hello"`) {
+		t.Errorf("planned after = %s, want it to carry the populated settings", pl.Changes[0].After)
+	}
+
+	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("Apply: %+v", ds)
+	}
+
+	attrs := stateAttrs(t, h.statePath, "tchoritest_nested_thing.filled")
+	if got := attrs["id"]; got != "id-filled" {
+		t.Errorf(`saved id = %v, want "id-filled"`, got)
+	}
+	settings, ok := attrs["settings"].(map[string]any)
+	if !ok {
+		t.Fatalf("saved settings = %#v, want a populated object", attrs["settings"])
+	}
+	if got := settings["flag"]; got != true {
+		t.Errorf(`saved settings["flag"] = %v, want true`, got)
+	}
+	if got := settings["label"]; got != "hello" {
+		t.Errorf(`saved settings["label"] = %v, want "hello"`, got)
 	}
 }
 
