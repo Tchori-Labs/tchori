@@ -52,6 +52,35 @@ var thingSchema = &tfprotov6.Schema{
 	},
 }
 
+// brokenThingSchema declares tchoritest_broken_thing: a resource type whose
+// schema carries a nested_type attribute (tfprotov6.SchemaObject in an
+// attribute's NestedType field, marshaled to the wire with an empty Type —
+// see internal/provider/schema.go's blockFromProto), which tchori's engine
+// cannot convert (nested_type support is out of scope; see issue #5). This
+// type exists purely as a test fixture: it is never configured, planned, or
+// applied by any test — only its presence in GetProviderSchema exercises the
+// engine's tolerate-until-used behavior (Schemas() must still succeed for
+// the whole provider, and only a config that actually references this type
+// may fail, with the stored per-type diagnostic).
+var brokenThingSchema = &tfprotov6.Schema{
+	Version: 0,
+	Block: &tfprotov6.SchemaBlock{
+		Attributes: []*tfprotov6.SchemaAttribute{
+			{Name: "name", Type: tftypes.String, Required: true},
+			{
+				Name:     "settings",
+				Optional: true,
+				NestedType: &tfprotov6.SchemaObject{
+					Nesting: tfprotov6.SchemaObjectNestingModeSingle,
+					Attributes: []*tfprotov6.SchemaAttribute{
+						{Name: "flag", Type: tftypes.Bool, Optional: true},
+					},
+				},
+			},
+		},
+	},
+}
+
 // server implements tfprotov6.ProviderServer. In terraform-plugin-go v0.31.0
 // that interface requires 23 methods (6 provider RPCs + ResourceServer 9 +
 // DataSourceServer 2 + FunctionServer 2 + EphemeralResourceServer 4). The
@@ -72,6 +101,7 @@ func (s *server) GetMetadata(ctx context.Context, req *tfprotov6.GetMetadataRequ
 		},
 		Resources: []tfprotov6.ResourceMetadata{
 			{TypeName: "tchoritest_thing"},
+			{TypeName: "tchoritest_broken_thing"},
 		},
 	}, nil
 }
@@ -80,7 +110,8 @@ func (s *server) GetProviderSchema(ctx context.Context, req *tfprotov6.GetProvid
 	return &tfprotov6.GetProviderSchemaResponse{
 		Provider: providerSchema,
 		ResourceSchemas: map[string]*tfprotov6.Schema{
-			"tchoritest_thing": thingSchema,
+			"tchoritest_thing":        thingSchema,
+			"tchoritest_broken_thing": brokenThingSchema,
 		},
 		DataSourceSchemas: map[string]*tfprotov6.Schema{},
 		Functions:         map[string]*tfprotov6.Function{},
