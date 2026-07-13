@@ -456,3 +456,36 @@ func TestPlanDestroy(t *testing.T) {
 		t.Error("HasChanges() = false, want true")
 	}
 }
+
+// TestPlanUnsupportedResourceType guards the fix for issue #5: a config that
+// references tchoritest_broken_thing (a resource type whose schema tchori
+// cannot convert — see testprovider's brokenThingSchema) must still fail at
+// Plan() time, but with a diagnostic that distinguishes "unsupported schema"
+// (known type, unconvertible schema) from "unknown resource type" (the
+// provider never defined it), naming the stored conversion detail. Every
+// other test in this file plans configs that reference only
+// tchoritest_thing, so the fake provider (rebuilt for every test in this
+// package with the broken type present too) already exercises the
+// "Schemas() succeeds despite one unsupported type" half of the fix.
+func TestPlanUnsupportedResourceType(t *testing.T) {
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_broken_thing.boom": {"name": "boom"},
+	})
+	st := stateWith(t, 0, nil)
+	p := newPlanner(t, cfg, st)
+
+	_, ds := p.Plan(context.Background())
+	if !ds.HasErrors() {
+		t.Fatal("Plan succeeded for a resource type with an unsupported (nested_type) schema, want error")
+	}
+	found := false
+	for _, d := range ds {
+		if strings.Contains(d.Summary, "unsupported schema") && strings.Contains(d.Detail, "nested_type") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("diagnostics = %+v, want one with summary containing %q and detail containing %q",
+			ds, "unsupported schema", "nested_type")
+	}
+}

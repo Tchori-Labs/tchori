@@ -211,6 +211,49 @@ func TestValidateInvalidName(t *testing.T) {
 	}
 }
 
+// TestValidateUnsupportedResourceType guards the fix for issue #5: a config
+// referencing tchoritest_broken_thing (a resource type whose schema tchori
+// cannot convert — see testprovider's brokenThingSchema, a nested_type
+// attribute) must fail validate with a diagnostic naming the stored
+// conversion detail, not crash or report a generic/misleading error. Other
+// tests in this file (e.g. TestCLILifecycle) prove that a config touching
+// only fully-supported flat resources still validates and plans cleanly even
+// though the provider now also exposes this unsupported type.
+func TestValidateUnsupportedResourceType(t *testing.T) {
+	dir := t.TempDir()
+	cfg := `{
+  "providers": {
+    "tchoritest": {
+      "source": "tchori-labs/tchoritest",
+      "version": "0.0.1",
+      "config": {"prefix": "t-"}
+    }
+  },
+  "resources": {
+    "tchoritest_broken_thing.boom": {
+      "config": {"name": "boom"}
+    }
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, stderr, code := runCLI(t, dir, "validate", "--plugin-dir="+pluginDir)
+	if code != 1 {
+		t.Fatalf("validate: exit %d, want 1\nstderr: %s", code, stderr)
+	}
+	if !strings.Contains(stderr, `"severity":"error"`) {
+		t.Errorf("stderr carries no structured JSON error diagnostic: %q", stderr)
+	}
+	if !strings.Contains(stderr, "unsupported schema") {
+		t.Errorf("stderr missing \"unsupported schema\": %q", stderr)
+	}
+	if !strings.Contains(stderr, "nested_type") {
+		t.Errorf("stderr missing the stored nested_type detail: %q", stderr)
+	}
+}
+
 func TestChdirGlobalFlag(t *testing.T) {
 	cfgDir := t.TempDir()
 	writeConfig(t, cfgDir, "demo")
