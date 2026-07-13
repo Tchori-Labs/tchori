@@ -42,6 +42,34 @@ type Schema struct {
 type ProviderSchemas struct {
 	Provider      *Schema
 	ResourceTypes map[string]*Schema
+	// UnsupportedResources records resource types the provider defines whose
+	// schema tchori could not convert (e.g. nested_type attributes — see
+	// blockFromProto), keyed by type name with the conversion error's detail
+	// text as the value. Schemas() tolerates these instead of failing the
+	// whole provider: a type here is only reported when a config or state
+	// entry actually references it (see LookupResourceType). Providers like
+	// cloudflare/cloudflare expose hundreds of resource types — many unused,
+	// some with nested attributes — and one unused type must not poison the
+	// provider's fully-supported flat resources (issue #5).
+	UnsupportedResources map[string]string
+}
+
+// LookupResourceType resolves typeName against ps, distinguishing the two
+// failure cases callers must report differently:
+//
+//   - schema, "", true: the type is known and its schema converted cleanly.
+//   - nil, detail, true: the type is known (the provider defines it) but its
+//     schema failed to convert — detail is the stored conversion error, e.g.
+//     a nested_type attribute message from blockFromProto.
+//   - nil, "", false: the provider does not define this resource type at all.
+func (ps *ProviderSchemas) LookupResourceType(typeName string) (schema *Schema, unsupportedDetail string, known bool) {
+	if s, ok := ps.ResourceTypes[typeName]; ok {
+		return s, "", true
+	}
+	if detail, ok := ps.UnsupportedResources[typeName]; ok {
+		return nil, detail, true
+	}
+	return nil, "", false
 }
 
 // ImpliedType returns the cty object type a value of this block must
@@ -90,13 +118,19 @@ func (c *Client) Schemas(ctx context.Context) (*ProviderSchemas, diag.Diagnostic
 		return nil, append(ds, diag.Errorf("", "invalid provider config schema", err.Error()))
 	}
 	out := &ProviderSchemas{
-		Provider:      providerSchema,
-		ResourceTypes: make(map[string]*Schema, len(resp.ResourceSchemas)),
+		Provider:             providerSchema,
+		ResourceTypes:        make(map[string]*Schema, len(resp.ResourceSchemas)),
+		UnsupportedResources: map[string]string{},
 	}
 	for typeName, ps := range resp.ResourceSchemas {
 		s, err := schemaFromProto(ps)
 		if err != nil {
-			return nil, append(ds, diag.Errorf("", "invalid schema for resource type "+typeName, err.Error()))
+			// Tolerate until used (issue #5): a resource type this engine
+			// cannot convert must not poison the whole provider. Record the
+			// detail and keep going; LookupResourceType surfaces it only if
+			// something actually references this type.
+			out.UnsupportedResources[typeName] = err.Error()
+			continue
 		}
 		out.ResourceTypes[typeName] = s
 	}
@@ -119,9 +153,10 @@ func schemaFromProto(ps *tfplugin6.Schema) (*Schema, error) {
 	return &Schema{Version: ps.Version, Block: block}, nil
 }
 
-// blockFromProto converts a wire Schema.Block. Attribute types arrive as
+// blockFromProto converts a wire Schema.Block. Flat attribute types arrive as
 // JSON-encoded cty type bytes (e.g. `"string"`, `["map","string"]`) and are
-// parsed with ctyjson.UnmarshalType.
+// parsed with ctyjson.UnmarshalType; nested_type attributes (pa.NestedType)
+// are converted recursively by attrTypeFromProto/nestedObjectType.
 func blockFromProto(pb *tfplugin6.Schema_Block) (*SchemaBlock, error) {
 	b := &SchemaBlock{
 		Attributes: map[string]*Attr{},
@@ -131,12 +166,9 @@ func blockFromProto(pb *tfplugin6.Schema_Block) (*SchemaBlock, error) {
 		return b, nil
 	}
 	for _, pa := range pb.Attributes {
-		if len(pa.Type) == 0 {
-			return nil, fmt.Errorf("attribute %q: nested attribute types (nested_type) are not supported", pa.Name)
-		}
-		ty, err := ctyjson.UnmarshalType(pa.Type)
+		ty, err := attrTypeFromProto(pa)
 		if err != nil {
-			return nil, fmt.Errorf("attribute %q: parsing type %s: %w", pa.Name, pa.Type, err)
+			return nil, err
 		}
 		b.Attributes[pa.Name] = &Attr{
 			Type:      ty,
@@ -167,6 +199,76 @@ func blockFromProto(pb *tfplugin6.Schema_Block) (*SchemaBlock, error) {
 		b.Blocks[pnb.TypeName] = &NestedBlock{Nesting: nesting, Block: inner}
 	}
 	return b, nil
+}
+
+// attrTypeFromProto converts one wire Schema_Attribute into a cty.Type. A
+// well-formed attribute carries exactly one of pa.Type (JSON-encoded cty
+// type bytes) or pa.NestedType (a *Schema_Object, aka nested_type — see
+// nestedObjectType). Neither set is a malformed schema.
+func attrTypeFromProto(pa *tfplugin6.Schema_Attribute) (cty.Type, error) {
+	if pa.NestedType != nil {
+		ty, err := nestedObjectType(pa.NestedType)
+		if err != nil {
+			return cty.NilType, fmt.Errorf("attribute %q: %w", pa.Name, err)
+		}
+		return ty, nil
+	}
+	if len(pa.Type) == 0 {
+		return cty.NilType, fmt.Errorf("attribute %q: neither type nor nested_type is set", pa.Name)
+	}
+	ty, err := ctyjson.UnmarshalType(pa.Type)
+	if err != nil {
+		return cty.NilType, fmt.Errorf("attribute %q: parsing type %s: %w", pa.Name, pa.Type, err)
+	}
+	return ty, nil
+}
+
+// nestedObjectType converts a tfprotov6 nested_type (Schema_Object) into its
+// cty type: SINGLE -> object, LIST -> list(object), SET -> set(object),
+// MAP -> map(object). Each nested attribute recurses through
+// attrTypeFromProto, so a nested_type attribute nested inside another
+// nested_type attribute converts the same way arbitrarily deep (issue #7).
+//
+// Non-required nested attributes (Optional or Computed-only) are marked
+// optional via cty.ObjectWithOptionalAttrs, mirroring how Terraform itself
+// treats non-required nested attributes: it lets a config that omits an
+// optional nested attribute/object entirely (this engine's Compose already
+// fills the missing key with cty.NullVal of the attribute's type either
+// way) and a source value with fewer attributes convert cleanly wherever a
+// nested value flows through cty/convert (e.g. resolving a ${ref} into a
+// nested attribute).
+//
+// A nesting mode this function does not recognize (i.e. not
+// SINGLE/LIST/SET/MAP) is a genuinely unconvertible schema: the caller
+// records it in ProviderSchemas.UnsupportedResources and tolerates it until
+// the resource type is actually used (issue #5's tolerate-until-used
+// machinery), exactly like any other conversion failure from this file.
+func nestedObjectType(so *tfplugin6.Schema_Object) (cty.Type, error) {
+	atys := make(map[string]cty.Type, len(so.Attributes))
+	var optional []string
+	for _, pa := range so.Attributes {
+		aty, err := attrTypeFromProto(pa)
+		if err != nil {
+			return cty.NilType, err
+		}
+		atys[pa.Name] = aty
+		if !pa.Required {
+			optional = append(optional, pa.Name)
+		}
+	}
+	obj := cty.ObjectWithOptionalAttrs(atys, optional)
+	switch so.Nesting {
+	case tfplugin6.Schema_Object_SINGLE:
+		return obj, nil
+	case tfplugin6.Schema_Object_LIST:
+		return cty.List(obj), nil
+	case tfplugin6.Schema_Object_SET:
+		return cty.Set(obj), nil
+	case tfplugin6.Schema_Object_MAP:
+		return cty.Map(obj), nil
+	default:
+		return cty.NilType, fmt.Errorf("nested attribute type (nested_type): unsupported nesting mode %s", so.Nesting)
+	}
 }
 
 // diagsFromProto converts protocol diagnostics into tchori diagnostics.
