@@ -100,6 +100,11 @@ Never push branches, open pull requests, or comment on repos outside
 `github.com/Tchori-Labs` — including upstreams of forked or vendored code
 (e.g. OpenTofu) — without explicit human approval recorded on the task first.
 
+## Task ownership & release path
+
+See [`docs/task-ownership.md`](docs/task-ownership.md) for the triage and merge
+owners, the release path for gated tasks, and the no-self-merge guardrail.
+
 ## Related
 
 Parent company repo: `Tchori-Labs/main` (state root — company/, org/,
