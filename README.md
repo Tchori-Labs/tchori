@@ -119,9 +119,10 @@ Exit codes follow the Terraform convention agents already know:
 
 State is a deterministic, git-diffable `state.json` in the working directory
 (flock-protected, with concurrent modifications rejected before
-`state.json.backup` and the state file are changed). Commits fsync the complete
-temp file before atomic replacement and fsync the directory before returning,
-so reported success is durable across abrupt host failure.
+`state.json.backup` and the state file are changed). On permission-supporting
+platforms, each backup is forced to owner read/write mode (`0600`). Commits
+fsync the complete temp file before atomic replacement and fsync the directory
+before returning, so reported success is durable across abrupt host failure.
 Format reference: [docs/formats.md](docs/formats.md).
 
 Provider responses are stored verbatim in `state.json` and `plan.json`, so

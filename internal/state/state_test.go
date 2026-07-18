@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -197,6 +198,68 @@ func TestSaveWritesBackupOnSecondSave(t *testing.T) {
 	}
 	if !bytes.Equal(gotBackup, firstSaveContent) {
 		t.Fatalf("backup content = %q, want first save's content %q", gotBackup, firstSaveContent)
+	}
+	assertOwnerReadWriteOnly(t, backupPath)
+}
+
+// TestSaveRetightensPermissiveBackup verifies Save overwrites stale backup
+// content and forces a pre-existing permissive backup back to mode 0600.
+func TestSaveRetightensPermissiveBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	backupPath := path + ".backup"
+
+	s, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load(missing) = %v", err)
+	}
+	s.Resources["thing.example"] = &ResourceState{
+		Type:       "thing",
+		Provider:   "test",
+		Attributes: json.RawMessage(`{"value":"before"}`),
+		Private:    []byte("sensitive state"),
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatalf("Save #1 = %v", err)
+	}
+	firstSaveContent, err := os.ReadFile(path) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(backupPath, []byte("stale backup"), 0o666); err != nil { //nolint:gosec // G306: permissive mode reproduces the regression
+		t.Fatalf("seed permissive backup = %v", err)
+	}
+	if err := os.Chmod(backupPath, 0o666); err != nil { //nolint:gosec // G302: explicit chmod defeats the process umask in this regression test
+		t.Fatalf("chmod seeded backup = %v", err)
+	}
+
+	s.Resources["thing.example"].Attributes = json.RawMessage(`{"value":"after"}`)
+	if err := s.Save(path); err != nil {
+		t.Fatalf("Save #2 = %v", err)
+	}
+	gotBackup, err := os.ReadFile(backupPath) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotBackup, firstSaveContent) {
+		t.Fatalf("backup content = %q, want first save's content %q", gotBackup, firstSaveContent)
+	}
+	assertOwnerReadWriteOnly(t, backupPath)
+}
+
+func assertOwnerReadWriteOnly(t *testing.T, path string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Log("skipping backup permission assertion on Windows")
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("os.Stat(%q) = %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("backup permissions = %o, want 600", got)
 	}
 }
 

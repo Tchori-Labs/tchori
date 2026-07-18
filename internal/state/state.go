@@ -214,9 +214,9 @@ func readSerial(path string) (uint64, error) {
 	return header.Serial, nil
 }
 
-// backupExisting copies the current file at path to path+".backup" before
-// it is overwritten. It is a no-op when path does not yet exist — there is
-// nothing to back up on the first save.
+// backupExisting copies the current file at path to path+".backup" before it
+// is overwritten, forcing mode 0600 where permissions are supported. It is a
+// no-op when path does not yet exist — there is nothing to back up on first save.
 func backupExisting(path string) error {
 	src, err := os.Open(path) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
 	if err != nil {
@@ -227,9 +227,13 @@ func backupExisting(path string) error {
 	}
 	defer func() { _ = src.Close() }()
 
-	dst, err := os.Create(path + ".backup") //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
+	dst, err := os.OpenFile(path+".backup", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
 	if err != nil {
 		return fmt.Errorf("create backup %s: %w", path+".backup", err)
+	}
+	if err := dst.Chmod(0o600); err != nil {
+		_ = dst.Close()
+		return fmt.Errorf("chmod backup %s: %w", path+".backup", err)
 	}
 	if _, err := io.Copy(dst, src); err != nil {
 		_ = dst.Close()
