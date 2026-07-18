@@ -2,13 +2,19 @@ package provider
 
 import (
 	"context"
+	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/zclconf/go-cty/cty"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // buildTestProvider compiles the Task 5 fake provider into a temp dir and
@@ -218,6 +224,136 @@ func TestSchemasConvertsNestedType(t *testing.T) {
 	}, []string{"flag", "label"})
 	if !settings.Type.Equals(want) {
 		t.Errorf("settings.Type = %#v, want %#v", settings.Type, want)
+	}
+}
+
+func TestLaunchCanceledContext(t *testing.T) {
+	bin := buildTestProvider(t)
+	pidFile := filepath.Join(t.TempDir(), "provider.pid")
+	t.Setenv("TCHORITEST_STALL_STARTUP", "1")
+	t.Setenv("TCHORITEST_PID_FILE", pidFile)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	type launchResult struct {
+		client *Client
+		err    error
+	}
+	resultCh := make(chan launchResult, 1)
+	started := time.Now()
+	go func() {
+		client, err := Launch(ctx, bin)
+		resultCh <- launchResult{client: client, err: err}
+	}()
+
+	pid := waitForProviderPID(t, pidFile, 5*time.Second)
+	cancel()
+
+	var result launchResult
+	select {
+	case result = <-resultCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Launch did not return within 5s of context cancellation")
+	}
+	if result.client != nil {
+		result.client.plugin.Kill()
+		t.Fatal("Launch returned a client after context cancellation")
+	}
+	if result.err == nil {
+		t.Fatal("Launch returned nil error after context cancellation")
+	}
+	if !errors.Is(result.err, context.Canceled) {
+		t.Errorf("Launch error = %v, want wrapped context.Canceled", result.err)
+	}
+	if !strings.Contains(result.err.Error(), "provider: launching ") || !strings.Contains(result.err.Error(), " canceled: context canceled") {
+		t.Errorf("Launch error = %q, want cancellation-classified launch error", result.err)
+	}
+	if elapsed := time.Since(started); elapsed >= providerStartTimeout {
+		t.Errorf("Launch returned after %v, want less than providerStartTimeout (%v)", elapsed, providerStartTimeout)
+	}
+
+	waitForProviderExit(t, pid, 5*time.Second)
+}
+
+func TestCloseStopProviderStall(t *testing.T) {
+	bin := buildTestProvider(t)
+	t.Setenv("TCHORITEST_STALL_STOP", "1")
+
+	c, err := Launch(context.Background(), bin)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	t.Cleanup(c.plugin.Kill)
+
+	closeResult := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		closeResult <- c.Close()
+	}()
+
+	var closeErr error
+	select {
+	case closeErr = <-closeResult:
+	case <-time.After(2 * providerStopGrace):
+		t.Fatalf("Close did not return within %v", 2*providerStopGrace)
+	}
+	if closeErr == nil {
+		t.Fatal("Close returned nil error when StopProvider exceeded its grace period")
+	}
+	if code := status.Code(closeErr); code != codes.DeadlineExceeded {
+		t.Errorf("Close error = %v (code %s), want DeadlineExceeded", closeErr, code)
+	}
+	if elapsed := time.Since(started); elapsed >= 2*providerStopGrace {
+		t.Errorf("Close returned after %v, want less than %v", elapsed, 2*providerStopGrace)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !c.plugin.Exited() {
+		if time.Now().After(deadline) {
+			t.Fatal("provider subprocess still running 5s after bounded Close")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForProviderPID(t *testing.T, path string, timeout time.Duration) int {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		raw, err := os.ReadFile(path) //nolint:gosec // G304: path is the t.TempDir PID artifact supplied by this test
+		if err == nil {
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(raw)))
+			if parseErr != nil {
+				t.Fatalf("parsing provider PID %q: %v", raw, parseErr)
+			}
+			return pid
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("reading provider PID file: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("provider did not write PID file within %v", timeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForProviderExit(t *testing.T, pid int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		err := syscall.Kill(pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		if err != nil && !errors.Is(err, syscall.EPERM) {
+			t.Fatalf("checking provider process %d: %v", pid, err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("provider process %d still exists %v after Launch returned", pid, timeout)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
