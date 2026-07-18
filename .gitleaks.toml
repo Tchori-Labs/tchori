@@ -1,0 +1,6 @@
+title = "tchori secret-scanning configuration"
+
+# Inherit Gitleaks' maintained rules. Suppressions must be narrow, documented
+# false positives; real credentials must be revoked and removed instead.
+[extend]
+useDefault = true

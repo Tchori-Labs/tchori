@@ -41,6 +41,38 @@ jobs:
       - name: go test
         run: go test ./...
 
+  secretscan:
+    name: secretscan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: install Gitleaks
+        timeout-minutes: 5
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/zricethezav/gitleaks/v8@v8.30.1
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: scan full Git history
+        timeout-minutes: 6
+        run: timeout 5m gitleaks git . --log-opts=--all --no-banner --config .gitleaks.toml --redact --exit-code 1
+
+      - name: scan working tree
+        timeout-minutes: 6
+        run: timeout 5m gitleaks dir . --no-banner --config .gitleaks.toml --redact --exit-code 1
+
+      - name: verify synthetic secret detection
+        timeout-minutes: 2
+        run: bash scripts/gitleaks-selftest.sh
+
   race:
     name: race
     runs-on: ubuntu-latest
