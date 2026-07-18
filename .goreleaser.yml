@@ -39,9 +39,32 @@ release:
   github:
     owner: tchori-labs
     name: tchori
+  # Keep assets private until the workflow has validated and attested them.
+  # A retry safely replaces an incomplete draft left by a failed run.
+  draft: true
+  replace_existing_draft: true
 
 checksum:
   name_template: "checksums.txt"
+
+sboms:
+  - id: archives
+    artifacts: archive
+    disable: false
+
+signs:
+  - id: checksums
+    artifacts: checksum
+    cmd: cosign
+    signature: "${artifact}.sig"
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-signature=${signature}"
+      - "--output-certificate=${certificate}"
+      - "${artifact}"
+      - --yes
+    output: true
 
 changelog:
   disable: true

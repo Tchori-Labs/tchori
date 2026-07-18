@@ -59,6 +59,14 @@ from source:
 go install github.com/tchori-labs/tchori/cmd/tchori@latest
 ```
 
+### Verifying downloads
+
+Release archives include a per-archive SPDX SBOM, a checksum manifest protected
+by a keyless Cosign signature, and GitHub build-provenance attestations. Verify
+the workflow identity, archive checksum, and provenance before installing a
+download; see [the release verification guide](docs/releasing.md#consumer-verification)
+for copy-pasteable commands.
+
 ## Quickstart
 
 No credential-free protocol-6 provider exists on the public registry yet, so
