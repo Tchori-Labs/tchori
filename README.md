@@ -154,11 +154,20 @@ apply-via-MCP, Homebrew tap (post-0.1).
 ## Development
 
 ```sh
-go test ./...                # unit + protocol tests (in-process fake provider)
-go test -tags e2e ./e2e -v   # built binary: fake-provider lifecycle, real
-                             # registry install, protocol-5 graceful failure
-                             # (network required)
+go test ./...                         # unit + protocol tests (in-process fake provider)
+go test -race -timeout=2m ./...       # full untagged suite under the race detector
+go test -tags e2e ./e2e -v            # built binary: fake-provider lifecycle, real
+                                      # registry install, protocol-5 graceful failure
+                                      # (network required)
 ```
+
+CI runs the full race suite in a dedicated job: it measured 47.5 seconds cold
+and 20.8 seconds for a warm three-run stability check, so narrowing to a
+package subset was not justified. The required `check` job depends on `race`,
+which makes a successful existing merge gate contingent on the detector lane.
+The two-minute per-package timeout is more than three times the slowest
+observed package (35.8 seconds) while bounding hung tests; tag-gated e2e
+coverage remains in its existing job.
 
 Provider acceptance: `docs/acceptance-admanager.md` is the manual checklist
 for running `terraform-provider-admanager` under tchori against a Google Ad

@@ -11,6 +11,7 @@ permissions:
 jobs:
   check:
     name: check
+    needs: race
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -39,6 +40,20 @@ jobs:
 
       - name: go test
         run: go test ./...
+
+  race:
+    name: race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: go test (race detector)
+        run: go test -race -timeout=2m ./...
 
   e2e:
     name: e2e
