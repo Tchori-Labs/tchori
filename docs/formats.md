@@ -182,8 +182,9 @@ creates.
 
 - `state.Load` on a missing path returns a fresh, empty state:
   `format_version: "1.0"`, `serial: 0`, `resources: {}` — not an error.
-- `Save` increments `Serial` unconditionally on **every** call, regardless
-  of whether the resource data actually changed.
+- Each successful `Save` increments `Serial`, regardless of whether the
+  resource data actually changed. A save rejected because another process
+  committed from the same base does not increment it.
 - Apply saves state after *each* successfully applied resource, not once
   per `apply` invocation — so an apply that creates two resources bumps
   `serial` by 2 (visible in the worked example below: two creates take the
@@ -191,18 +192,34 @@ creates.
   safety possible: if a later resource in the same apply fails, everything
   already applied is already saved under its own incremented serial.
 
-### Locking and backup behavior
+### Locking, backup, and durability behavior
 
 `Save` (`internal/state/state.go`):
 
 1. Acquires an flock-based lock at `path+".lock"` (`github.com/gofrs/flock`),
    polling every 50ms up to a 10-second timeout, and releases it via
    `defer`.
-2. Copies the current file at `path` to `path+".backup"` before overwriting
+2. Re-reads the on-disk serial and compares it with the base serial observed
+   by `Load` or the preceding successful `Save`. If another process committed
+   in the meantime, `Save` returns `state.ErrConcurrentModification` with the
+   state path and re-run guidance; neither the state nor its backup is touched.
+3. Copies the current file at `path` to `path+".backup"` before overwriting
    — a no-op on the very first save, since there's nothing to back up yet.
-3. Increments `Serial`, marshals, and writes atomically: `MarshalIndent`
-   to a temp file (`.state-*.tmp`) in the same directory, then
-   `os.Rename` over `path`.
+4. Increments `Serial`, marshals with `MarshalIndent`, writes a temp file
+   (`.state-*.tmp`) in the same directory, and fsyncs the complete file before
+   closing it.
+5. Atomically renames the temp file over `path`, then fsyncs the containing
+   directory before reporting success. Failures before rename remove the temp
+   file and leave the in-memory serial unchanged. A post-rename directory-sync
+   failure is returned without deleting the newly committed state; the
+   in-memory serial and compare-and-swap base advance to match that visible
+   replacement so a retry does not report a false concurrent modification. A
+   successful commit becomes the next base, so apply's per-resource saves can
+   continue sequentially.
+
+Together, the file and directory fsync barriers mean a `nil` return confirms
+both the state contents and the atomic directory-entry replacement reached
+stable storage across abrupt process or host failure.
 
 ### Determinism
 

@@ -1,10 +1,12 @@
 // Package state implements tchori's deterministic, git-diffable state
-// file: atomic load/save with flock-based locking and backup-on-write.
+// file: crash-durable atomic saves with flock locking and backup-on-write.
 package state
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,10 +19,24 @@ import (
 // formatVersion is the only state file schema version the MVP understands.
 const formatVersion = "1.0"
 
+// ErrConcurrentModification indicates that state changed on disk after it was
+// loaded. The caller should reload state and re-run its operation to reconcile
+// with the other process's committed changes.
+var ErrConcurrentModification = errors.New("state was modified by another process since it was loaded; re-run the command to reconcile the latest state")
+
 // lockTimeout bounds how long Save waits to acquire path+".lock" before
 // giving up. State files are local and short-lived; a lock should never be
 // held for long.
 const lockTimeout = 10 * time.Second
+
+// Filesystem seams keep Save's failure paths deterministic in tests while
+// production uses the real durability and atomic-replacement operations.
+var (
+	fsyncFile  = (*os.File).Sync
+	closeFile  = (*os.File).Close
+	renameFile = os.Rename
+	syncDir    = defaultSyncDir
+)
 
 // ResourceState is the persisted state of a single managed resource.
 type ResourceState struct {
@@ -35,6 +51,7 @@ type State struct {
 	FormatVersion string                    `json:"format_version"` // "1.0"
 	Serial        uint64                    `json:"serial"`
 	Resources     map[string]*ResourceState `json:"resources"` // key = address
+	baseSerial    uint64                    `json:"-"`
 }
 
 // Load returns an empty state (FormatVersion "1.0", Serial 0, empty map)
@@ -65,13 +82,23 @@ func Load(path string) (*State, error) {
 	if s.Resources == nil {
 		s.Resources = map[string]*ResourceState{}
 	}
+	s.baseSerial = s.Serial
 	return &s, nil
 }
 
-// Save acquires path+".lock" via flock, writes path+".backup" (copy of the
-// existing file, if any) before overwriting, increments Serial, then writes
-// atomically: MarshalIndent with two-space indent plus a trailing newline
-// to a temp file in the same directory, followed by os.Rename.
+// Save acquires path+".lock" via flock and compares the on-disk serial with
+// the base serial observed by Load or the preceding successful Save. If they
+// differ, Save returns ErrConcurrentModification without changing the state or
+// its backup. Otherwise, Save writes path+".backup" (copy of the existing file,
+// if any) before overwriting, increments Serial, then commits crash-durably:
+// MarshalIndent with two-space indent plus a trailing newline to a temp file in
+// the same directory, fsync the complete temp file, close it, atomically rename
+// it over path, then fsync the containing directory before reporting success.
+// Failures before rename remove the temp file and leave Serial unchanged. A
+// directory-sync failure is returned without removing the state file because
+// the rename already took effect; Serial and the compare-and-swap base advance
+// to match that visible replacement, allowing a caller to retry safely. Save
+// reports success only after the directory sync completes.
 func (s *State) Save(path string) error {
 	lock := flock.New(path + ".lock")
 	defer func() { _ = lock.Close() }()
@@ -87,6 +114,14 @@ func (s *State) Save(path string) error {
 		return fmt.Errorf("timed out acquiring lock %s", path+".lock")
 	}
 
+	onDiskSerial, err := readSerial(path)
+	if err != nil {
+		return err
+	}
+	if onDiskSerial != s.baseSerial {
+		return fmt.Errorf("%s: on-disk serial %d does not match loaded serial %d: %w", path, onDiskSerial, s.baseSerial, ErrConcurrentModification)
+	}
+
 	if err := backupExisting(path); err != nil {
 		return err
 	}
@@ -95,9 +130,14 @@ func (s *State) Save(path string) error {
 	if s.Resources == nil {
 		s.Resources = map[string]*ResourceState{}
 	}
-	s.Serial++
+	// Marshal a copy with the next serial so pre-rename failures do not mutate
+	// the caller's serial. Once rename succeeds, the replacement is visible and
+	// both Serial and baseSerial must advance even if the durability barrier
+	// below subsequently fails.
+	next := *s
+	next.Serial++
 
-	data, err := json.MarshalIndent(s, "", "  ")
+	data, err := json.MarshalIndent(&next, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
@@ -110,19 +150,68 @@ func (s *State) Save(path string) error {
 	}
 	tmpPath := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
+		_ = closeFile(tmp)
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("write temp state file: %w", err)
 	}
-	if err := tmp.Close(); err != nil {
+	if err := fsyncFile(tmp); err != nil {
+		_ = closeFile(tmp)
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("sync temp state file: %w", err)
+	}
+	if err := closeFile(tmp); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("close temp state file: %w", err)
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := renameFile(tmpPath, path); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename temp state file: %w", err)
 	}
+	s.Serial = next.Serial
+	s.baseSerial = next.Serial
+	if err := syncDir(dir); err != nil {
+		return fmt.Errorf("sync state directory %s: %w", dir, err)
+	}
 	return nil
+}
+
+// defaultSyncDir persists a completed rename's directory entry before Save
+// reports success.
+func defaultSyncDir(dir string) error {
+	f, err := os.Open(dir) //nolint:gosec // G304: dir is derived from the operator-supplied state path, not attacker-controlled
+	if err != nil {
+		return fmt.Errorf("open directory: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync directory: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close directory: %w", err)
+	}
+	return nil
+}
+
+// readSerial returns the serial currently committed at path. A missing or
+// empty file is the serial-zero state expected by a fresh State.
+func readSerial(path string) (uint64, error) {
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read state serial %s: %w", path, err)
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		return 0, nil
+	}
+	var header struct {
+		Serial uint64 `json:"serial"`
+	}
+	if err := json.Unmarshal(data, &header); err != nil {
+		return 0, fmt.Errorf("parse state serial %s: %w", path, err)
+	}
+	return header.Serial, nil
 }
 
 // backupExisting copies the current file at path to path+".backup" before
