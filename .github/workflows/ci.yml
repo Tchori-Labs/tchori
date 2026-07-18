@@ -14,6 +14,7 @@ jobs:
     needs: race
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # Lint and tests typically finish in 5–7 minutes; ~2x headroom bounds hangs.
     steps:
       - name: Require race detector success
         env:
@@ -86,6 +87,7 @@ jobs:
   race:
     name: race
     runs-on: ubuntu-latest
+    timeout-minutes: 10 # The race test command has a two-minute test timeout; headroom covers setup and compilation.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -101,6 +103,7 @@ jobs:
     name: e2e
     needs: check
     runs-on: ubuntu-latest
+    timeout-minutes: 20 # Registry and provider lifecycle typically finish under 10 minutes; ~2x headroom bounds hangs.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -116,6 +119,7 @@ jobs:
     name: goreleaser
     needs: check
     runs-on: ubuntu-latest
+    timeout-minutes: 30 # Snapshot cross-builds typically finish under 15 minutes; ~2x headroom bounds stalls.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
