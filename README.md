@@ -110,7 +110,10 @@ Exit codes follow the Terraform convention agents already know:
 `0` success / no changes · `2` plan has changes · `1` error.
 
 State is a deterministic, git-diffable `state.json` in the working directory
-(flock-protected, `state.json.backup` written before every mutation).
+(flock-protected, with concurrent modifications rejected before
+`state.json.backup` and the state file are changed). Commits fsync the complete
+temp file before atomic replacement and fsync the directory before returning,
+so reported success is durable across abrupt host failure.
 Format reference: [docs/formats.md](docs/formats.md).
 
 Provider responses are stored verbatim in `state.json` and `plan.json`, so
