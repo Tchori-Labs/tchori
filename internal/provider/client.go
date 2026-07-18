@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
 	plugin "github.com/hashicorp/go-plugin"
@@ -24,9 +25,19 @@ import (
 	"github.com/tchori-labs/tchori/internal/provider/proto/tfplugin6"
 )
 
-// pluginName is the fixed plugin name every Terraform/OpenTofu provider
-// registers itself under. It is not configurable.
-const pluginName = "provider"
+const (
+	// pluginName is the fixed plugin name every Terraform/OpenTofu provider
+	// registers itself under. It is not configurable.
+	pluginName = "provider"
+
+	// providerStartTimeout bounds the provider handshake at 60 seconds so a
+	// subprocess that never starts serving cannot block tchori indefinitely.
+	providerStartTimeout = 60 * time.Second
+
+	// providerStopGrace gives a provider 5 seconds to flush and stop cleanly;
+	// after this finite grace period tchori unconditionally kills the process.
+	providerStopGrace = 5 * time.Second
+)
 
 // handshake must exactly match Terraform/OpenTofu's handshake constants —
 // every real provider binary rejects clients that present anything else.
@@ -63,25 +74,35 @@ func (p *grpcProviderPlugin) GRPCServer(*plugin.GRPCBroker, *grpc.Server) error 
 
 // Client wraps a live provider subprocess speaking plugin protocol 6.
 type Client struct {
-	grpc    tfplugin6.ProviderClient
-	plugin  *plugin.Client
-	schemas *ProviderSchemas // cached by Schemas
+	grpc          tfplugin6.ProviderClient
+	plugin        *plugin.Client
+	cancelCommand context.CancelFunc
+	schemas       *ProviderSchemas // cached by Schemas
 }
 
 // Launch starts the provider binary as a go-plugin subprocess, performs
 // the handshake (AutoMTLS, gRPC only, protocol 6 only), and dispenses the
-// provider's gRPC client. ctx is accepted for interface symmetry; process
-// lifetime is managed by Close, not by ctx.
+// provider's gRPC client. Startup honors ctx and is independently bounded by
+// providerStartTimeout; cancellation kills and reaps the subprocess.
 func Launch(ctx context.Context, binary string) (*Client, error) {
-	_ = ctx
+	commandCtx, cancelCommand := context.WithCancel(context.Background())
+	stopCallerCancellation := context.AfterFunc(ctx, cancelCommand)
+	keepCommandContext := false
+	defer func() {
+		stopCallerCancellation()
+		if !keepCommandContext {
+			cancelCommand()
+		}
+	}()
 
 	pc := plugin.NewClient(&plugin.ClientConfig{
 		HandshakeConfig: handshake,
 		VersionedPlugins: map[int]plugin.PluginSet{
 			6: {pluginName: &grpcProviderPlugin{}},
 		},
-		Cmd:              exec.Command(binary), //nolint:gosec // no CLI args; binary path comes from tchori's own registry/discovery
+		Cmd:              exec.CommandContext(commandCtx, binary), //nolint:gosec // no CLI args; binary path comes from tchori's own registry/discovery
 		AllowedProtocols: []plugin.Protocol{plugin.ProtocolGRPC},
+		StartTimeout:     providerStartTimeout,
 		AutoMTLS:         true,
 		Logger: hclog.New(&hclog.LoggerOptions{
 			Name:   "provider",
@@ -90,7 +111,35 @@ func Launch(ctx context.Context, binary string) (*Client, error) {
 		}),
 	})
 
-	rpcClient, err := pc.Client()
+	type clientResult struct {
+		client plugin.ClientProtocol
+		err    error
+	}
+	resultCh := make(chan clientResult, 1)
+	go func() {
+		client, err := pc.Client()
+		resultCh <- clientResult{client: client, err: err}
+	}()
+
+	var result clientResult
+	select {
+	case result = <-resultCh:
+		// Detach the live provider from startup cancellation. If cancellation
+		// has already won the race, AfterFunc has killed the command and the
+		// launch must still be reported as canceled.
+		if !stopCallerCancellation() {
+			pc.Kill()
+			return nil, fmt.Errorf("provider: launching %q canceled: %w", binary, ctx.Err())
+		}
+	case <-ctx.Done():
+		// CommandContext interrupts Start while go-plugin holds its startup
+		// lock; Kill then waits for Client to unwind and reaps the process.
+		cancelCommand()
+		pc.Kill()
+		return nil, fmt.Errorf("provider: launching %q canceled: %w", binary, ctx.Err())
+	}
+
+	rpcClient, err := result.client, result.err
 	if err != nil {
 		pc.Kill()
 		// go-plugin reports a failed protocol negotiation as
@@ -124,15 +173,21 @@ func Launch(ctx context.Context, binary string) (*Client, error) {
 		return nil, fmt.Errorf("provider: %q negotiated protocol %d, want 6 (protocol-5-only provider?)", binary, v)
 	}
 
-	return &Client{grpc: grpcClient, plugin: pc}, nil
+	keepCommandContext = true
+	return &Client{grpc: grpcClient, plugin: pc, cancelCommand: cancelCommand}, nil
 }
 
-// Close asks the provider to stop via the StopProvider RPC (a chance to
-// flush and clean up), then kills the subprocess. Kill blocks until the
-// process has exited. Pattern adapted from OpenTofu
+// Close gives the provider providerStopGrace to stop via the StopProvider RPC
+// (a chance to flush and clean up), then always kills the subprocess. Kill
+// blocks until the process has exited; a stop timeout or error is returned
+// after the process is reaped. Pattern adapted from OpenTofu
 // internal/plugin6/grpc_provider.go (Stop + Close) at v1.12.3, MPL-2.0.
 func (c *Client) Close() error {
-	_, stopErr := c.grpc.StopProvider(context.Background(), &tfplugin6.StopProvider_Request{})
+	ctx, cancel := context.WithTimeout(context.Background(), providerStopGrace)
+	defer cancel()
+
+	_, stopErr := c.grpc.StopProvider(ctx, &tfplugin6.StopProvider_Request{})
 	c.plugin.Kill()
+	c.cancelCommand()
 	return stopErr
 }

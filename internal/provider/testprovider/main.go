@@ -7,6 +7,9 @@ package main
 import (
 	"context"
 	"log"
+	"os"
+	"strconv"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6/tf6server"
@@ -206,6 +209,9 @@ func (s *server) ConfigureProvider(ctx context.Context, req *tfprotov6.Configure
 }
 
 func (s *server) StopProvider(ctx context.Context, req *tfprotov6.StopProviderRequest) (*tfprotov6.StopProviderResponse, error) {
+	if os.Getenv("TCHORITEST_STALL_STOP") != "" {
+		time.Sleep(30 * time.Second)
+	}
 	return &tfprotov6.StopProviderResponse{}, nil
 }
 
@@ -528,6 +534,15 @@ func (s *server) CloseEphemeralResource(ctx context.Context, req *tfprotov6.Clos
 }
 
 func main() {
+	if pidFile := os.Getenv("TCHORITEST_PID_FILE"); pidFile != "" {
+		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil { //nolint:gosec // G703: test-only path is explicitly provided by the lifecycle test
+			log.Fatal(err)
+		}
+	}
+	if os.Getenv("TCHORITEST_STALL_STARTUP") != "" {
+		time.Sleep(24 * time.Hour)
+	}
+
 	err := tf6server.Serve(
 		"registry.opentofu.org/tchori-labs/tchoritest",
 		func() tfprotov6.ProviderServer { return &server{} },
