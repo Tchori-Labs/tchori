@@ -204,7 +204,9 @@ creates.
    in the meantime, `Save` returns `state.ErrConcurrentModification` with the
    state path and re-run guidance; neither the state nor its backup is touched.
 3. Copies the current file at `path` to `path+".backup"` before overwriting
-   — a no-op on the very first save, since there's nothing to back up yet.
+   — a no-op on the very first save, since there's nothing to back up yet. On
+   permission-supporting platforms, each backup is created or re-tightened to
+   owner read/write mode (`0600`).
 4. Increments `Serial`, marshals with `MarshalIndent`, writes a temp file
    (`.state-*.tmp`) in the same directory, and fsyncs the complete file before
    closing it.
