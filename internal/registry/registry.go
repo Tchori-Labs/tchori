@@ -5,6 +5,7 @@ package registry
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -16,6 +17,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/ProtonMail/go-crypto/openpgp"
 )
 
 // defaultBaseURL is used by Install when baseURL is empty.
@@ -55,6 +58,15 @@ type versionsResponse struct {
 	} `json:"versions"`
 }
 
+// gpgPublicKey is an allowed provider-checksum signing key advertised by the
+// registry. ASCIIArmor is the directly trusted OpenPGP public-key material;
+// TrustSignature is parsed for protocol compatibility but is not honored.
+type gpgPublicKey struct {
+	KeyID          string `json:"key_id"`
+	ASCIIArmor     string `json:"ascii_armor"`
+	TrustSignature string `json:"trust_signature"`
+}
+
 // downloadResponse is the shape of
 // GET /v1/providers/{ns}/{name}/{version}/download/{os}/{arch}.
 type downloadResponse struct {
@@ -62,6 +74,15 @@ type downloadResponse struct {
 	DownloadURL string `json:"download_url"`
 	ShasumsURL  string `json:"shasums_url"`
 	Shasum      string `json:"shasum"`
+
+	// ShasumsSignatureURL locates the binary detached OpenPGP signature over
+	// the exact bytes served by ShasumsURL.
+	ShasumsSignatureURL string `json:"shasums_signature_url"`
+	// SigningKeys lists the only OpenPGP public keys allowed to authenticate
+	// that detached signature. Missing or malformed keys fail closed.
+	SigningKeys struct {
+		GPGPublicKeys []gpgPublicKey `json:"gpg_public_keys"`
+	} `json:"signing_keys"`
 }
 
 // httpGet issues a GET request and returns the response with its body still
@@ -86,19 +107,90 @@ func httpGet(ctx context.Context, url string) (*http.Response, error) {
 	return resp, nil
 }
 
-// findSHA256 scans a SHA256SUMS document (lines of "<hex-sha256>  <filename>")
-// for the entry matching filename and returns its hash.
-func findSHA256(sumsBody, filename string) (string, error) {
-	for _, line := range strings.Split(sumsBody, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		if fields[1] == filename {
-			return fields[0], nil
+// verifyShasumsSignature authenticates the exact SHA256SUMS bytes that will
+// subsequently be parsed. It fails closed unless every advertised key is valid
+// OpenPGP material and the binary detached signature verifies against one of
+// those directly advertised keys; registry trust_signature delegation is not
+// followed.
+func verifyShasumsSignature(sumsBytes, sigBytes []byte, keys []gpgPublicKey) error {
+	if len(keys) == 0 {
+		return fmt.Errorf("registry: no usable signing key advertised for SHA256SUMS")
+	}
+
+	allEmpty := true
+	for _, key := range keys {
+		if strings.TrimSpace(key.ASCIIArmor) != "" {
+			allEmpty = false
+			break
 		}
 	}
-	return "", fmt.Errorf("registry: no SHA256SUMS entry for %s", filename)
+	if allEmpty {
+		return fmt.Errorf("registry: no usable signing key advertised for SHA256SUMS")
+	}
+
+	var keyring openpgp.EntityList
+	for i, key := range keys {
+		if strings.TrimSpace(key.ASCIIArmor) == "" {
+			return fmt.Errorf("registry: advertised signing key %d has empty ascii_armor", i)
+		}
+		entities, err := openpgp.ReadArmoredKeyRing(strings.NewReader(key.ASCIIArmor))
+		if err != nil {
+			return fmt.Errorf("registry: malformed advertised signing key %d: %w", i, err)
+		}
+		if len(entities) == 0 {
+			return fmt.Errorf("registry: malformed advertised signing key %d: no OpenPGP entity", i)
+		}
+		keyring = append(keyring, entities...)
+	}
+
+	if _, err := openpgp.CheckDetachedSignature(
+		keyring,
+		bytes.NewReader(sumsBytes),
+		bytes.NewReader(sigBytes),
+		nil,
+	); err != nil {
+		return fmt.Errorf("registry: SHA256SUMS signature verification failed: %w", err)
+	}
+	return nil
+}
+
+// normalizeSHA256 validates an exact 32-byte hexadecimal digest and returns
+// its canonical lowercase representation.
+func normalizeSHA256(value, source string) (string, error) {
+	if len(value) != sha256.Size*2 {
+		return "", fmt.Errorf("registry: invalid SHA256 for %s: want 64 hexadecimal characters", source)
+	}
+	if _, err := hex.DecodeString(value); err != nil {
+		return "", fmt.Errorf("registry: invalid SHA256 for %s: %w", source, err)
+	}
+	return strings.ToLower(value), nil
+}
+
+// findSHA256 is the single source of SHA256SUMS filename lookup. It requires
+// exactly one case-sensitive filename match, validates that entry's digest,
+// and rejects duplicate entries even when their hashes are equal.
+func findSHA256(sumsBytes []byte, filename string) (string, error) {
+	var match string
+	matches := 0
+	for _, line := range strings.Split(string(sumsBytes), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || fields[1] != filename {
+			continue
+		}
+		matches++
+		if matches > 1 {
+			return "", fmt.Errorf("registry: duplicate SHA256SUMS entries for %s", filename)
+		}
+		var err error
+		match, err = normalizeSHA256(fields[0], "SHA256SUMS entry for "+filename)
+		if err != nil {
+			return "", err
+		}
+	}
+	if matches == 0 {
+		return "", fmt.Errorf("registry: no SHA256SUMS entry for %s", filename)
+	}
+	return match, nil
 }
 
 // extractZipFile copies one zip entry's content to destPath. The copy is
@@ -162,9 +254,11 @@ func safeZipEntryName(name string) (string, error) {
 
 // Install downloads source@version for the current GOOS/GOARCH from the
 // OpenTofu registry (baseURL default "https://registry.opentofu.org"),
-// verifies the zip's SHA256 against the SHA256SUMS document, extracts the
-// provider binary to cacheDir/<ns>/<name>/<version>/<os>_<arch>/, and
-// returns the binary path. cacheDir default: ~/.tchori/providers.
+// authenticates the exact SHA256SUMS bytes with a detached OpenPGP signature
+// from an advertised key, cross-checks the archive SHA256 against both the
+// signed entry and descriptor, then extracts the provider binary to
+// cacheDir/<ns>/<name>/<version>/<os>_<arch>/ and returns its path. cacheDir
+// default: ~/.tchori/providers. No cache path is created before verification.
 func Install(ctx context.Context, source, version, baseURL, cacheDir string) (string, error) {
 	ns, name, err := parseSource(source)
 	if err != nil {
@@ -242,8 +336,8 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 	}
 	sum := hex.EncodeToString(hasher.Sum(nil))
 
-	// 4. Fetch SHA256SUMS and verify our computed hash against the entry
-	// for this zip's filename.
+	// 4. Fetch SHA256SUMS once, authenticate those exact bytes with its
+	// detached signature, and only then trust its entry for this zip.
 	sResp, err := httpGet(ctx, meta.ShasumsURL)
 	if err != nil {
 		return "", err
@@ -253,12 +347,35 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 	if err != nil {
 		return "", fmt.Errorf("registry: reading %s: %w", meta.ShasumsURL, err)
 	}
-	want, err := findSHA256(string(sumsBody), meta.Filename)
+	if strings.TrimSpace(meta.ShasumsSignatureURL) == "" {
+		return "", fmt.Errorf("registry: missing required shasums_signature_url for %s", meta.Filename)
+	}
+	sigResp, err := httpGet(ctx, meta.ShasumsSignatureURL)
 	if err != nil {
 		return "", err
 	}
-	if sum != want {
-		return "", fmt.Errorf("registry: checksum mismatch for %s: computed %s, SHA256SUMS says %s", meta.Filename, sum, want)
+	sigBytes, err := io.ReadAll(sigResp.Body)
+	_ = sigResp.Body.Close()
+	if err != nil {
+		return "", fmt.Errorf("registry: reading %s: %w", meta.ShasumsSignatureURL, err)
+	}
+	if err := verifyShasumsSignature(sumsBody, sigBytes, meta.SigningKeys.GPGPublicKeys); err != nil {
+		return "", err
+	}
+
+	entryHash, err := findSHA256(sumsBody, meta.Filename)
+	if err != nil {
+		return "", err
+	}
+	descriptorHash, err := normalizeSHA256(meta.Shasum, "download descriptor shasum")
+	if err != nil {
+		return "", err
+	}
+	if descriptorHash != entryHash {
+		return "", fmt.Errorf("registry: descriptor shasum disagrees with signed SHA256SUMS for %s", meta.Filename)
+	}
+	if sum != entryHash {
+		return "", fmt.Errorf("registry: checksum mismatch for %s: computed %s, SHA256SUMS says %s", meta.Filename, sum, entryHash)
 	}
 
 	// 5. Extract the terraform-provider-* binary into the cache layout.

@@ -36,18 +36,21 @@ Status: **0.1.0-dev** — pre-MVP, under active development, built in public.
 tchori speaks plugin protocol **6** (tfplugin6) — the protocol every
 provider built on terraform-plugin-framework speaks. The classic hashicorp
 utility providers (`null`, `random`, `time`, `local`) publish
-protocol-5-only binaries: `tchori providers install` still downloads and
-checksum-verifies them, but launching one fails fast with a structured
-diagnostic naming the protocol mismatch (`provider protocol unsupported`).
-A tfplugin5 adapter is a recorded post-MVP roadmap item.
+protocol-5-only binaries: `tchori providers install` still downloads them,
+PGP-verifies the registry's signed `SHA256SUMS`, and SHA256-verifies the
+archive, but launching one fails fast with a structured diagnostic naming the
+protocol mismatch (`provider protocol unsupported`). A tfplugin5 adapter is a
+recorded post-MVP roadmap item.
 
 ```sh
-tchori providers install NAMESPACE/NAME VERSION   # download + SHA256-verify
+tchori providers install NAMESPACE/NAME VERSION   # PGP-verify sums + SHA256-verify archive
 tchori providers list                             # inspect the local cache
 ```
 
 Providers cache under `~/.tchori/providers/`. During provider development,
-`--plugin-dir DIR` points discovery at locally built provider binaries.
+`--plugin-dir DIR` points discovery at locally built provider binaries. See
+[provider package verification](docs/provider-verification.md) for the trust
+model, fail-closed checks, and supported signing-key variants.
 
 ## Install
 
