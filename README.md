@@ -172,6 +172,35 @@ The two-minute per-package timeout is more than three times the slowest
 observed package (35.8 seconds) while bounding hung tests; tag-gated e2e
 coverage remains in its existing job.
 
+### Secret scanning
+
+Install the same pinned Gitleaks release used by CI, then scan every fetched Git
+ref and the current working tree:
+
+```sh
+go install github.com/zricethezav/gitleaks/v8@v8.30.1
+timeout 5m gitleaks git . --log-opts=--all --no-banner --config .gitleaks.toml --redact --exit-code 1
+timeout 5m gitleaks dir . --no-banner --config .gitleaks.toml --redact --exit-code 1
+bash scripts/gitleaks-selftest.sh
+```
+
+The source repository is now `github.com/gitleaks/gitleaks`, but the v8 Go
+module intentionally retains its declared `github.com/zricethezav/gitleaks/v8`
+path. To update Gitleaks, identify a stable release, verify its `go.mod` module
+path, and change the exact version in both this section and the `secretscan`
+install step in `.github/workflows/ci.yml`. Reinstall it, inspect `gitleaks
+--help` for command changes, and rerun both real scans, the synthetic self-test,
+and `actionlint .github/workflows/ci.yml` before merging. Never use `@latest` in
+CI.
+
+Secret findings fail the gate by default. Revoke and remove real credentials,
+then track any coordinated history purge as focused follow-up work; never
+allowlist a real secret. Suppress only a confirmed false positive with the
+narrowest practical, individually commented rule/path/regex entry in
+`.gitleaks.toml`—never a blanket exclusion. A temporary baseline is exceptional:
+every entry requires an explicit written rationale and a remediation task
+reference.
+
 Provider acceptance: `docs/acceptance-admanager.md` is the manual checklist
 for running `terraform-provider-admanager` under tchori against a Google Ad
 Manager test network.
