@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // FormatVersion is the plan.json schema version this engine writes and reads.
@@ -46,14 +47,40 @@ func (pl *Plan) HasChanges() bool {
 
 // Write serializes the plan deterministically: encoding/json MarshalIndent
 // with two-space indent plus a trailing newline. Map-free struct encoding and
-// address-sorted Changes make the same plan produce byte-identical files.
+// address-sorted Changes make the same plan produce byte-identical files. It
+// atomically replaces path with a regular owner-only (0600) file, so an
+// existing permissive file is tightened and a symlink at path is not followed.
 func Write(pl *Plan, path string) error {
 	b, err := json.MarshalIndent(pl, "", "  ")
 	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
-	return os.WriteFile(path, b, 0o600)
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".plan-*.tmp") //nolint:gosec // G304: path is operator-supplied via the CLI -out flag, not attacker-controlled
+	if err != nil {
+		return fmt.Errorf("create temp plan file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("write temp plan file: %w", err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("chmod temp plan file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close temp plan file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename temp plan file: %w", err)
+	}
+	return nil
 }
 
 // Read loads a plan.json written by Write, rejecting unknown format versions.
