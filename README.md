@@ -241,6 +241,12 @@ Provider acceptance: `docs/acceptance-admanager.md` is the manual checklist
 for running `terraform-provider-admanager` under tchori against a Google Ad
 Manager test network.
 
+## Security
+
+Found a suspected vulnerability? Follow the private disclosure process in
+[`SECURITY.md`](SECURITY.md). Do not disclose it in a public issue, pull request,
+or discussion.
+
 ## License
 
 MPL-2.0 — see `LICENSE`. Files adapted from OpenTofu keep their original
