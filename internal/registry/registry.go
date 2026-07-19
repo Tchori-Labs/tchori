@@ -24,6 +24,14 @@ import (
 // defaultBaseURL is used by Install when baseURL is empty.
 const defaultBaseURL = "https://registry.opentofu.org"
 
+// maxProviderArchiveBytes caps the provider archive downloaded to local
+// temporary storage. Real provider archives are at most a few hundred MB, so
+// 1 GiB accommodates supported providers while bounding disk use if a registry
+// or CDN streams an untrusted oversized response. This local-download DoS guard
+// is independent of maxZipEntryBytes, which limits each entry during extraction.
+// A var (not const) lets tests exercise the boundary with small fixtures.
+var maxProviderArchiveBytes int64 = 1 << 30 // 1 GiB
+
 // maxZipEntryBytes caps how much of a single zip entry Install will copy to
 // disk during extraction. Provider binaries are a few tens of MB at most;
 // this bound exists purely to give io.Copy an upper limit so a malicious or
@@ -317,6 +325,10 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 		return "", err
 	}
 	defer func() { _ = zipResp.Body.Close() }()
+	if zipResp.ContentLength > maxProviderArchiveBytes {
+		return "", fmt.Errorf("registry: provider archive %s declares %d bytes, exceeds %d byte limit",
+			meta.Filename, zipResp.ContentLength, maxProviderArchiveBytes)
+	}
 
 	tmpFile, err := os.CreateTemp("", "tchori-provider-*.zip")
 	if err != nil {
@@ -326,9 +338,15 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 	defer func() { _ = os.Remove(tmpPath) }() // best-effort temp file cleanup
 
 	hasher := sha256.New()
-	_, copyErr := io.Copy(io.MultiWriter(tmpFile, hasher), zipResp.Body) //nolint:gosec // size is bounded by the registry's own archive size; content is checksum-verified below before extraction
+	// Request one byte beyond the local cap so unknown, chunked, or falsely
+	// under-reported Content-Length responses cannot bypass the download bound.
+	n, copyErr := io.CopyN(io.MultiWriter(tmpFile, hasher), zipResp.Body, maxProviderArchiveBytes+1)
 	closeErr := tmpFile.Close()
-	if copyErr != nil {
+	if n > maxProviderArchiveBytes {
+		return "", fmt.Errorf("registry: provider archive %s exceeds %d byte limit",
+			meta.Filename, maxProviderArchiveBytes)
+	}
+	if copyErr != nil && copyErr != io.EOF {
 		return "", fmt.Errorf("registry: downloading %s: %w", meta.DownloadURL, copyErr)
 	}
 	if closeErr != nil {
