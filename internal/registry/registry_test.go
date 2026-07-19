@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -99,6 +100,7 @@ type fakeRegistry struct {
 	signature           []byte
 	advertisedKeys      []gpgPublicKey
 	includeSignatureURL bool
+	archiveHandler      http.HandlerFunc
 	signatureHandler    http.HandlerFunc
 	signer              *testSigner
 }
@@ -170,7 +172,11 @@ func newFakeRegistry(t *testing.T, ns, name, version, binaryContent string) *fak
 			},
 		})
 	})
-	mux.HandleFunc("GET /dl/"+fr.filename, func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /dl/"+fr.filename, func(w http.ResponseWriter, r *http.Request) {
+		if fr.archiveHandler != nil {
+			fr.archiveHandler(w, r)
+			return
+		}
 		_, _ = w.Write(fr.zipBytes)
 	})
 	mux.HandleFunc("GET /dl/SHA256SUMS", func(w http.ResponseWriter, _ *http.Request) {
@@ -221,6 +227,119 @@ func TestInstall_Success(t *testing.T) {
 	if info.Mode().Perm()&0o111 == 0 {
 		t.Errorf("mode = %v, want executable bits set (chmod 0755)", info.Mode())
 	}
+}
+
+func setMaxProviderArchiveBytes(t *testing.T, limit int64) {
+	t.Helper()
+	original := maxProviderArchiveBytes
+	maxProviderArchiveBytes = limit
+	t.Cleanup(func() { maxProviderArchiveBytes = original })
+}
+
+func assertNoArchiveInstallResidue(t *testing.T, cacheDir, tempDir, ns, name, version string) {
+	t.Helper()
+
+	nsDir := filepath.Join(cacheDir, ns)
+	if _, err := os.Stat(nsDir); !os.IsNotExist(err) {
+		t.Errorf("cache namespace %s should not exist after oversized archive rejection", nsDir)
+	}
+	binaryPath := filepath.Join(cacheDir, ns, name, version, runtime.GOOS+"_"+runtime.GOARCH, "terraform-provider-"+name)
+	if _, err := os.Stat(binaryPath); !os.IsNotExist(err) {
+		t.Errorf("no binary should be left behind at %s after oversized archive rejection", binaryPath)
+	}
+	entries, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatalf("ReadDir(%s): %v", tempDir, err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("temporary archive directory %s should be empty after rejection, found %v", tempDir, entries)
+	}
+}
+
+func TestInstall_ArchiveDeclaredLengthOverLimit(t *testing.T) {
+	const limit int64 = 64
+	setMaxProviderArchiveBytes(t, limit)
+
+	fr := newFakeRegistry(t, "opentofu", "declared", "1.0.0", "unused")
+	fr.archiveHandler = func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", strconv.FormatInt(limit+1, 10))
+		w.WriteHeader(http.StatusOK)
+	}
+
+	tempDir := t.TempDir()
+	t.Setenv("TMPDIR", tempDir)
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	_, err := Install(context.Background(), "opentofu/declared", "1.0.0", fr.srv.URL, cacheDir)
+	if err == nil {
+		t.Fatal("Install: want error for an archive declaring more than the size limit, got nil")
+	}
+	if !strings.Contains(err.Error(), "declares 65 bytes") || !strings.Contains(err.Error(), "64 byte limit") {
+		t.Errorf("error = %q, want declared size and byte limit", err)
+	}
+	assertNoArchiveInstallResidue(t, cacheDir, tempDir, "opentofu", "declared", "1.0.0")
+}
+
+func TestInstall_ArchiveChunkedBodyOverLimit(t *testing.T) {
+	const limit int64 = 64
+	setMaxProviderArchiveBytes(t, limit)
+
+	fr := newFakeRegistry(t, "opentofu", "chunked", "1.0.0", "unused")
+	fr.archiveHandler = func(w http.ResponseWriter, _ *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("archive response writer does not support flushing")
+			return
+		}
+		_, _ = w.Write(bytes.Repeat([]byte("A"), 32))
+		flusher.Flush() // Force chunked framing, leaving ContentLength unknown.
+		_, _ = w.Write(bytes.Repeat([]byte("B"), 33))
+	}
+
+	tempDir := t.TempDir()
+	t.Setenv("TMPDIR", tempDir)
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	_, err := Install(context.Background(), "opentofu/chunked", "1.0.0", fr.srv.URL, cacheDir)
+	if err == nil {
+		t.Fatal("Install: want error for a chunked archive exceeding the size limit, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds 64 byte limit") {
+		t.Errorf("error = %q, want it to mention the byte limit", err)
+	}
+	assertNoArchiveInstallResidue(t, cacheDir, tempDir, "opentofu", "chunked", "1.0.0")
+}
+
+func TestInstall_ArchiveSizeBoundary(t *testing.T) {
+	fr := newFakeRegistry(t, "opentofu", "boundary", "1.0.0", "#!/bin/sh\necho boundary\n")
+	archiveSize := int64(len(fr.zipBytes))
+
+	t.Run("exact limit succeeds", func(t *testing.T) {
+		setMaxProviderArchiveBytes(t, archiveSize)
+		cacheDir := t.TempDir()
+
+		path, err := Install(context.Background(), "opentofu/boundary", "1.0.0", fr.srv.URL, cacheDir)
+		if err != nil {
+			t.Fatalf("Install with %d-byte archive at exact limit: %v", archiveSize, err)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("Stat installed provider: %v", err)
+		}
+	})
+
+	t.Run("one byte over limit is rejected", func(t *testing.T) {
+		setMaxProviderArchiveBytes(t, archiveSize-1)
+		tempDir := t.TempDir()
+		t.Setenv("TMPDIR", tempDir)
+		cacheDir := filepath.Join(t.TempDir(), "cache")
+
+		_, err := Install(context.Background(), "opentofu/boundary", "1.0.0", fr.srv.URL, cacheDir)
+		if err == nil {
+			t.Fatal("Install: want error for an archive one byte over the size limit, got nil")
+		}
+		if !strings.Contains(err.Error(), fmt.Sprintf("exceeds %d byte limit", archiveSize-1)) {
+			t.Errorf("error = %q, want exact byte limit", err)
+		}
+		assertNoArchiveInstallResidue(t, cacheDir, tempDir, "opentofu", "boundary", "1.0.0")
+	})
 }
 
 func TestInstall_VersionNotFound(t *testing.T) {
@@ -483,8 +602,8 @@ func TestInstall_OversizedEntryRejected(t *testing.T) {
 	if err == nil {
 		t.Fatal("Install: want error for a zip entry exceeding the size limit, got nil")
 	}
-	if !strings.Contains(err.Error(), "exceeds") || !strings.Contains(err.Error(), "byte limit") {
-		t.Errorf("error = %q, want it to mention the byte limit", err)
+	if !strings.Contains(err.Error(), "zip entry") || !strings.Contains(err.Error(), "exceeds 16 byte limit") {
+		t.Errorf("error = %q, want it to identify the independently enforced zip-entry limit", err)
 	}
 
 	destDir := filepath.Join(cacheDir, "opentofu", "bigbin", "1.0.0", runtime.GOOS+"_"+runtime.GOARCH)
