@@ -1,6 +1,10 @@
 // Package registry downloads, verifies, and locates Terraform-protocol
 // provider binaries from an OpenTofu-compatible provider registry
 // (https://opentofu.org/docs/internals/provider-registry-protocol/).
+//
+// Provider sources must be lowercase alphanumeric namespace/name identifiers
+// with optional internal hyphens, and versions must be exact X.Y.Z strings.
+// Unsafe or ambiguous path segments are rejected rather than sanitized.
 package registry
 
 import (
@@ -16,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -53,7 +58,81 @@ var (
 	httpMetadataReadTimeout = time.Minute
 	// httpArchiveReadTimeout bounds complete provider archive requests.
 	httpArchiveReadTimeout = 30 * time.Minute
+
+	// providerIdentifierPattern accepts OpenTofu-compatible namespace and
+	// provider-name segments: lowercase alphanumeric groups separated by single
+	// hyphens. It retains addresses such as opentofu/random and
+	// tchori-labs/metaads while excluding path syntax and ambiguous punctuation.
+	providerIdentifierPattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+	// providerVersionPattern matches the exact numeric X.Y.Z versions accepted
+	// by config validation. Keeping this boundary equally strict protects the
+	// CLI install path, which does not pass through config validation.
+	providerVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 )
+
+// validateSegment rejects a registry coordinate that could alter either the
+// provider registry URL structure or the cache path. Values are never cleaned
+// or rewritten: callers must provide one canonical namespace, name, or version
+// segment. Namespace and name accept lowercase alphanumeric groups with
+// internal hyphens; version accepts an exact numeric X.Y.Z string.
+func validateSegment(kind, value string) error {
+	if value == "" || value == "." || value == ".." {
+		return fmt.Errorf("registry: invalid %s %q", kind, value)
+	}
+	if strings.ContainsRune(value, 0) || strings.ContainsRune(value, '/') ||
+		strings.ContainsRune(value, '\\') || strings.ContainsRune(value, os.PathSeparator) {
+		return fmt.Errorf("registry: invalid %s %q: want one path segment", kind, value)
+	}
+	if filepath.IsAbs(value) || isWindowsAbsolutePath(value) {
+		return fmt.Errorf("registry: invalid %s %q: absolute paths are not allowed", kind, value)
+	}
+	if filepath.Clean(value) != value {
+		return fmt.Errorf("registry: invalid %s %q: want a canonical path segment", kind, value)
+	}
+
+	pattern := providerIdentifierPattern
+	if kind == "version" {
+		pattern = providerVersionPattern
+	}
+	if !pattern.MatchString(value) {
+		return fmt.Errorf("registry: invalid %s %q", kind, value)
+	}
+	return nil
+}
+
+// isWindowsAbsolutePath detects drive-rooted and UNC forms even when tchori is
+// running on a non-Windows host, where filepath.IsAbs would not recognize them.
+func isWindowsAbsolutePath(value string) bool {
+	if strings.HasPrefix(value, `\\`) || strings.HasPrefix(value, `//`) {
+		return true
+	}
+	return len(value) >= 3 && ((value[0] >= 'a' && value[0] <= 'z') ||
+		(value[0] >= 'A' && value[0] <= 'Z')) && value[1] == ':' &&
+		(value[2] == '/' || value[2] == '\\')
+}
+
+// assertUnderRoot verifies lexical containment after resolving both paths to
+// clean absolute forms. It is a belt-and-suspenders check in addition to the
+// strict segment allow-lists used to construct provider cache destinations.
+func assertUnderRoot(root, dest string) error {
+	rootAbs, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return fmt.Errorf("registry: resolving cache root %q: %w", root, err)
+	}
+	destAbs, err := filepath.Abs(filepath.Clean(dest))
+	if err != nil {
+		return fmt.Errorf("registry: resolving cache destination %q: %w", dest, err)
+	}
+	rel, err := filepath.Rel(rootAbs, destAbs)
+	if err != nil {
+		return fmt.Errorf("registry: checking cache destination %q: %w", destAbs, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("registry: cache destination %q escapes root %q", destAbs, rootAbs)
+	}
+	return nil
+}
 
 // defaultCacheDir returns ~/.tchori/providers, used by Install when
 // cacheDir is empty.
@@ -65,11 +144,19 @@ func defaultCacheDir() (string, error) {
 	return filepath.Join(home, ".tchori", "providers"), nil
 }
 
-// parseSource splits "namespace/name" into its two parts.
+// parseSource splits and validates an exact "namespace/name" provider source.
+// Both parts must be canonical lowercase alphanumeric identifiers with optional
+// internal hyphens; path separators and traversal forms are rejected.
 func parseSource(source string) (namespace, name string, err error) {
 	parts := strings.Split(source, "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return "", "", fmt.Errorf("registry: invalid provider source %q, want NAMESPACE/NAME", source)
+	}
+	if err := validateSegment("namespace", parts[0]); err != nil {
+		return "", "", err
+	}
+	if err := validateSegment("provider name", parts[1]); err != nil {
+		return "", "", err
 	}
 	return parts[0], parts[1], nil
 }
@@ -351,6 +438,9 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 	if err != nil {
 		return "", err
 	}
+	if err := validateSegment("version", version); err != nil {
+		return "", err
+	}
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
@@ -359,6 +449,10 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 		if err != nil {
 			return "", err
 		}
+	}
+	cacheRoot, err := filepath.Abs(filepath.Clean(cacheDir))
+	if err != nil {
+		return "", fmt.Errorf("registry: resolving cache root %q: %w", cacheDir, err)
 	}
 
 	client := newRegistryClient()
@@ -479,7 +573,10 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 	}
 
 	// 5. Extract the terraform-provider-* binary into the cache layout.
-	destDir := filepath.Join(cacheDir, ns, name, version, runtime.GOOS+"_"+runtime.GOARCH)
+	destDir := filepath.Join(cacheRoot, ns, name, version, runtime.GOOS+"_"+runtime.GOARCH)
+	if err := assertUnderRoot(cacheRoot, destDir); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(destDir, 0o750); err != nil {
 		return "", fmt.Errorf("registry: creating %s: %w", destDir, err)
 	}
@@ -520,6 +617,13 @@ func Discover(cacheDir, pluginDir, source, version string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if err := validateSegment("version", version); err != nil {
+		return "", err
+	}
+	cacheRoot, err := filepath.Abs(filepath.Clean(cacheDir))
+	if err != nil {
+		return "", fmt.Errorf("registry: resolving cache root %q: %w", cacheDir, err)
+	}
 	pattern := "terraform-provider-" + name + "*"
 
 	if pluginDir != "" {
@@ -532,7 +636,10 @@ func Discover(cacheDir, pluginDir, source, version string) (string, error) {
 		}
 	}
 
-	cacheSubdir := filepath.Join(cacheDir, ns, name, version, runtime.GOOS+"_"+runtime.GOARCH)
+	cacheSubdir := filepath.Join(cacheRoot, ns, name, version, runtime.GOOS+"_"+runtime.GOARCH)
+	if err := assertUnderRoot(cacheRoot, cacheSubdir); err != nil {
+		return "", err
+	}
 	matches, err := filepath.Glob(filepath.Join(cacheSubdir, pattern))
 	if err != nil {
 		return "", fmt.Errorf("registry: globbing cache dir %s: %w", cacheSubdir, err)
@@ -555,44 +662,58 @@ type Installed struct {
 // List walks cacheDir's <namespace>/<name>/<version>/<os_arch>/ layout and
 // returns one Installed entry per version directory that actually contains
 // a terraform-provider-* binary in some platform subdirectory. A missing
-// cacheDir yields an empty, non-error result (nothing installed yet).
+// cacheDir yields an empty, non-error result (nothing installed yet). Invalid
+// legacy or externally-created coordinate directories are ignored.
 func List(cacheDir string) ([]Installed, error) {
-	if _, err := os.Stat(cacheDir); err != nil {
+	cacheRoot, err := filepath.Abs(filepath.Clean(cacheDir))
+	if err != nil {
+		return nil, fmt.Errorf("registry: resolving cache root %q: %w", cacheDir, err)
+	}
+	if _, err := os.Stat(cacheRoot); err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("registry: stat %s: %w", cacheDir, err)
+		return nil, fmt.Errorf("registry: stat %s: %w", cacheRoot, err)
 	}
 
-	namespaces, err := os.ReadDir(cacheDir)
+	namespaces, err := os.ReadDir(cacheRoot)
 	if err != nil {
-		return nil, fmt.Errorf("registry: reading %s: %w", cacheDir, err)
+		return nil, fmt.Errorf("registry: reading %s: %w", cacheRoot, err)
 	}
 
 	var out []Installed
 	for _, nsEntry := range namespaces {
-		if !nsEntry.IsDir() {
+		if !nsEntry.IsDir() || validateSegment("namespace", nsEntry.Name()) != nil {
 			continue
 		}
-		nsPath := filepath.Join(cacheDir, nsEntry.Name())
+		nsPath := filepath.Join(cacheRoot, nsEntry.Name())
+		if err := assertUnderRoot(cacheRoot, nsPath); err != nil {
+			return nil, err
+		}
 		names, err := os.ReadDir(nsPath)
 		if err != nil {
 			return nil, fmt.Errorf("registry: reading %s: %w", nsPath, err)
 		}
 		for _, nameEntry := range names {
-			if !nameEntry.IsDir() {
+			if !nameEntry.IsDir() || validateSegment("provider name", nameEntry.Name()) != nil {
 				continue
 			}
 			namePath := filepath.Join(nsPath, nameEntry.Name())
+			if err := assertUnderRoot(cacheRoot, namePath); err != nil {
+				return nil, err
+			}
 			versions, err := os.ReadDir(namePath)
 			if err != nil {
 				return nil, fmt.Errorf("registry: reading %s: %w", namePath, err)
 			}
 			for _, versionEntry := range versions {
-				if !versionEntry.IsDir() {
+				if !versionEntry.IsDir() || validateSegment("version", versionEntry.Name()) != nil {
 					continue
 				}
 				versionPath := filepath.Join(namePath, versionEntry.Name())
+				if err := assertUnderRoot(cacheRoot, versionPath); err != nil {
+					return nil, err
+				}
 				matches, globErr := filepath.Glob(filepath.Join(versionPath, "*", "terraform-provider-*"))
 				if globErr != nil {
 					return nil, fmt.Errorf("registry: globbing %s: %w", versionPath, globErr)

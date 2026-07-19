@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -210,6 +211,168 @@ func newFakeRegistry(t *testing.T, ns, name, version, binaryContent string) *fak
 	fr.srv = httptest.NewServer(mux)
 	t.Cleanup(fr.srv.Close)
 	return fr
+}
+
+func TestInstall_RejectsUnsafeProviderCoordinatesWithoutSideEffects(t *testing.T) {
+	tests := []struct {
+		name    string
+		source  string
+		version string
+	}{
+		{name: "parent namespace", source: "../name", version: "1.0.0"},
+		{name: "parent name", source: "name/..", version: "1.0.0"},
+		{name: "exact symptom parent name", source: "opentofu/..", version: "1.0.0"},
+		{name: "multiple parent segments", source: "../../x/y", version: "1.0.0"},
+		{name: "nested source", source: "a/b/c", version: "1.0.0"},
+		{name: "backslash in name", source: `opentofu/na\me`, version: "1.0.0"},
+		{name: "absolute source", source: "/absolute", version: "1.0.0"},
+		{name: "windows absolute source", source: `C:\evil/name`, version: "1.0.0"},
+		{name: "UNC source", source: `\\host\share/name`, version: "1.0.0"},
+		{name: "NUL in name", source: "opentofu/na\x00me", version: "1.0.0"},
+		{name: "encoded traversal name", source: "opentofu/%2e%2e", version: "1.0.0"},
+		{name: "parent version", source: "opentofu/widget", version: ".."},
+		{name: "traversing version", source: "opentofu/widget", version: "../../x"},
+		{name: "embedded version traversal", source: "opentofu/widget", version: "1.0.0/../.."},
+		{name: "backslash in version", source: "opentofu/widget", version: `1.0.0\x`},
+		{name: "dot version", source: "opentofu/widget", version: "."},
+		{name: "absolute version", source: "opentofu/widget", version: "/1.0.0"},
+		{name: "windows absolute version", source: "opentofu/widget", version: `C:\1.0.0`},
+		{name: "NUL in version", source: "opentofu/widget", version: "1.0.0\x00x"},
+		{name: "encoded traversal version", source: "opentofu/widget", version: "%2e%2e"},
+	}
+
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unsafe coordinates reached the registry", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rootDir := t.TempDir()
+			cacheDir := filepath.Join(rootDir, "cache")
+			beforeRequests := requests.Load()
+
+			_, err := Install(context.Background(), tt.source, tt.version, srv.URL, cacheDir)
+			if err == nil {
+				t.Fatalf("Install(%q, %q): want validation error, got nil", tt.source, tt.version)
+			}
+			if !strings.Contains(err.Error(), "registry: invalid") {
+				t.Errorf("error = %q, want registry validation error", err)
+			}
+			if got := requests.Load(); got != beforeRequests {
+				t.Errorf("registry received %d request(s), want zero", got-beforeRequests)
+			}
+
+			var written []string
+			walkErr := filepath.Walk(rootDir, func(path string, _ os.FileInfo, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
+				}
+				if path != rootDir {
+					written = append(written, path)
+				}
+				return nil
+			})
+			if walkErr != nil {
+				t.Fatalf("Walk(%s): %v", rootDir, walkErr)
+			}
+			if len(written) != 0 {
+				t.Errorf("unsafe Install wrote beneath %s: %v", rootDir, written)
+			}
+		})
+	}
+}
+
+func TestDiscover_RejectsUnsafeProviderCoordinatesBeforeGlobbing(t *testing.T) {
+	tests := []struct {
+		name             string
+		source           string
+		version          string
+		pluginBinaryName string
+	}{
+		{name: "parent namespace", source: "../name", version: "1.0.0", pluginBinaryName: "name"},
+		{name: "parent name", source: "name/..", version: "1.0.0", pluginBinaryName: "..-trap"},
+		{name: "exact symptom parent name", source: "opentofu/..", version: "1.0.0", pluginBinaryName: "..-trap"},
+		{name: "multiple parent segments", source: "../../x/y", version: "1.0.0"},
+		{name: "nested source", source: "a/b/c", version: "1.0.0"},
+		{name: "backslash in name", source: `opentofu/na\me`, version: "1.0.0"},
+		{name: "absolute source", source: "/absolute", version: "1.0.0"},
+		{name: "windows absolute source", source: `C:\evil/name`, version: "1.0.0", pluginBinaryName: "name"},
+		{name: "UNC source", source: `\\host\share/name`, version: "1.0.0", pluginBinaryName: "name"},
+		{name: "NUL in name", source: "opentofu/na\x00me", version: "1.0.0"},
+		{name: "encoded traversal name", source: "opentofu/%2e%2e", version: "1.0.0"},
+		{name: "parent version", source: "opentofu/widget", version: "..", pluginBinaryName: "widget"},
+		{name: "traversing version", source: "opentofu/widget", version: "../../x", pluginBinaryName: "widget"},
+		{name: "embedded version traversal", source: "opentofu/widget", version: "1.0.0/../..", pluginBinaryName: "widget"},
+		{name: "backslash in version", source: "opentofu/widget", version: `1.0.0\x`, pluginBinaryName: "widget"},
+		{name: "dot version", source: "opentofu/widget", version: ".", pluginBinaryName: "widget"},
+		{name: "encoded traversal version", source: "opentofu/widget", version: "%2e%2e", pluginBinaryName: "widget"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rootDir := t.TempDir()
+			cacheDir := filepath.Join(rootDir, "cache")
+			pluginDir := ""
+			if tt.pluginBinaryName != "" {
+				pluginDir = filepath.Join(rootDir, "plugins")
+				if err := os.Mkdir(pluginDir, 0o750); err != nil {
+					t.Fatalf("Mkdir plugin dir: %v", err)
+				}
+				trap := filepath.Join(pluginDir, "terraform-provider-"+tt.pluginBinaryName)
+				if err := os.WriteFile(trap, []byte("must not be discovered"), 0o600); err != nil {
+					t.Fatalf("WriteFile plugin trap: %v", err)
+				}
+			}
+
+			_, err := Discover(cacheDir, pluginDir, tt.source, tt.version)
+			if err == nil {
+				t.Fatalf("Discover(%q, %q): want validation error, got nil", tt.source, tt.version)
+			}
+			if !strings.Contains(err.Error(), "registry: invalid") {
+				t.Errorf("error = %q, want registry validation error", err)
+			}
+			if _, statErr := os.Stat(cacheDir); !os.IsNotExist(statErr) {
+				t.Errorf("cache dir %s should not exist after rejected discovery", cacheDir)
+			}
+		})
+	}
+}
+
+func TestInstallDiscover_ValidHyphenatedCoordinates(t *testing.T) {
+	fr := newFakeRegistry(t, "tchori-labs", "metaads", "3.2.4", "valid provider")
+	cacheDir := filepath.Join(t.TempDir(), "cache", "nested", "..", "providers")
+
+	installed, err := Install(context.Background(), "tchori-labs/metaads", "3.2.4", fr.srv.URL, cacheDir)
+	if err != nil {
+		t.Fatalf("Install valid provider: %v", err)
+	}
+	if err := assertUnderRoot(cacheDir, installed); err != nil {
+		t.Fatalf("installed path containment: %v", err)
+	}
+
+	discovered, err := Discover(cacheDir, "", "tchori-labs/metaads", "3.2.4")
+	if err != nil {
+		t.Fatalf("Discover valid provider: %v", err)
+	}
+	if discovered != installed {
+		t.Errorf("Discover = %s, want installed path %s", discovered, installed)
+	}
+}
+
+func TestAssertUnderRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "cache", "nested", "..")
+	inside := filepath.Join(root, "opentofu", "widget", "1.2.3", runtime.GOOS+"_"+runtime.GOARCH)
+	if err := assertUnderRoot(root, inside); err != nil {
+		t.Fatalf("assertUnderRoot(valid destination): %v", err)
+	}
+
+	outside := filepath.Join(root, "..", "outside")
+	if err := assertUnderRoot(root, outside); err == nil {
+		t.Fatal("assertUnderRoot(escaping destination): want error, got nil")
+	}
 }
 
 func TestInstall_Success(t *testing.T) {
@@ -1180,6 +1343,43 @@ func TestList(t *testing.T) {
 		if inst.Path != wantPath {
 			t.Errorf("%s: Path = %s, want %s", key, inst.Path, wantPath)
 		}
+	}
+}
+
+func TestList_IgnoresInvalidCoordinateDirectories(t *testing.T) {
+	rootDir := t.TempDir()
+	cacheRoot := filepath.Join(rootDir, "cache")
+	cacheDir := filepath.Join(cacheRoot, "nested", "..")
+
+	writeProvider := func(namespace, name, version string) string {
+		t.Helper()
+		binDir := filepath.Join(cacheRoot, namespace, name, version, "linux_amd64")
+		if err := os.MkdirAll(binDir, 0o750); err != nil {
+			t.Fatalf("MkdirAll(%s): %v", binDir, err)
+		}
+		binPath := filepath.Join(binDir, "terraform-provider-"+name)
+		if err := os.WriteFile(binPath, []byte("bin"), 0o600); err != nil {
+			t.Fatalf("WriteFile(%s): %v", binPath, err)
+		}
+		return binPath
+	}
+
+	validPath := writeProvider("opentofu", "widget", "1.2.3")
+	writeProvider("bad[namespace", "widget", "1.2.3")
+	writeProvider("opentofu", "bad[name", "1.2.3")
+	writeProvider("opentofu", "widget", "[")
+	writeProvider("OpenTofu", "widget", "1.2.3")
+
+	got, err := List(cacheDir)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("List returned %d entries, want only the valid entry: %+v", len(got), got)
+	}
+	want := Installed{Source: "opentofu/widget", Version: "1.2.3", Path: validPath}
+	if got[0] != want {
+		t.Errorf("List entry = %+v, want %+v", got[0], want)
 	}
 }
 
