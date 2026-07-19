@@ -62,6 +62,11 @@ go test ./...
 CI's `check` job (`.github/workflows/ci.yml`) re-runs the same four checks
 and is a required status check — it must be green before merge.
 
+## Branch protection
+
+See [`docs/branch-protection.md`](docs/branch-protection.md) for the importable
+`main` ruleset and the repository-admin apply, audit, and verification runbook.
+
 ## Security
 
 - Never commit secrets, tokens, or credentials — not in code, tests,
