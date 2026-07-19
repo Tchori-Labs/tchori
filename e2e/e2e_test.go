@@ -5,14 +5,13 @@
 //   - lifecycle: validate → plan → apply → plan (no-op) → destroy plan →
 //     apply, against the in-repo fake tfplugin6 provider via --plugin-dir,
 //     with a real cross-resource reference chain
-//   - registry_install: a real download from registry.opentofu.org,
-//     SHA256-verified, cache layout asserted via `providers list -json`
-//     (install never launches the binary, so its protocol is irrelevant)
-//   - protocol5_graceful_failure: launching the installed protocol-5-only
-//     null provider fails with exit 1 and a structured diagnostic naming
-//     the protocol mismatch
+//   - registry_install: a download from an in-process fixture registry,
+//     SHA256-verified with cache layout asserted via `providers list -json`
+//   - protocol5_graceful_failure: launching the fixture-installed,
+//     protocol-5-only null provider fails with exit 1 and a structured
+//     diagnostic naming the protocol mismatch
 //
-// Run with: go test -tags e2e ./e2e -v   (network required)
+// Run with: go test -tags e2e ./e2e -v   (no network required)
 package e2e
 
 import (
@@ -105,6 +104,7 @@ func TestEndToEnd(t *testing.T) {
 		{bin, "./cmd/tchori"},
 		{filepath.Join(pluginDir, "terraform-provider-tchoritest"),
 			"./internal/provider/testprovider"},
+		{fixtureProviderPath(binDir), "./internal/provider/testprovider5"},
 	}
 	for _, b := range builds {
 		cmd := exec.Command("go", "build", "-o", b.target, b.pkg)
@@ -114,11 +114,11 @@ func TestEndToEnd(t *testing.T) {
 		}
 	}
 
-	// Isolated HOME: the provider cache defaults to $HOME/.tchori/providers,
-	// so overriding HOME in the child process env keeps the registry
-	// download out of the developer's real home and makes the test hermetic
-	// and repeatable.
+	// Isolated HOME keeps the provider cache out of the developer's real
+	// home. TCHORI_REGISTRY_URL redirects every child to the local fixture,
+	// making accidental public-registry access impossible in this suite.
 	home := t.TempDir()
+	fixture := newFixtureRegistry(t, fixtureProviderPath(binDir))
 
 	// run executes the built binary in dir, asserts its exit code (dumping
 	// stdout/stderr on any mismatch), and returns stdout and stderr.
@@ -131,7 +131,7 @@ func TestEndToEnd(t *testing.T) {
 				cmd.Env = append(cmd.Env, kv)
 			}
 		}
-		cmd.Env = append(cmd.Env, "HOME="+home)
+		cmd.Env = append(cmd.Env, "HOME="+home, "TCHORI_REGISTRY_URL="+fixture.URL)
 		var outBuf, errBuf bytes.Buffer
 		cmd.Stdout = &outBuf
 		cmd.Stderr = &errBuf
@@ -231,23 +231,13 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
-	// Track whether registry_install succeeded, so protocol5_graceful_failure
-	// can skip if the provider isn't available.
-	registrySuccess := false
-
 	t.Run("registry_install", func(t *testing.T) {
 		work := t.TempDir()
 
-		// Real download from registry.opentofu.org: version lookup, zip
-		// fetch, SHA256 verification against the SHA256SUMS document,
-		// extraction into the cache. install never launches the binary.
-		// Skip the subtest (and protocol5) on network failure; fail loudly on
-		// any other error (checksum mismatch, bad layout, etc).
-		installErr := tryInstallProvider(t, bin, work, home)
-		if installErr != nil {
-			t.Skipf("registry unreachable, skipping: %v", installErr)
-		}
-		registrySuccess = true
+		// Exercise version lookup, archive fetch, SHA256SUMS verification,
+		// and cache extraction against the in-process fixture. Any failure is
+		// a real regression; this required suite must never skip.
+		run(t, work, 0, "providers", "install", "opentofu/null", nullVersion)
 
 		// Cache layout asserted via providers list -json.
 		stdout, _ := run(t, work, 0, "-json", "providers", "list")
@@ -288,12 +278,6 @@ func TestEndToEnd(t *testing.T) {
 	})
 
 	t.Run("protocol5_graceful_failure", func(t *testing.T) {
-		// This test depends on the provider installed by registry_install.
-		// If that subtest was skipped due to network failure, skip this one too.
-		if !registrySuccess {
-			t.Skip("skipping because registry_install was skipped")
-		}
-
 		work := t.TempDir()
 		cfg := fmt.Sprintf(protocol5Config, nullVersion)
 		if err := os.WriteFile(filepath.Join(work, "main.tchori.json"), []byte(cfg), 0o644); err != nil {
@@ -316,65 +300,6 @@ func TestEndToEnd(t *testing.T) {
 			t.Errorf("stderr does not say tchori speaks tfplugin6: %q", stderr)
 		}
 	})
-}
-
-// tryInstallProvider attempts to install the null provider from the registry.
-// Returns an error (which may be a network error) if installation fails;
-// returns nil if installation succeeds. isNetworkError() can be used to
-// distinguish network failures from other errors.
-func tryInstallProvider(t *testing.T, bin, work, home string) error {
-	t.Helper()
-	cmd := exec.Command(bin, "providers", "install", "opentofu/null", nullVersion)
-	cmd.Dir = work
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "HOME=") {
-			cmd.Env = append(cmd.Env, kv)
-		}
-	}
-	cmd.Env = append(cmd.Env, "HOME="+home)
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-	runErr := cmd.Run()
-	exit := 0
-	if runErr != nil {
-		var ee *exec.ExitError
-		if !errors.As(runErr, &ee) {
-			return fmt.Errorf("unexpected error: %v", runErr)
-		}
-		exit = ee.ExitCode()
-	}
-
-	if exit != 0 {
-		stderr := errBuf.String()
-		if isNetworkError(stderr) {
-			return errors.New(stderr)
-		}
-		// Non-network error: fail loudly in the test.
-		t.Fatalf("providers install opentofu/null %s: exit %d (non-network error)\nstderr:\n%s",
-			nullVersion, exit, stderr)
-	}
-
-	return nil
-}
-
-// isNetworkError returns true if the error message indicates a network problem.
-func isNetworkError(msg string) bool {
-	networkPatterns := []string{
-		"no such host",
-		"connection refused",
-		"i/o timeout",
-		"TLS handshake timeout",
-		"temporary failure in name resolution",
-		"dial tcp",
-	}
-	msg = strings.ToLower(msg)
-	for _, pattern := range networkPatterns {
-		if strings.Contains(msg, pattern) {
-			return true
-		}
-	}
-	return false
 }
 
 func readJSON(t *testing.T, path string, v any) {

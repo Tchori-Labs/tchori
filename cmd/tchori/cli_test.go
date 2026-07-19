@@ -1,13 +1,19 @@
 package main_test
 
 import (
+	"archive/zip"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -63,8 +69,27 @@ func testMain(m *testing.M) int {
 // (ProcessState.ExitCode works on both unix and windows).
 func runCLI(t *testing.T, dir string, args ...string) (string, string, int) {
 	t.Helper()
+	return runCLIEnv(t, dir, nil, args...)
+}
+
+// runCLIEnv is runCLI with selected environment variables replaced. It is
+// used for options whose contract is intentionally environment-based, while
+// keeping all other inherited variables (including PATH) intact.
+func runCLIEnv(t *testing.T, dir string, env map[string]string, args ...string) (string, string, int) {
+	t.Helper()
 	cmd := exec.Command(tchoriBin, args...) //nolint:gosec // binary built by TestMain into a temp dir
 	cmd.Dir = dir
+	cmd.Env = os.Environ()
+	for key, value := range env {
+		prefix := key + "="
+		filtered := cmd.Env[:0]
+		for _, entry := range cmd.Env {
+			if !strings.HasPrefix(entry, prefix) {
+				filtered = append(filtered, entry)
+			}
+		}
+		cmd.Env = append(filtered, prefix+value)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -100,6 +125,120 @@ func writeConfig(t *testing.T, dir, name string) {
 }`, name)
 	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
+	}
+}
+
+// newCLIRegistryFixture serves one provider release with the same metadata,
+// archive, and SHA256SUMS chain as the OpenTofu registry protocol.
+func newCLIRegistryFixture(t *testing.T, namespace, name, version string) *httptest.Server {
+	t.Helper()
+
+	var archive bytes.Buffer
+	zw := zip.NewWriter(&archive)
+	entry, err := zw.Create("terraform-provider-" + name)
+	if err != nil {
+		t.Fatalf("creating fixture archive entry: %v", err)
+	}
+	if _, err := entry.Write([]byte("#!/bin/sh\nexit 0\n")); err != nil {
+		t.Fatalf("writing fixture archive entry: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("closing fixture archive: %v", err)
+	}
+
+	archiveBytes := archive.Bytes()
+	sum := sha256.Sum256(archiveBytes)
+	sumHex := hex.EncodeToString(sum[:])
+	filename := fmt.Sprintf("terraform-provider-%s_%s_%s_%s.zip", name, version, runtime.GOOS, runtime.GOARCH)
+
+	var srv *httptest.Server
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/providers/{namespace}/{name}/versions", func(w http.ResponseWriter, r *http.Request) {
+		if r.PathValue("namespace") != namespace || r.PathValue("name") != name {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"versions": []map[string]any{{"version": version, "protocols": []string{"6.0"}}},
+		})
+	})
+	mux.HandleFunc("GET /v1/providers/{namespace}/{name}/{version}/download/{goos}/{goarch}", func(w http.ResponseWriter, r *http.Request) {
+		if r.PathValue("namespace") != namespace || r.PathValue("name") != name ||
+			r.PathValue("version") != version || r.PathValue("goos") != runtime.GOOS ||
+			r.PathValue("goarch") != runtime.GOARCH {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"filename":     filename,
+			"download_url": srv.URL + "/dl/" + filename,
+			"shasums_url":  srv.URL + "/dl/SHA256SUMS",
+			"shasum":       sumHex,
+		})
+	})
+	mux.HandleFunc("GET /dl/"+filename, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(archiveBytes)
+	})
+	mux.HandleFunc("GET /dl/SHA256SUMS", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, "%s  %s\n", sumHex, filename)
+	})
+
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestProvidersInstallRegistryOverride(t *testing.T) {
+	const (
+		namespace = "example"
+		name      = "fixture"
+		version   = "1.2.3"
+	)
+	registry := newCLIRegistryFixture(t, namespace, name, version)
+	home := t.TempDir()
+	work := t.TempDir()
+	env := map[string]string{
+		"HOME":                home,
+		"TCHORI_REGISTRY_URL": registry.URL,
+	}
+
+	if stdout, stderr, code := runCLIEnv(t, work, env, "providers", "install", namespace+"/"+name, version); code != 0 {
+		t.Fatalf("providers install: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+
+	stdout, stderr, code := runCLIEnv(t, work, env, "-json", "providers", "list")
+	if code != 0 {
+		t.Fatalf("providers list: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	var installed []struct {
+		Source  string `json:"source"`
+		Version string `json:"version"`
+		Path    string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &installed); err != nil {
+		t.Fatalf("providers list output is not JSON: %v\n%s", err, stdout)
+	}
+	if len(installed) != 1 {
+		t.Fatalf("providers list returned %d entries, want 1: %+v", len(installed), installed)
+	}
+
+	got := installed[0]
+	wantDir := filepath.Join(home, ".tchori", "providers", namespace, name, version, runtime.GOOS+"_"+runtime.GOARCH)
+	if got.Source != namespace+"/"+name || got.Version != version {
+		t.Errorf("installed provider = %s@%s, want %s@%s", got.Source, got.Version, namespace+"/"+name, version)
+	}
+	if filepath.Dir(got.Path) != wantDir {
+		t.Errorf("installed path dir = %s, want %s", filepath.Dir(got.Path), wantDir)
+	}
+	if filepath.Base(got.Path) != "terraform-provider-"+name {
+		t.Errorf("installed binary = %s, want terraform-provider-%s", filepath.Base(got.Path), name)
+	}
+	info, err := os.Stat(got.Path)
+	if err != nil {
+		t.Fatalf("stat installed provider: %v", err)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Errorf("installed binary mode = %v, want executable bits", info.Mode())
 	}
 }
 

@@ -414,9 +414,11 @@ func runProvidersInstall(cmd *cobra.Command, args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	// Empty baseURL selects registry.Install's default,
+	// TCHORI_REGISTRY_URL optionally redirects registry.Install to a mirror
+	// or test fixture. Empty/unset preserves the default
 	// https://registry.opentofu.org (per the internal/registry contract).
-	path, err := registry.Install(cmd.Context(), args[0], args[1], "", cacheDir)
+	baseURL := os.Getenv("TCHORI_REGISTRY_URL")
+	path, err := registry.Install(cmd.Context(), args[0], args[1], baseURL, cacheDir)
 	if err != nil {
 		return 1, fmt.Errorf("installing %s %s: %s", args[0], args[1], err)
 	}
