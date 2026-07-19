@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -340,6 +341,190 @@ func TestInstall_ArchiveSizeBoundary(t *testing.T) {
 		}
 		assertNoArchiveInstallResidue(t, cacheDir, tempDir, "opentofu", "boundary", "1.0.0")
 	})
+}
+func providerInstallPath(cacheDir, namespace, name, version string) (string, string) {
+	destDir := filepath.Join(cacheDir, namespace, name, version, runtime.GOOS+"_"+runtime.GOARCH)
+	return destDir, filepath.Join(destDir, "terraform-provider-"+name)
+}
+
+func TestInstall_SymlinkDestinationTargetUntouched(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink and POSIX mode assertions are not portable to Windows")
+	}
+
+	const sentinel = "do not overwrite this external file"
+	fr := newFakeRegistry(t, "opentofu", "widget", "1.2.3", "provider binary")
+	cacheDir := t.TempDir()
+	destDir, destPath := providerInstallPath(cacheDir, fr.ns, fr.name, fr.version)
+	if err := os.MkdirAll(destDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	realTarget := filepath.Join(t.TempDir(), "external-target")
+	if err := os.WriteFile(realTarget, []byte(sentinel), 0o600); err != nil {
+		t.Fatalf("WriteFile real target: %v", err)
+	}
+	before, err := os.Lstat(realTarget)
+	if err != nil {
+		t.Fatalf("Lstat real target before install: %v", err)
+	}
+	if err := os.Symlink(realTarget, destPath); err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			t.Skipf("creating symlink is not permitted: %v", err)
+		}
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	_, installErr := Install(context.Background(), fr.ns+"/"+fr.name, fr.version, fr.srv.URL, cacheDir)
+	info, lstatErr := os.Lstat(destPath)
+	if installErr == nil {
+		if lstatErr != nil {
+			t.Fatalf("Lstat destination after successful Install: %v", lstatErr)
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			t.Fatalf("successful Install left destination mode %v, want a regular non-symlink", info.Mode())
+		}
+	} else if lstatErr != nil {
+		t.Fatalf("Lstat rejected destination: %v", lstatErr)
+	}
+
+	got, err := os.ReadFile(realTarget) //nolint:gosec // realTarget is inside t.TempDir()
+	if err != nil {
+		t.Fatalf("ReadFile real target after install: %v", err)
+	}
+	if string(got) != sentinel {
+		t.Errorf("real target content = %q, want unchanged sentinel %q", got, sentinel)
+	}
+	after, err := os.Lstat(realTarget)
+	if err != nil {
+		t.Fatalf("Lstat real target after install: %v", err)
+	}
+	if after.Mode() != before.Mode() {
+		t.Errorf("real target mode = %v, want unchanged %v", after.Mode(), before.Mode())
+	}
+}
+
+func TestInstall_ExtractionFailureLeavesNoPartialBinary(t *testing.T) {
+	orig := maxZipEntryBytes
+	maxZipEntryBytes = 16
+	t.Cleanup(func() { maxZipEntryBytes = orig })
+
+	fr := newFakeRegistry(t, "opentofu", "bigbin", "1.0.0", strings.Repeat("A", 17))
+	cacheDir := t.TempDir()
+	destDir, destPath := providerInstallPath(cacheDir, fr.ns, fr.name, fr.version)
+
+	_, err := Install(context.Background(), fr.ns+"/"+fr.name, fr.version, fr.srv.URL, cacheDir)
+	if err == nil {
+		t.Fatal("Install: want extraction error for oversized entry, got nil")
+	}
+	if _, statErr := os.Lstat(destPath); !os.IsNotExist(statErr) {
+		t.Errorf("Lstat(%s) error = %v, want destination to remain absent", destPath, statErr)
+	}
+	temps, globErr := filepath.Glob(filepath.Join(destDir, ".terraform-provider-*.tmp"))
+	if globErr != nil {
+		t.Fatalf("Glob temporary provider files: %v", globErr)
+	}
+	if len(temps) != 0 {
+		t.Errorf("temporary provider files remain after extraction failure: %v", temps)
+	}
+}
+
+func TestInstall_EmptyBinaryContent(t *testing.T) {
+	fr := newFakeRegistry(t, "opentofu", "emptybin", "1.0.0", "")
+	path, err := Install(context.Background(), fr.ns+"/"+fr.name, fr.version, fr.srv.URL, t.TempDir())
+	if err != nil {
+		t.Fatalf("Install empty binary: %v", err)
+	}
+	got, err := os.ReadFile(path) //nolint:gosec // path is inside t.TempDir()
+	if err != nil {
+		t.Fatalf("ReadFile empty binary: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("empty provider content length = %d, want 0", len(got))
+	}
+}
+
+func TestInstall_SuccessfulInstallIsAtomicRegularExecutable(t *testing.T) {
+	const content = "#!/bin/sh\necho complete-provider\n"
+	fr := newFakeRegistry(t, "opentofu", "widget", "1.2.3", content)
+	cacheDir := t.TempDir()
+
+	path, err := Install(context.Background(), fr.ns+"/"+fr.name, fr.version, fr.srv.URL, cacheDir)
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("Lstat installed provider: %v", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("installed provider mode = %v, want regular non-symlink", info.Mode())
+	}
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != 0o755 {
+			t.Errorf("installed provider permissions = %#o, want 0755", got)
+		}
+		if got := info.Mode().Perm() & 0o022; got != 0 {
+			t.Errorf("installed provider group/world write bits = %#o, want 0", got)
+		}
+	}
+	got, err := os.ReadFile(path) //nolint:gosec // path is inside t.TempDir()
+	if err != nil {
+		t.Fatalf("ReadFile installed provider: %v", err)
+	}
+	if string(got) != content {
+		t.Errorf("installed provider content = %q, want %q", got, content)
+	}
+}
+
+func TestInstall_ConcurrentInstallsNoCorruptOutput(t *testing.T) {
+	const (
+		installers = 8
+		content    = "#!/bin/sh\necho complete-concurrent-provider\n"
+	)
+	fr := newFakeRegistry(t, "opentofu", "widget", "1.2.3", content)
+	cacheDir := t.TempDir()
+	destDir, destPath := providerInstallPath(cacheDir, fr.ns, fr.name, fr.version)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, installers)
+	for range installers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := Install(context.Background(), fr.ns+"/"+fr.name, fr.version, fr.srv.URL, cacheDir)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent Install: %v", err)
+		}
+	}
+
+	got, err := os.ReadFile(destPath) //nolint:gosec // destPath is inside t.TempDir()
+	if err != nil {
+		t.Fatalf("ReadFile final provider: %v", err)
+	}
+	if string(got) != content {
+		t.Errorf("final provider content = %q, want complete content %q", got, content)
+	}
+	info, err := os.Lstat(destPath)
+	if err != nil {
+		t.Fatalf("Lstat final provider: %v", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		t.Errorf("final provider mode = %v, want regular non-symlink", info.Mode())
+	}
+	temps, globErr := filepath.Glob(filepath.Join(destDir, ".terraform-provider-*.tmp"))
+	if globErr != nil {
+		t.Fatalf("Glob temporary provider files: %v", globErr)
+	}
+	if len(temps) != 0 {
+		t.Errorf("temporary provider files remain after concurrent installs: %v", temps)
+	}
 }
 
 func TestInstall_VersionNotFound(t *testing.T) {
