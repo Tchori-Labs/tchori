@@ -31,6 +31,32 @@ func buildTestProvider(t *testing.T) string {
 	return bin
 }
 
+func TestLaunch_Protocol5Unsupported(t *testing.T) {
+	t.Parallel()
+
+	bin := filepath.Join(t.TempDir(), "terraform-provider-protocol5")
+	cmd := exec.Command("go", "build", "-o", bin, //nolint:gosec // fixed command; bin is a t.TempDir artifact
+		"github.com/tchori-labs/tchori/internal/provider/testprovider5")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("building protocol-5 test provider: %v\n%s", err, out)
+	}
+
+	client, err := Launch(context.Background(), bin)
+	if client != nil {
+		t.Cleanup(func() { _ = client.Close() })
+		t.Fatal("Launch returned a client for a protocol-5-only provider")
+	}
+	if err == nil {
+		t.Fatal("Launch returned nil error for a protocol-5-only provider")
+	}
+	if !strings.Contains(err.Error(), "provider protocol unsupported") {
+		t.Errorf("Launch error does not name the unsupported protocol: %q", err)
+	}
+	if !strings.Contains(err.Error(), "tfplugin6") {
+		t.Errorf("Launch error does not name tfplugin6: %q", err)
+	}
+}
+
 func TestLaunchAndSchemas(t *testing.T) {
 	bin := buildTestProvider(t)
 	ctx := context.Background()
