@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -29,6 +30,169 @@ func TestHasChanges(t *testing.T) {
 	pl.Summary = plan.Summary{Delete: 2}
 	if !pl.HasChanges() {
 		t.Fatal("summary delete=2: HasChanges() = false, want true")
+	}
+}
+
+func TestWriteNewFileIsOwnerReadWriteOnly(t *testing.T) {
+	pl := &plan.Plan{FormatVersion: plan.FormatVersion}
+	path := filepath.Join(t.TempDir(), "plan.json")
+
+	if err := plan.Write(pl, path); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	assertPlanContent(t, path, pl)
+	assertOwnerReadWriteOnly(t, path)
+}
+
+func TestWriteOverwritePermissiveFileTightensMode(t *testing.T) {
+	pl := populatedPlan()
+	path := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(path, []byte("stale"), 0o644); err != nil { //nolint:gosec // G306: intentionally reproduce an existing permissive plan artifact
+		t.Fatalf("seed permissive plan: %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil { //nolint:gosec // G302: explicitly defeat umask to reproduce the permissive overwrite
+		t.Fatalf("chmod permissive plan: %v", err)
+	}
+
+	if err := plan.Write(pl, path); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	first := assertPlanContent(t, path, pl)
+	assertOwnerReadWriteOnly(t, path)
+
+	if err := plan.Write(pl, path); err != nil {
+		t.Fatalf("second Write: %v", err)
+	}
+	second := assertPlanContent(t, path, pl)
+	if !bytes.Equal(first, second) {
+		t.Error("plan.json is not byte-identical across writes")
+	}
+	assertOwnerReadWriteOnly(t, path)
+
+	got, err := plan.Read(path)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got.Changes) != 2 || !bytes.Equal(got.Changes[0].PlannedRaw, pl.Changes[0].PlannedRaw) ||
+		!bytes.Equal(got.Changes[1].Private, pl.Changes[1].Private) {
+		t.Errorf("Write/Read round-trip lost plan payloads: %+v", got.Changes)
+	}
+}
+
+func TestWriteSymlinkDestinationIsSafe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior requires a permission-supporting platform")
+	}
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.json")
+	link := filepath.Join(dir, "plan.json")
+	sentinel := []byte("target must remain unchanged")
+	if err := os.WriteFile(target, sentinel, 0o600); err != nil {
+		t.Fatalf("write symlink target: %v", err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		if os.IsPermission(err) {
+			t.Skipf("symlink creation is not permitted: %v", err)
+		}
+		t.Fatalf("create symlink: %v", err)
+	}
+
+	pl := populatedPlan()
+	if err := plan.Write(pl, link); err != nil {
+		if targetContent, readErr := os.ReadFile(target); readErr != nil { //nolint:gosec // G304: target is inside t.TempDir()
+			t.Fatalf("read symlink target after rejected Write: %v", readErr)
+		} else if !bytes.Equal(targetContent, sentinel) {
+			t.Fatalf("rejected Write modified symlink target: got %q", targetContent)
+		}
+		return
+	}
+
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("Lstat replacement: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		t.Fatalf("destination mode = %v, want regular non-symlink file", info.Mode())
+	}
+	assertPlanContent(t, link, pl)
+	assertOwnerReadWriteOnly(t, link)
+	if targetContent, err := os.ReadFile(target); err != nil { //nolint:gosec // G304: target is inside t.TempDir()
+		t.Fatalf("read original symlink target: %v", err)
+	} else if !bytes.Equal(targetContent, sentinel) {
+		t.Fatalf("Write followed symlink: target got %q, want %q", targetContent, sentinel)
+	}
+}
+
+func TestWriteDirectoryDestinationReturnsWrappedError(t *testing.T) {
+	dir := t.TempDir()
+	if err := plan.Write(&plan.Plan{FormatVersion: plan.FormatVersion}, dir); err == nil {
+		t.Fatal("Write to directory succeeded, want error")
+	} else if !strings.Contains(err.Error(), "rename temp plan file") {
+		t.Fatalf("Write error = %q, want actionable rename context", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(dir), ".plan-*.tmp"))
+	if err != nil {
+		t.Fatalf("Glob temp plans: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("temporary plan files left behind after failure: %v", matches)
+	}
+}
+
+func populatedPlan() *plan.Plan {
+	return &plan.Plan{
+		FormatVersion: plan.FormatVersion,
+		EngineVersion: "0.1.0-dev",
+		StateSerial:   4,
+		Changes: []*plan.Change{
+			{
+				Address:    "tchoritest_thing.alpha",
+				Action:     "update",
+				Before:     json.RawMessage(`{"name":"before"}`),
+				After:      json.RawMessage(`{"name":"after"}`),
+				PlannedRaw: []byte{0x81, 0xa4, 'n', 'a', 'm', 'e'},
+			},
+			{
+				Address: "tchoritest_thing.beta",
+				Action:  "create",
+				Before:  json.RawMessage("null"),
+				After:   json.RawMessage(`{"token":null}`),
+				Private: []byte("provider-private-payload"),
+			},
+		},
+		Summary: plan.Summary{Create: 1, Update: 1},
+	}
+}
+
+func assertPlanContent(t *testing.T, path string, pl *plan.Plan) []byte {
+	t.Helper()
+	got, err := os.ReadFile(path) //nolint:gosec // G304: path is inside t.TempDir()
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	want, err := json.MarshalIndent(pl, "", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent expected plan: %v", err)
+	}
+	want = append(want, '\n')
+	if !bytes.Equal(got, want) {
+		t.Errorf("plan content mismatch:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+	return got
+}
+
+func assertOwnerReadWriteOnly(t *testing.T, path string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("plan mode = %04o, want 0600", got)
 	}
 }
 
