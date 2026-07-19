@@ -213,6 +213,29 @@ narrowest practical, individually commented rule/path/regex entry in
 every entry requires an explicit written rationale and a remediation task
 reference.
 
+### Vulnerability scanning
+
+Install the same pinned scanner version used by CI, then run the bounded scan
+from the repository root:
+
+```sh
+go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+timeout 5m govulncheck ./...
+```
+
+To update the scanner, review the stable versions listed by
+`go list -m -versions golang.org/x/vuln`, choose a released tag, and update the
+pinned install lines in both this section and the `vulncheck` job in
+`.github/workflows/ci.yml`. Verify the new version with `govulncheck -version`,
+rerun the scan, and run the repository checks before submitting the change.
+Never replace the pin with `@latest`.
+
+The scan fails on reachable findings by default. Fix small dependency findings
+in place; create a focused follow-up task for findings that require a major
+upgrade or broader code change. Vulnerabilities are never suppressed or given
+a successful exit code without an explicit written rationale that names the
+advisory; any suppression must also be documented inline where it is applied.
+
 Provider acceptance: `docs/acceptance-admanager.md` is the manual checklist
 for running `terraform-provider-admanager` under tchori against a Google Ad
 Manager test network.
