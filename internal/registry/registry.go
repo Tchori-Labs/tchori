@@ -12,11 +12,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 )
@@ -40,6 +42,19 @@ var maxProviderArchiveBytes int64 = 1 << 30 // 1 GiB
 // exercise the oversized-entry path without generating a real multi-GB file.
 var maxZipEntryBytes int64 = 1 << 30 // 1 GiB
 
+var (
+	// httpDialTimeout bounds DNS resolution and TCP connection setup for every registry fetch.
+	httpDialTimeout = 30 * time.Second
+	// httpTLSHandshakeTimeout bounds TLS negotiation after a connection is established.
+	httpTLSHandshakeTimeout = 15 * time.Second
+	// httpResponseHeaderTimeout bounds the wait for response headers after the request is written.
+	httpResponseHeaderTimeout = 30 * time.Second
+	// httpMetadataReadTimeout bounds complete metadata requests, including body reads.
+	httpMetadataReadTimeout = time.Minute
+	// httpArchiveReadTimeout bounds complete provider archive requests.
+	httpArchiveReadTimeout = 30 * time.Minute
+)
+
 // defaultCacheDir returns ~/.tchori/providers, used by Install when
 // cacheDir is empty.
 func defaultCacheDir() (string, error) {
@@ -57,6 +72,23 @@ func parseSource(source string) (namespace, name string, err error) {
 		return "", "", fmt.Errorf("registry: invalid provider source %q, want NAMESPACE/NAME", source)
 	}
 	return parts[0], parts[1], nil
+}
+
+// newRegistryClient builds an isolated client and transport from the current timeout policy.
+// Per-request deadlines are applied by httpGet so metadata and archives retain distinct bounds.
+func newRegistryClient() *http.Client {
+	dialer := &net.Dialer{Timeout: httpDialTimeout, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   httpTLSHandshakeTimeout,
+		ResponseHeaderTimeout: httpResponseHeaderTimeout,
+		ExpectContinueTimeout: time.Second,
+	}
+	return &http.Client{Transport: transport}
 }
 
 // versionsResponse is the shape of GET /v1/providers/{ns}/{name}/versions.
@@ -93,25 +125,39 @@ type downloadResponse struct {
 	} `json:"signing_keys"`
 }
 
-// httpGet issues a GET request and returns the response with its body still
-// open (the caller must close it) once the status is 2xx. Non-2xx
-// responses are treated as hard failures: registry error bodies are not
-// guaranteed to be JSON (a 404 can come back as an HTML page from the CDN
-// in front of the registry), so no attempt is made to parse a structured
-// error out of them.
-func httpGet(ctx context.Context, url string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) //nolint:gosec // url is built from a fixed base + validated path segments, never raw user input
+// cancelReadCloser keeps a request deadline alive until its response body is closed.
+type cancelReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
+}
+
+// httpGet issues a bounded GET request and returns a successful response with
+// its body still open. Its derived request context covers response body reads
+// and inherits caller cancellation.
+func httpGet(ctx context.Context, client *http.Client, url string, readTimeout time.Duration) (*http.Response, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, readTimeout)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil) //nolint:gosec // url is built from a fixed base + validated path segments, never raw user input
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("registry: building request for %s: %w", url, err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("registry: GET %s: %w", url, err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		_ = resp.Body.Close()
+		cancel()
 		return nil, fmt.Errorf("registry: GET %s: unexpected status %s", url, resp.Status)
 	}
+	resp.Body = &cancelReadCloser{ReadCloser: resp.Body, cancel: cancel}
 	return resp, nil
 }
 
@@ -315,9 +361,12 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 		}
 	}
 
+	client := newRegistryClient()
+	defer client.CloseIdleConnections()
+
 	// 1. GET versions and validate the requested version is actually offered.
 	versionsURL := fmt.Sprintf("%s/v1/providers/%s/%s/versions", baseURL, ns, name)
-	vResp, err := httpGet(ctx, versionsURL)
+	vResp, err := httpGet(ctx, client, versionsURL, httpMetadataReadTimeout)
 	if err != nil {
 		return "", err
 	}
@@ -341,7 +390,7 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 	// 2. GET the download descriptor for this GOOS/GOARCH.
 	downloadURL := fmt.Sprintf("%s/v1/providers/%s/%s/%s/download/%s/%s",
 		baseURL, ns, name, version, runtime.GOOS, runtime.GOARCH)
-	dResp, err := httpGet(ctx, downloadURL)
+	dResp, err := httpGet(ctx, client, downloadURL, httpMetadataReadTimeout)
 	if err != nil {
 		return "", err
 	}
@@ -353,7 +402,7 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 	}
 
 	// 3. Download the zip to a temp file, hashing while streaming.
-	zipResp, err := httpGet(ctx, meta.DownloadURL)
+	zipResp, err := httpGet(ctx, client, meta.DownloadURL, httpArchiveReadTimeout)
 	if err != nil {
 		return "", err
 	}
@@ -389,7 +438,7 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 
 	// 4. Fetch SHA256SUMS once, authenticate those exact bytes with its
 	// detached signature, and only then trust its entry for this zip.
-	sResp, err := httpGet(ctx, meta.ShasumsURL)
+	sResp, err := httpGet(ctx, client, meta.ShasumsURL, httpMetadataReadTimeout)
 	if err != nil {
 		return "", err
 	}
@@ -401,7 +450,7 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 	if strings.TrimSpace(meta.ShasumsSignatureURL) == "" {
 		return "", fmt.Errorf("registry: missing required shasums_signature_url for %s", meta.Filename)
 	}
-	sigResp, err := httpGet(ctx, meta.ShasumsSignatureURL)
+	sigResp, err := httpGet(ctx, client, meta.ShasumsSignatureURL, httpMetadataReadTimeout)
 	if err != nil {
 		return "", err
 	}

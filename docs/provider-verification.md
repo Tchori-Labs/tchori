@@ -64,6 +64,22 @@ or executable. Registry, archive, checksum, and signature requests all use the
 caller's context, so cancellation interrupts the network operation and retains
 normal Go context error semantics.
 
+## Network and resource bounds
+
+Registry installation uses a dedicated HTTP client rather than Go's global
+default client. Every fetch has finite phase bounds: DNS resolution and TCP
+connection setup have 30 seconds, TLS negotiation has 15 seconds, and response
+headers have 30 seconds. The complete request, including response-body reads,
+is limited to one minute for versions, download descriptors, `SHA256SUMS`, and
+signatures. Provider archives have a separate 30-minute total request limit so
+large legitimate downloads remain viable. A caller deadline or cancellation is
+inherited by every request and wins whenever it occurs first.
+
+The downloaded archive is also capped at 1 GiB, including chunked responses or
+responses whose declared length is missing or inaccurate. Each decompressed zip
+entry has an independent 1 GiB limit. Timeout, cancellation, and size-limit
+failures remove the temporary archive and do not create a cache path.
+
 ## Trust model
 
 The signature establishes that `SHA256SUMS` was signed by a key in the same
