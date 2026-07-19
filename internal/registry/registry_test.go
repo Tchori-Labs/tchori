@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -101,7 +102,10 @@ type fakeRegistry struct {
 	signature           []byte
 	advertisedKeys      []gpgPublicKey
 	includeSignatureURL bool
+	versionsHandler     http.HandlerFunc
+	descriptorHandler   http.HandlerFunc
 	archiveHandler      http.HandlerFunc
+	shasumsHandler      http.HandlerFunc
 	signatureHandler    http.HandlerFunc
 	signer              *testSigner
 }
@@ -144,6 +148,10 @@ func newFakeRegistry(t *testing.T, ns, name, version, binaryContent string) *fak
 			http.NotFound(w, r)
 			return
 		}
+		if fr.versionsHandler != nil {
+			fr.versionsHandler(w, r)
+			return
+		}
 		// Real registry serves JSON with this content-type; Install must
 		// not gate parsing on it.
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -156,6 +164,10 @@ func newFakeRegistry(t *testing.T, ns, name, version, binaryContent string) *fak
 	mux.HandleFunc("GET /v1/providers/{ns}/{name}/{version}/download/{goos}/{goarch}", func(w http.ResponseWriter, r *http.Request) {
 		if r.PathValue("ns") != fr.ns || r.PathValue("name") != fr.name || r.PathValue("version") != fr.version {
 			http.NotFound(w, r)
+			return
+		}
+		if fr.descriptorHandler != nil {
+			fr.descriptorHandler(w, r)
 			return
 		}
 		signatureURL := ""
@@ -180,7 +192,11 @@ func newFakeRegistry(t *testing.T, ns, name, version, binaryContent string) *fak
 		}
 		_, _ = w.Write(fr.zipBytes)
 	})
-	mux.HandleFunc("GET /dl/SHA256SUMS", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /dl/SHA256SUMS", func(w http.ResponseWriter, r *http.Request) {
+		if fr.shasumsHandler != nil {
+			fr.shasumsHandler(w, r)
+			return
+		}
 		_, _ = w.Write(fr.sumsBytes)
 	})
 	mux.HandleFunc("GET /dl/SHA256SUMS.sig", func(w http.ResponseWriter, r *http.Request) {
@@ -254,6 +270,201 @@ func assertNoArchiveInstallResidue(t *testing.T, cacheDir, tempDir, ns, name, ve
 	}
 	if len(entries) != 0 {
 		t.Errorf("temporary archive directory %s should be empty after rejection, found %v", tempDir, entries)
+	}
+}
+
+func setRegistryHTTPTimeoutsForTest(t *testing.T, dial, tlsHandshake, responseHeader, metadataRead, archiveRead time.Duration) {
+	t.Helper()
+	oldDial := httpDialTimeout
+	oldTLSHandshake := httpTLSHandshakeTimeout
+	oldResponseHeader := httpResponseHeaderTimeout
+	oldMetadataRead := httpMetadataReadTimeout
+	oldArchiveRead := httpArchiveReadTimeout
+	httpDialTimeout = dial
+	httpTLSHandshakeTimeout = tlsHandshake
+	httpResponseHeaderTimeout = responseHeader
+	httpMetadataReadTimeout = metadataRead
+	httpArchiveReadTimeout = archiveRead
+	t.Cleanup(func() {
+		httpDialTimeout = oldDial
+		httpTLSHandshakeTimeout = oldTLSHandshake
+		httpResponseHeaderTimeout = oldResponseHeader
+		httpMetadataReadTimeout = oldMetadataRead
+		httpArchiveReadTimeout = oldArchiveRead
+	})
+}
+
+func requireTimeoutError(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("Install: want timeout error, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) && !os.IsTimeout(err) {
+		t.Fatalf("Install error = %v, want a deadline/timeout error", err)
+	}
+}
+
+func assertNoProviderInstallResidue(t *testing.T, tempDir, cacheDir, ns, name, version string) {
+	t.Helper()
+	nsDir := filepath.Join(cacheDir, ns)
+	if _, err := os.Stat(nsDir); !os.IsNotExist(err) {
+		t.Errorf("provider cache namespace %s should not exist after timeout", nsDir)
+	}
+	binaryPath := filepath.Join(cacheDir, ns, name, version, runtime.GOOS+"_"+runtime.GOARCH, "terraform-provider-"+name)
+	if _, err := os.Stat(binaryPath); !os.IsNotExist(err) {
+		t.Errorf("provider binary %s should not exist after timeout", binaryPath)
+	}
+	entries, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatalf("ReadDir(%s): %v", tempDir, err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("temporary provider archive was not cleaned up after timeout: %v", entries)
+	}
+}
+
+func TestNewRegistryClient_UsesDedicatedTimeoutPolicy(t *testing.T) {
+	setRegistryHTTPTimeoutsForTest(t, 11*time.Millisecond, 12*time.Millisecond, 13*time.Millisecond, 14*time.Millisecond, 15*time.Millisecond)
+
+	client := newRegistryClient()
+	if client == http.DefaultClient {
+		t.Fatal("newRegistryClient returned http.DefaultClient")
+	}
+	if client.Timeout != 0 {
+		t.Errorf("client.Timeout = %s, want zero so request classes retain distinct deadlines", client.Timeout)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("client.Transport = %T, want *http.Transport", client.Transport)
+	}
+	if transport == http.DefaultTransport {
+		t.Fatal("newRegistryClient reused http.DefaultTransport")
+	}
+	if transport.DialContext == nil {
+		t.Error("transport.DialContext is nil, want a bounded net.Dialer")
+	}
+	if transport.TLSHandshakeTimeout != httpTLSHandshakeTimeout {
+		t.Errorf("TLSHandshakeTimeout = %s, want %s", transport.TLSHandshakeTimeout, httpTLSHandshakeTimeout)
+	}
+	if transport.ResponseHeaderTimeout != httpResponseHeaderTimeout {
+		t.Errorf("ResponseHeaderTimeout = %s, want %s", transport.ResponseHeaderTimeout, httpResponseHeaderTimeout)
+	}
+}
+
+func TestInstall_ResponseHeaderTimeoutAppliesToEveryFetch(t *testing.T) {
+	tests := []struct {
+		name       string
+		setHandler func(*fakeRegistry, http.HandlerFunc)
+	}{
+		{name: "versions", setHandler: func(fr *fakeRegistry, h http.HandlerFunc) { fr.versionsHandler = h }},
+		{name: "download descriptor", setHandler: func(fr *fakeRegistry, h http.HandlerFunc) { fr.descriptorHandler = h }},
+		{name: "archive", setHandler: func(fr *fakeRegistry, h http.HandlerFunc) { fr.archiveHandler = h }},
+		{name: "SHA256SUMS", setHandler: func(fr *fakeRegistry, h http.HandlerFunc) { fr.shasumsHandler = h }},
+		{name: "signature", setHandler: func(fr *fakeRegistry, h http.HandlerFunc) { fr.signatureHandler = h }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRegistryHTTPTimeoutsForTest(t, time.Second, time.Second, 25*time.Millisecond, 500*time.Millisecond, 500*time.Millisecond)
+			fr := newFakeRegistry(t, "opentofu", "widget", "1.2.3", "provider")
+			tt.setHandler(fr, func(_ http.ResponseWriter, r *http.Request) {
+				select {
+				case <-r.Context().Done():
+				case <-time.After(250 * time.Millisecond):
+				}
+			})
+			tempDir := t.TempDir()
+			t.Setenv("TMPDIR", tempDir)
+			cacheDir := filepath.Join(t.TempDir(), "cache")
+
+			started := time.Now()
+			_, err := Install(context.Background(), fr.ns+"/"+fr.name, fr.version, fr.srv.URL, cacheDir)
+			requireTimeoutError(t, err)
+			if elapsed := time.Since(started); elapsed > time.Second {
+				t.Errorf("Install took %s after response-header timeout, want prompt return", elapsed)
+			}
+			assertNoProviderInstallResidue(t, tempDir, cacheDir, fr.ns, fr.name, fr.version)
+		})
+	}
+}
+
+func TestInstall_MetadataBodyTimeoutAppliesToEveryMetadataFetch(t *testing.T) {
+	tests := []struct {
+		name       string
+		prefix     string
+		setHandler func(*fakeRegistry, http.HandlerFunc)
+	}{
+		{name: "versions", prefix: "{", setHandler: func(fr *fakeRegistry, h http.HandlerFunc) { fr.versionsHandler = h }},
+		{name: "download descriptor", prefix: "{", setHandler: func(fr *fakeRegistry, h http.HandlerFunc) { fr.descriptorHandler = h }},
+		{name: "SHA256SUMS", prefix: "0", setHandler: func(fr *fakeRegistry, h http.HandlerFunc) { fr.shasumsHandler = h }},
+		{name: "signature", prefix: "0", setHandler: func(fr *fakeRegistry, h http.HandlerFunc) { fr.signatureHandler = h }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRegistryHTTPTimeoutsForTest(t, time.Second, time.Second, 500*time.Millisecond, 40*time.Millisecond, time.Second)
+			fr := newFakeRegistry(t, "opentofu", "widget", "1.2.3", "provider")
+			tt.setHandler(fr, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, tt.prefix)
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				<-r.Context().Done()
+			})
+			tempDir := t.TempDir()
+			t.Setenv("TMPDIR", tempDir)
+			cacheDir := filepath.Join(t.TempDir(), "cache")
+
+			_, err := Install(context.Background(), fr.ns+"/"+fr.name, fr.version, fr.srv.URL, cacheDir)
+			requireTimeoutError(t, err)
+			assertNoProviderInstallResidue(t, tempDir, cacheDir, fr.ns, fr.name, fr.version)
+		})
+	}
+}
+
+func TestInstall_ArchiveBodyTimeoutCleansUp(t *testing.T) {
+	setRegistryHTTPTimeoutsForTest(t, time.Second, time.Second, 500*time.Millisecond, time.Second, 60*time.Millisecond)
+	fr := newFakeRegistry(t, "opentofu", "widget", "1.2.3", "provider")
+	fr.archiveHandler = func(w http.ResponseWriter, r *http.Request) {
+		flusher, _ := w.(http.Flusher)
+		for _, b := range fr.zipBytes {
+			if _, err := w.Write([]byte{b}); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(20 * time.Millisecond):
+			}
+		}
+	}
+	tempDir := t.TempDir()
+	t.Setenv("TMPDIR", tempDir)
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+
+	_, err := Install(context.Background(), fr.ns+"/"+fr.name, fr.version, fr.srv.URL, cacheDir)
+	requireTimeoutError(t, err)
+	assertNoProviderInstallResidue(t, tempDir, cacheDir, fr.ns, fr.name, fr.version)
+}
+
+func TestInstall_SuccessWithFiniteTimeoutPolicy(t *testing.T) {
+	setRegistryHTTPTimeoutsForTest(t, time.Second, time.Second, time.Second, time.Second, time.Second)
+	fr := newFakeRegistry(t, "opentofu", "widget", "1.2.3", "responsive provider")
+	cacheDir := t.TempDir()
+
+	path, err := Install(context.Background(), "opentofu/widget", "1.2.3", fr.srv.URL, cacheDir)
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	got, err := os.ReadFile(path) //nolint:gosec // path is returned from an install rooted in t.TempDir
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) != "responsive provider" {
+		t.Errorf("installed content = %q, want responsive provider", got)
 	}
 }
 
@@ -722,6 +933,7 @@ func TestInstall_UppercaseHashesNormalizeConsistently(t *testing.T) {
 }
 
 func TestInstall_SignatureFetchHonorsContextCancellation(t *testing.T) {
+	setRegistryHTTPTimeoutsForTest(t, time.Second, time.Second, time.Second, 500*time.Millisecond, time.Second)
 	fr := newFakeRegistry(t, "opentofu", "widget", "1.2.3", "authentic provider")
 	started := make(chan struct{})
 	fr.signatureHandler = func(_ http.ResponseWriter, r *http.Request) {
@@ -751,6 +963,9 @@ func TestInstall_SignatureFetchHonorsContextCancellation(t *testing.T) {
 	case err := <-result:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Install error = %v, want context.Canceled", err)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Install error = %v, caller cancellation must not surface as deadline exceeded", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Install did not return after context cancellation")
