@@ -60,7 +60,8 @@ golangci-lint run
 go test ./...
 ```
 CI's `check` job (`.github/workflows/ci.yml`) re-runs the same four checks
-and is a required status check — it must be green before merge.
+plus the bounded full-suite race detector and is a required status check — it
+must be green before merge.
 
 ## Branch protection
 

@@ -176,13 +176,14 @@ go test -tags e2e ./e2e -v            # built binary: fake-provider lifecycle, r
                                       # (network required)
 ```
 
-CI runs the full race suite in a dedicated job: it measured 47.5 seconds cold
-and 20.8 seconds for a warm three-run stability check, so narrowing to a
-package subset was not justified. The required `check` job depends on `race`,
-which makes a successful existing merge gate contingent on the detector lane.
-The two-minute per-package timeout is more than three times the slowest
-observed package (35.8 seconds) while bounding hung tests; tag-gated e2e
-coverage remains in its existing job.
+CI runs the full race suite directly inside the required `check` job. It
+measured 47.5 seconds cold and 20.8 seconds for a warm three-run stability
+check, so narrowing to a package subset was not justified. Because the race
+command is a step in `check`, the required context cannot succeed unless the
+detector succeeds, and no upstream-job failure can skip the context. The
+two-minute per-package timeout is more than three times the slowest observed
+package (35.8 seconds) while bounding hung tests; tag-gated e2e coverage
+remains in its existing job.
 
 ### Secret scanning
 

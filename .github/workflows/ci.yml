@@ -15,20 +15,9 @@ concurrency:
 jobs:
   check:
     name: check
-    needs: race
-    if: ${{ always() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15 # Lint and tests typically finish in 5–7 minutes; ~2x headroom bounds hangs.
+    timeout-minutes: 15 # Lint, tests, and the ~1-minute race run finish in 5–8 minutes; ~2x headroom bounds hangs.
     steps:
-      - name: Require race detector success
-        env:
-          RACE_RESULT: ${{ needs.race.result }}
-        run: |
-          if [ "$RACE_RESULT" != success ]; then
-            echo "The required race job did not succeed: $RACE_RESULT" >&2
-            exit 1
-          fi
-
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
@@ -55,6 +44,9 @@ jobs:
 
       - name: go test
         run: go test ./...
+
+      - name: go test (race detector)
+        run: go test -race -timeout=2m ./...
 
   vulncheck:
     name: vulncheck
@@ -106,21 +98,6 @@ jobs:
       - name: verify synthetic secret detection
         timeout-minutes: 2
         run: bash scripts/gitleaks-selftest.sh
-
-  race:
-    name: race
-    runs-on: ubuntu-latest
-    timeout-minutes: 10 # The race test command has a two-minute test timeout; headroom covers setup and compilation.
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
-        with:
-          go-version-file: 'go.mod'
-          cache: true
-
-      - name: go test (race detector)
-        run: go test -race -timeout=2m ./...
 
   e2e:
     name: e2e
