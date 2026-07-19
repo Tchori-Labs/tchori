@@ -201,22 +201,39 @@ func findSHA256(sumsBytes []byte, filename string) (string, error) {
 	return match, nil
 }
 
-// extractZipFile copies one zip entry's content to destPath. The copy is
-// bounded by maxZipEntryBytes to guard against decompression-bomb archives;
-// entry names have already been validated by the caller to rule out zip-slip
-// (absolute paths / ".." traversal) before this is called.
+// extractZipFile securely publishes one zip entry at destPath. A pre-existing
+// non-regular destination is rejected using Lstat so symlinks are never
+// followed. The entry is copied, with the maxZipEntryBytes decompression-bomb
+// bound, to a fresh owner-only temp file in the destination directory, then
+// fsynced, chmoded 0755, closed, and atomically renamed into place. Failures
+// remove only that owned temp file, never the final destination. Entry names
+// have already been validated by the caller to rule out zip-slip (absolute
+// paths / ".." traversal) before this is called.
 func extractZipFile(f *zip.File, destPath string) error {
+	info, err := os.Lstat(destPath)
+	if err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("registry: refusing to install over non-regular destination %s", destPath)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("registry: inspecting destination %s: %w", destPath, err)
+	}
+
 	rc, err := f.Open()
 	if err != nil {
 		return fmt.Errorf("registry: opening %s in zip: %w", f.Name, err)
 	}
 	defer func() { _ = rc.Close() }()
 
-	// 0o600: the executable bit is applied separately by the caller once
-	// extraction succeeds (see Install's os.Chmod after this returns).
-	out, err := os.OpenFile(destPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: destPath is cacheDir joined with validated ns/name/version and a safeZipEntryName-checked flat entry name, not attacker input
+	// CreateTemp creates the file with mode 0600. Keeping it in destPath's
+	// directory guarantees that the final rename stays on one filesystem.
+	tmp, err := os.CreateTemp(filepath.Dir(destPath), ".terraform-provider-*.tmp") //nolint:gosec // CreateTemp uses a fixed pattern to create a unique 0600 file in the cache destination directory; it never opens destPath
 	if err != nil {
-		return fmt.Errorf("registry: creating %s: %w", destPath, err)
+		return fmt.Errorf("registry: creating temporary provider file in %s: %w", filepath.Dir(destPath), err)
+	}
+	tmpPath := tmp.Name()
+	cleanupTemp := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
 	}
 
 	// Ask for one byte more than the cap. io.CopyN silently stops (with a
@@ -226,18 +243,34 @@ func extractZipFile(f *zip.File, destPath string) error {
 	// err == nil. Requesting maxZipEntryBytes+1 instead means a nil error
 	// (or n > maxZipEntryBytes) only happens when the entry is too big, and
 	// an entry within the limit still ends the copy via io.EOF as before.
-	n, copyErr := io.CopyN(out, rc, maxZipEntryBytes+1)
+	n, copyErr := io.CopyN(tmp, rc, maxZipEntryBytes+1)
 	if copyErr != nil && copyErr != io.EOF {
-		_ = out.Close()
-		_ = os.Remove(destPath)
-		return fmt.Errorf("registry: writing %s: %w", destPath, copyErr)
+		cleanupTemp()
+		return fmt.Errorf("registry: writing temporary provider file for %s: %w", destPath, copyErr)
 	}
 	if copyErr == nil || n > maxZipEntryBytes {
-		_ = out.Close()
-		_ = os.Remove(destPath)
+		cleanupTemp()
 		return fmt.Errorf("registry: zip entry %q exceeds %d byte limit", f.Name, maxZipEntryBytes)
 	}
-	return out.Close()
+	// Set the final mode before Sync so the durability barrier covers both the
+	// verified contents and executable/non-writable permission metadata.
+	if err := tmp.Chmod(0o755); err != nil { //nolint:gosec // G302: provider binaries must be executable; 0755 grants execute without group/world write
+		cleanupTemp()
+		return fmt.Errorf("registry: chmod temporary provider file for %s: %w", destPath, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanupTemp()
+		return fmt.Errorf("registry: syncing temporary provider file for %s: %w", destPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("registry: closing temporary provider file for %s: %w", destPath, err)
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("registry: publishing provider file %s: %w", destPath, err)
+	}
+	return nil
 }
 
 // safeZipEntryName validates that a zip entry's name is a plain relative
@@ -425,9 +458,6 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 	}
 	if destPath == "" {
 		return "", fmt.Errorf("registry: no terraform-provider-* file found inside %s", meta.Filename)
-	}
-	if err := os.Chmod(destPath, 0o755); err != nil { //nolint:gosec // G302: the extracted file is a plugin binary tchori must exec directly; 0755 (not group/world-writable) is the minimum mode that grants the required executable bit
-		return "", fmt.Errorf("registry: chmod %s: %w", destPath, err)
 	}
 
 	return destPath, nil
