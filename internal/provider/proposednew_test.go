@@ -264,3 +264,117 @@ func TestProposedNewListGrewBeyondPrior(t *testing.T) {
 		t.Errorf("policy[1].assigned = %#v, want null — there is no prior element to carry", v)
 	}
 }
+
+// nestingFixture builds a block with one nested block of the given nesting
+// mode, whose element has an operator-written "name" and a computed
+// "assigned".
+func nestingFixture(nesting string) (*SchemaBlock, func(name, assigned cty.Value) cty.Value) {
+	inner := &SchemaBlock{
+		Attributes: map[string]*Attr{
+			"name":     {Type: cty.String, Required: true},
+			"assigned": {Type: cty.String, Computed: true},
+		},
+		Blocks: map[string]*NestedBlock{},
+	}
+	block := &SchemaBlock{
+		Attributes: map[string]*Attr{},
+		Blocks:     map[string]*NestedBlock{"entry": {Nesting: nesting, Block: inner}},
+	}
+	elem := func(name, assigned cty.Value) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{"name": name, "assigned": assigned})
+	}
+	return block, elem
+}
+
+// A map block correlates by key, so a computed value carries forward onto the
+// element that kept its key — and only onto that one.
+func TestProposedNewMapBlockCorrelatesByKey(t *testing.T) {
+	block, elem := nestingFixture("map")
+
+	prior := cty.ObjectVal(map[string]cty.Value{
+		"entry": cty.MapVal(map[string]cty.Value{
+			"first":  elem(cty.StringVal("a"), cty.StringVal("first-assigned")),
+			"second": elem(cty.StringVal("b"), cty.StringVal("second-assigned")),
+		}),
+	})
+	config := cty.ObjectVal(map[string]cty.Value{
+		"entry": cty.MapVal(map[string]cty.Value{
+			"second": elem(cty.StringVal("b"), cty.NullVal(cty.String)),
+			"third":  elem(cty.StringVal("c"), cty.NullVal(cty.String)),
+		}),
+	})
+
+	got := ProposedNew(block, prior, config).GetAttr("entry")
+
+	if got.LengthInt() != 2 {
+		t.Fatalf("entry length = %d, want 2 — the proposal must follow config, not prior", got.LengthInt())
+	}
+	if v := got.Index(cty.StringVal("second")).GetAttr("assigned"); v.IsNull() || v.AsString() != "second-assigned" {
+		t.Errorf(`entry["second"].assigned = %#v, want the prior value carried forward by key`, v)
+	}
+	// "third" has no counterpart in prior, and "first" is gone from config —
+	// neither may leak a value onto the other.
+	if v := got.Index(cty.StringVal("third")).GetAttr("assigned"); !v.IsNull() {
+		t.Errorf(`entry["third"].assigned = %#v, want null — no prior element shares that key`, v)
+	}
+	if got.HasIndex(cty.StringVal("first")).True() {
+		t.Error(`entry["first"] survived into the proposal, but config dropped it`)
+	}
+}
+
+// A set block is passed through unchanged: set elements have no stable
+// identity, so there is no non-arbitrary way to pair prior with config, and a
+// wrong pairing would carry one element's computed values onto another.
+func TestProposedNewSetBlockIsPassedThroughUnchanged(t *testing.T) {
+	block, elem := nestingFixture("set")
+
+	prior := cty.ObjectVal(map[string]cty.Value{
+		"entry": cty.SetVal([]cty.Value{elem(cty.StringVal("a"), cty.StringVal("a-assigned"))}),
+	})
+	configSet := cty.SetVal([]cty.Value{elem(cty.StringVal("a"), cty.NullVal(cty.String))})
+	config := cty.ObjectVal(map[string]cty.Value{"entry": configSet})
+
+	got := ProposedNew(block, prior, config).GetAttr("entry")
+
+	if !got.RawEquals(configSet) {
+		t.Errorf("set block was modified\n got: %#v\nwant: %#v", got, configSet)
+	}
+	for it := got.ElementIterator(); it.Next(); {
+		_, v := it.Element()
+		if !v.GetAttr("assigned").IsNull() {
+			t.Errorf("computed value carried into a set element (%#v); correlation there would be arbitrary", v)
+		}
+	}
+}
+
+// Deleting every element of a nested block must propose the empty collection,
+// not resurrect the prior one.
+func TestProposedNewEmptyNestedCollections(t *testing.T) {
+	for _, nesting := range []string{"list", "map", "set"} {
+		t.Run(nesting, func(t *testing.T) {
+			block, elem := nestingFixture(nesting)
+			ety := cty.Object(map[string]cty.Type{"name": cty.String, "assigned": cty.String})
+
+			var priorColl, configColl cty.Value
+			switch nesting {
+			case "list":
+				priorColl = cty.ListVal([]cty.Value{elem(cty.StringVal("a"), cty.StringVal("x"))})
+				configColl = cty.ListValEmpty(ety)
+			case "map":
+				priorColl = cty.MapVal(map[string]cty.Value{"k": elem(cty.StringVal("a"), cty.StringVal("x"))})
+				configColl = cty.MapValEmpty(ety)
+			case "set":
+				priorColl = cty.SetVal([]cty.Value{elem(cty.StringVal("a"), cty.StringVal("x"))})
+				configColl = cty.SetValEmpty(ety)
+			}
+
+			prior := cty.ObjectVal(map[string]cty.Value{"entry": priorColl})
+			config := cty.ObjectVal(map[string]cty.Value{"entry": configColl})
+
+			got := ProposedNew(block, prior, config).GetAttr("entry")
+			if got.LengthInt() != 0 {
+				t.Errorf("entry length = %d, want 0 — config emptied the block", got.LengthInt())
+			}
+		})
+	}
+}
