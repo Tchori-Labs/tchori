@@ -133,20 +133,29 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 			}
 		}
 
-		// Proposed value from raw config; refs resolve to planned values.
-		proposed, cds := provider.Compose(res.Config, ty, false, resolve)
+		// Config value from raw config; refs resolve to planned values. An
+		// attribute absent from config is null here, which is what "the
+		// author did not write this" means to a provider.
+		configVal, cds := provider.Compose(res.Config, ty, false, resolve)
 		ds = append(ds, cds...)
 		if cds.HasErrors() {
 			return nil, ds
 		}
 
-		vds := client.ValidateResource(ctx, res.Type, proposed)
+		vds := client.ValidateResource(ctx, res.Type, configVal)
 		ds = append(ds, vds...)
 		if vds.HasErrors() {
 			return nil, ds
 		}
 
-		pc, pds := client.PlanResource(ctx, res.Type, prior, proposed, proposed, priorPrivate)
+		// Proposed new state is a different thing from config: it is the
+		// guess at the post-apply object, so Computed attributes the author
+		// left unset keep the value the provider assigned last run instead of
+		// reverting to null. Sending config for both makes every plan read as
+		// "clear all server-assigned fields" (Tchori-Labs/tchori#59).
+		proposed := provider.ProposedNew(schema.Block, prior, configVal)
+
+		pc, pds := client.PlanResource(ctx, res.Type, prior, proposed, configVal, priorPrivate)
 		ds = append(ds, pds...)
 		if pds.HasErrors() {
 			return nil, ds

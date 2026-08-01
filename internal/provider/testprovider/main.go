@@ -105,6 +105,44 @@ var nestedThingSchema = &tfprotov6.Schema{
 	},
 }
 
+// serverAssignedType is the wire shape of tchoritest_server_assigned.
+var serverAssignedType = tftypes.Object{
+	AttributeTypes: map[string]tftypes.Type{
+		"name":       tftypes.String,
+		"id":         tftypes.String,
+		"status":     tftypes.String,
+		"created_at": tftypes.String,
+	},
+}
+
+// serverAssignedSchema declares tchoritest_server_assigned: one required
+// attribute the operator writes and three the remote API decides. It is the
+// fixture for issue #59.
+//
+// The difference from tchoritest_thing is deliberate and is the whole point:
+// tchoritest_thing's PlanResourceChange repairs its own computed attributes
+// by hand (see the `attrs["id"] = priorAttrs["id"]` branch), so it converges
+// even when handed a proposed new state full of nulls. Real providers do not
+// do that. Ones built on terraform-plugin-framework lean on plan modifiers
+// like UseStateForUnknown, which fire only for UNKNOWN values and so never
+// run against a null. That is why the engine bug in #59 survived a green test
+// suite: every fixture was too well behaved to expose it.
+//
+// This resource is the honest naive case — its plan echoes ProposedNewState
+// unchanged — so a planner test against it fails the moment the engine
+// proposes null for an attribute the operator never wrote.
+var serverAssignedSchema = &tfprotov6.Schema{
+	Version: 0,
+	Block: &tfprotov6.SchemaBlock{
+		Attributes: []*tfprotov6.SchemaAttribute{
+			{Name: "name", Type: tftypes.String, Required: true},
+			{Name: "id", Type: tftypes.String, Computed: true},
+			{Name: "status", Type: tftypes.String, Computed: true},
+			{Name: "created_at", Type: tftypes.String, Computed: true},
+		},
+	},
+}
+
 // brokenThingSchema declares tchoritest_broken_thing: a resource type whose
 // "settings" attribute is nested_type, but with a nesting mode
 // blockFromProto/nestedObjectType does not recognize (none of
@@ -157,6 +195,7 @@ func (s *server) GetMetadata(ctx context.Context, req *tfprotov6.GetMetadataRequ
 		Resources: []tfprotov6.ResourceMetadata{
 			{TypeName: "tchoritest_thing"},
 			{TypeName: "tchoritest_nested_thing"},
+			{TypeName: "tchoritest_server_assigned"},
 			{TypeName: "tchoritest_broken_thing"},
 		},
 	}, nil
@@ -166,9 +205,10 @@ func (s *server) GetProviderSchema(ctx context.Context, req *tfprotov6.GetProvid
 	return &tfprotov6.GetProviderSchemaResponse{
 		Provider: providerSchema,
 		ResourceSchemas: map[string]*tfprotov6.Schema{
-			"tchoritest_thing":        thingSchema,
-			"tchoritest_nested_thing": nestedThingSchema,
-			"tchoritest_broken_thing": brokenThingSchema,
+			"tchoritest_thing":           thingSchema,
+			"tchoritest_nested_thing":    nestedThingSchema,
+			"tchoritest_server_assigned": serverAssignedSchema,
+			"tchoritest_broken_thing":    brokenThingSchema,
 		},
 		DataSourceSchemas: map[string]*tfprotov6.Schema{},
 		Functions:         map[string]*tfprotov6.Function{},
@@ -218,6 +258,12 @@ func (s *server) ValidateResourceConfig(ctx context.Context, req *tfprotov6.Vali
 		}
 		return &tfprotov6.ValidateResourceConfigResponse{}, nil
 	}
+	if req.TypeName == "tchoritest_server_assigned" {
+		if _, err := req.Config.Unmarshal(serverAssignedType); err != nil {
+			return nil, err
+		}
+		return &tfprotov6.ValidateResourceConfigResponse{}, nil
+	}
 	cfg, err := req.Config.Unmarshal(thingType)
 	if err != nil {
 		return nil, err
@@ -251,8 +297,11 @@ func (s *server) UpgradeResourceState(ctx context.Context, req *tfprotov6.Upgrad
 	// Schema version is 0 and never bumped for any resource type: reinterpret
 	// the raw state as-is, just against the requested type's own wire shape.
 	ty := thingType
-	if req.TypeName == "tchoritest_nested_thing" {
+	switch req.TypeName {
+	case "tchoritest_nested_thing":
 		ty = nestedThingType
+	case "tchoritest_server_assigned":
+		ty = serverAssignedType
 	}
 	val, err := req.RawState.Unmarshal(ty)
 	if err != nil {
@@ -276,6 +325,9 @@ func (s *server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
 	if req.TypeName == "tchoritest_nested_thing" {
 		return s.planNestedThing(req)
+	}
+	if req.TypeName == "tchoritest_server_assigned" {
+		return s.planServerAssigned(req)
 	}
 	proposed, err := req.ProposedNewState.Unmarshal(thingType)
 	if err != nil {
@@ -392,6 +444,9 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 	if req.TypeName == "tchoritest_nested_thing" {
 		return s.applyNestedThing(req)
 	}
+	if req.TypeName == "tchoritest_server_assigned" {
+		return s.applyServerAssigned(req)
+	}
 	planned, err := req.PlannedState.Unmarshal(thingType)
 	if err != nil {
 		return nil, err
@@ -428,6 +483,88 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 		attrs["echo"] = tftypes.NewValue(tftypes.String, name)
 	}
 	newDV, err := tfprotov6.NewDynamicValue(thingType, tftypes.NewValue(thingType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.ApplyResourceChangeResponse{
+		NewState: &newDV,
+		Private:  req.PlannedPrivate,
+	}, nil
+}
+
+// planServerAssigned plans a tchoritest_server_assigned change the way an
+// ordinary provider does: it echoes the proposed new state back, except on
+// create, where the three server-assigned attributes become unknown.
+//
+// It deliberately does NOT repair those attributes from prior state. A client
+// that proposes null for them gets null back in the planned state, which is
+// what makes this resource a faithful detector for issue #59.
+func (s *server) planServerAssigned(req *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
+	proposed, err := req.ProposedNewState.Unmarshal(serverAssignedType)
+	if err != nil {
+		return nil, err
+	}
+	if proposed.IsNull() {
+		return &tfprotov6.PlanResourceChangeResponse{
+			PlannedState:   req.ProposedNewState,
+			PlannedPrivate: req.PriorPrivate,
+		}, nil
+	}
+	prior, err := req.PriorState.Unmarshal(serverAssignedType)
+	if err != nil {
+		return nil, err
+	}
+	if !prior.IsNull() {
+		return &tfprotov6.PlanResourceChangeResponse{
+			PlannedState:   req.ProposedNewState,
+			PlannedPrivate: req.PriorPrivate,
+		}, nil
+	}
+	var attrs map[string]tftypes.Value
+	if err := proposed.As(&attrs); err != nil {
+		return nil, err
+	}
+	for _, n := range []string{"id", "status", "created_at"} {
+		attrs[n] = tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+	}
+	plannedDV, err := tfprotov6.NewDynamicValue(serverAssignedType, tftypes.NewValue(serverAssignedType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.PlanResourceChangeResponse{
+		PlannedState:   &plannedDV,
+		PlannedPrivate: req.PriorPrivate,
+	}, nil
+}
+
+// applyServerAssigned mints the three server-assigned attributes when they
+// arrive unknown, standing in for the remote API deciding them.
+func (s *server) applyServerAssigned(req *tfprotov6.ApplyResourceChangeRequest) (*tfprotov6.ApplyResourceChangeResponse, error) {
+	planned, err := req.PlannedState.Unmarshal(serverAssignedType)
+	if err != nil {
+		return nil, err
+	}
+	if planned.IsNull() {
+		return &tfprotov6.ApplyResourceChangeResponse{NewState: req.PlannedState}, nil
+	}
+	var attrs map[string]tftypes.Value
+	if err := planned.As(&attrs); err != nil {
+		return nil, err
+	}
+	var name string
+	if err := attrs["name"].As(&name); err != nil {
+		return nil, err
+	}
+	if !attrs["id"].IsKnown() {
+		attrs["id"] = tftypes.NewValue(tftypes.String, s.prefix+"id-"+name)
+	}
+	if !attrs["status"].IsKnown() {
+		attrs["status"] = tftypes.NewValue(tftypes.String, "inactive")
+	}
+	if !attrs["created_at"].IsKnown() {
+		attrs["created_at"] = tftypes.NewValue(tftypes.String, "2026-01-01T00:00:00Z")
+	}
+	newDV, err := tfprotov6.NewDynamicValue(serverAssignedType, tftypes.NewValue(serverAssignedType, attrs))
 	if err != nil {
 		return nil, err
 	}
