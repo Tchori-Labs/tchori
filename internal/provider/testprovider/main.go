@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
@@ -477,8 +478,60 @@ func (s *server) applyNestedThing(req *tfprotov6.ApplyResourceChangeRequest) (*t
 	}, nil
 }
 
+// ImportResourceState adopts an existing tchoritest_thing by ID: it derives
+// name from the substring after the last "id-" marker, matching
+// ApplyResourceChange's id = "<prefix>id-<name>" convention, and returns a
+// fully populated state so import -> plan is a clean no-op. IDs without an
+// "id-" marker are rejected so the CLI's "resource does not exist" path is
+// testable.
 func (s *server) ImportResourceState(ctx context.Context, req *tfprotov6.ImportResourceStateRequest) (*tfprotov6.ImportResourceStateResponse, error) {
-	return &tfprotov6.ImportResourceStateResponse{}, nil
+	if req.TypeName != "tchoritest_thing" {
+		return &tfprotov6.ImportResourceStateResponse{
+			Diagnostics: []*tfprotov6.Diagnostic{{
+				Severity: tfprotov6.DiagnosticSeverityError,
+				Summary:  "import not supported",
+				Detail:   "resource type " + req.TypeName + " does not support import",
+			}},
+		}, nil
+	}
+	const marker = "id-"
+	idx := strings.LastIndex(req.ID, marker)
+	if idx < 0 {
+		return &tfprotov6.ImportResourceStateResponse{
+			Diagnostics: []*tfprotov6.Diagnostic{{
+				Severity: tfprotov6.DiagnosticSeverityError,
+				Summary:  "resource does not exist",
+				Detail:   `id "` + req.ID + `" has no "id-" marker`,
+			}},
+		}, nil
+	}
+	name := req.ID[idx+len(marker):]
+	if name == "" {
+		return &tfprotov6.ImportResourceStateResponse{
+			Diagnostics: []*tfprotov6.Diagnostic{{
+				Severity: tfprotov6.DiagnosticSeverityError,
+				Summary:  "resource does not exist",
+				Detail:   `id "` + req.ID + `" has an empty name after "id-"`,
+			}},
+		}, nil
+	}
+	attrs := map[string]tftypes.Value{
+		"id":         tftypes.NewValue(tftypes.String, req.ID),
+		"name":       tftypes.NewValue(tftypes.String, name),
+		"echo":       tftypes.NewValue(tftypes.String, name),
+		"replace_me": tftypes.NewValue(tftypes.String, nil),
+		"tags":       tftypes.NewValue(tftypes.Map{ElementType: tftypes.String}, nil),
+	}
+	dv, err := tfprotov6.NewDynamicValue(thingType, tftypes.NewValue(thingType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.ImportResourceStateResponse{
+		ImportedResources: []*tfprotov6.ImportedResource{{
+			TypeName: req.TypeName,
+			State:    &dv,
+		}},
+	}, nil
 }
 
 func (s *server) MoveResourceState(ctx context.Context, req *tfprotov6.MoveResourceStateRequest) (*tfprotov6.MoveResourceStateResponse, error) {

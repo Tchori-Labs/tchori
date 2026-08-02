@@ -16,6 +16,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
 )
 
 // The CLI is tested end to end: TestMain builds the real tchori binary and
@@ -133,6 +136,26 @@ func writeConfig(t *testing.T, dir, name string) {
 func newCLIRegistryFixture(t *testing.T, namespace, name, version string) *httptest.Server {
 	t.Helper()
 
+	// Ephemeral signing key: authenticates the fixture's SHA256SUMS the same
+	// way registry.Install requires of a real registry (detached OpenPGP
+	// signature over shasums_url bytes, key advertised via signing_keys).
+	entity, err := openpgp.NewEntity("tchori-test", "cli fixture signing key", "test@example.com", nil)
+	if err != nil {
+		t.Fatalf("openpgp.NewEntity: %v", err)
+	}
+	var publicArmor bytes.Buffer
+	armorWriter, err := armor.Encode(&publicArmor, openpgp.PublicKeyType, nil)
+	if err != nil {
+		t.Fatalf("armor.Encode: %v", err)
+	}
+	if err := entity.Serialize(armorWriter); err != nil {
+		t.Fatalf("serialize public key: %v", err)
+	}
+	if err := armorWriter.Close(); err != nil {
+		t.Fatalf("close public-key armor: %v", err)
+	}
+	keyID := fmt.Sprintf("%016X", entity.PrimaryKey.KeyId)
+
 	var archive bytes.Buffer
 	zw := zip.NewWriter(&archive)
 	entry, err := zw.Create("terraform-provider-" + name)
@@ -150,6 +173,11 @@ func newCLIRegistryFixture(t *testing.T, namespace, name, version string) *httpt
 	sum := sha256.Sum256(archiveBytes)
 	sumHex := hex.EncodeToString(sum[:])
 	filename := fmt.Sprintf("terraform-provider-%s_%s_%s_%s.zip", name, version, runtime.GOOS, runtime.GOARCH)
+	sumsBytes := []byte(fmt.Sprintf("%s  %s\n", sumHex, filename))
+	var signature bytes.Buffer
+	if err := openpgp.DetachSign(&signature, entity, bytes.NewReader(sumsBytes), nil); err != nil {
+		t.Fatalf("openpgp.DetachSign: %v", err)
+	}
 
 	var srv *httptest.Server
 	mux := http.NewServeMux()
@@ -169,18 +197,28 @@ func newCLIRegistryFixture(t *testing.T, namespace, name, version string) *httpt
 			http.NotFound(w, r)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"filename":     filename,
-			"download_url": srv.URL + "/dl/" + filename,
-			"shasums_url":  srv.URL + "/dl/SHA256SUMS",
-			"shasum":       sumHex,
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"filename":              filename,
+			"download_url":          srv.URL + "/dl/" + filename,
+			"shasums_url":           srv.URL + "/dl/SHA256SUMS",
+			"shasums_signature_url": srv.URL + "/dl/SHA256SUMS.sig",
+			"shasum":                sumHex,
+			"signing_keys": map[string]any{
+				"gpg_public_keys": []map[string]string{{
+					"key_id":      keyID,
+					"ascii_armor": publicArmor.String(),
+				}},
+			},
 		})
 	})
 	mux.HandleFunc("GET /dl/"+filename, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(archiveBytes)
 	})
 	mux.HandleFunc("GET /dl/SHA256SUMS", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprintf(w, "%s  %s\n", sumHex, filename)
+		_, _ = w.Write(sumsBytes)
+	})
+	mux.HandleFunc("GET /dl/SHA256SUMS.sig", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(signature.Bytes())
 	})
 
 	srv = httptest.NewServer(mux)
@@ -412,4 +450,136 @@ func TestVersion(t *testing.T) {
 	if stdout != "0.1.0-dev\n" {
 		t.Errorf("version = %q, want %q", stdout, "0.1.0-dev\n")
 	}
+}
+
+// readStateFile parses dir/state.json into serial and resource keys, for
+// asserting state-file integrity (no serial bump, no partial writes) on
+// import error paths. A missing file reads as serial 0, no resources.
+func readStateFile(t *testing.T, dir string) (serial uint64, resources map[string]json.RawMessage) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // G304: dir is a t.TempDir() test fixture, not attacker-controlled
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		t.Fatalf("read state.json: %v", err)
+	}
+	var doc struct {
+		Serial    uint64                     `json:"serial"`
+		Resources map[string]json.RawMessage `json:"resources"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("parse state.json: %v\n%s", err, data)
+	}
+	return doc.Serial, doc.Resources
+}
+
+// TestImportAdoptsResourceIntoState covers the success path: import writes
+// the resource into state.json under the declared address with the
+// provider-returned type/attributes, and a subsequent plan is a clean no-op
+// (import -> plan idempotence).
+func TestImportAdoptsResourceIntoState(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, "demo")
+	pd := "--plugin-dir=" + pluginDir
+
+	stdout, stderr, code := runCLI(t, dir, "import", pd, "tchoritest_thing.demo", "t-id-demo")
+	if code != 0 {
+		t.Fatalf("import: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "tchoritest_thing.demo") {
+		t.Errorf("import stdout missing confirmation: %q", stdout)
+	}
+
+	stdout, _, code = runCLI(t, dir, "state", "show", "tchoritest_thing.demo")
+	if code != 0 {
+		t.Fatalf("state show: exit %d, want 0", code)
+	}
+	var rs struct {
+		Type       string `json:"type"`
+		Provider   string `json:"provider"`
+		Attributes struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"attributes"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &rs); err != nil {
+		t.Fatalf("state show output is not JSON: %v\n%s", err, stdout)
+	}
+	if rs.Type != "tchoritest_thing" {
+		t.Errorf("imported type = %q, want %q", rs.Type, "tchoritest_thing")
+	}
+	if rs.Provider != "tchoritest" {
+		t.Errorf("imported provider = %q, want %q", rs.Provider, "tchoritest")
+	}
+	if rs.Attributes.ID != "t-id-demo" {
+		t.Errorf("imported id = %q, want %q", rs.Attributes.ID, "t-id-demo")
+	}
+	if rs.Attributes.Name != "demo" {
+		t.Errorf("imported name = %q, want %q", rs.Attributes.Name, "demo")
+	}
+
+	// Idempotence: config's name ("demo") matches the id-derived imported
+	// name, so plan reports no changes.
+	stdout, stderr, code = runCLI(t, dir, "plan", pd)
+	if code != 0 {
+		t.Fatalf("plan after import: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "No changes") {
+		t.Errorf("plan after import stdout = %q, want it to say No changes", stdout)
+	}
+}
+
+// TestImportErrorPaths covers import's error contract: undeclared address,
+// already-in-state address, and a nonexistent provider ID all exit 1
+// without mutating state.json (serial unchanged, no partial resource entry).
+func TestImportErrorPaths(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, "demo")
+	pd := "--plugin-dir=" + pluginDir
+
+	t.Run("address not declared in config", func(t *testing.T) {
+		serialBefore, resBefore := readStateFile(t, dir)
+		_, stderr, code := runCLI(t, dir, "import", pd, "tchoritest_thing.nope", "t-id-demo")
+		if code != 1 {
+			t.Fatalf("import undeclared address: exit %d, want 1\nstderr: %s", code, stderr)
+		}
+		serialAfter, resAfter := readStateFile(t, dir)
+		if serialAfter != serialBefore || len(resAfter) != len(resBefore) {
+			t.Fatalf("import undeclared address mutated state: serial %d->%d, resources %d->%d",
+				serialBefore, serialAfter, len(resBefore), len(resAfter))
+		}
+	})
+
+	t.Run("nonexistent provider id", func(t *testing.T) {
+		serialBefore, resBefore := readStateFile(t, dir)
+		_, stderr, code := runCLI(t, dir, "import", pd, "tchoritest_thing.demo", "no-marker-here")
+		if code != 1 {
+			t.Fatalf("import nonexistent id: exit %d, want 1\nstderr: %s", code, stderr)
+		}
+		serialAfter, resAfter := readStateFile(t, dir)
+		if serialAfter != serialBefore || len(resAfter) != len(resBefore) {
+			t.Fatalf("import nonexistent id mutated state: serial %d->%d, resources %d->%d",
+				serialBefore, serialAfter, len(resBefore), len(resAfter))
+		}
+	})
+
+	// Successful import, then a second import of the same address must
+	// refuse to overwrite.
+	if _, stderr, code := runCLI(t, dir, "import", pd, "tchoritest_thing.demo", "t-id-demo"); code != 0 {
+		t.Fatalf("import (setup): exit %d, want 0\nstderr: %s", code, stderr)
+	}
+
+	t.Run("address already in state", func(t *testing.T) {
+		serialBefore, resBefore := readStateFile(t, dir)
+		_, stderr, code := runCLI(t, dir, "import", pd, "tchoritest_thing.demo", "t-id-demo")
+		if code != 1 {
+			t.Fatalf("import already-in-state: exit %d, want 1\nstderr: %s", code, stderr)
+		}
+		serialAfter, resAfter := readStateFile(t, dir)
+		if serialAfter != serialBefore || len(resAfter) != len(resBefore) {
+			t.Fatalf("import already-in-state mutated state: serial %d->%d, resources %d->%d",
+				serialBefore, serialAfter, len(resBefore), len(resAfter))
+		}
+	})
 }
