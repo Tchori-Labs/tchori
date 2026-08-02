@@ -205,7 +205,7 @@ func TestPlanWriteReadDeterminism(t *testing.T) {
 			Address:      "tchoritest_thing.demo",
 			Action:       "create",
 			Before:       json.RawMessage("null"),
-			After:        json.RawMessage(`{"echo":null,"id":null,"name":"demo","replace_me":null,"tags":null}`),
+			After:        json.RawMessage(`{"echo":null,"id":null,"name":"demo","replace_me":null,"rules":null,"tags":null}`),
 			UnknownAfter: []string{"echo", "id"},
 		}},
 		Summary: plan.Summary{Create: 1},
@@ -365,8 +365,8 @@ func newPlanner(t *testing.T, cfg *config.Config, st *state.State) *plan.Planner
 
 // Apply-shaped state attributes, exactly as ctyjson.Marshal would emit them
 // (compact, attribute keys sorted).
-const demoApplied = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":null,"tags":null}`
-const demoAppliedOld = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"old","tags":null}`
+const demoApplied = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":null,"rules":null,"tags":null}`
+const demoAppliedOld = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"old","rules":null,"tags":null}`
 
 func TestPlanCreateWithReference(t *testing.T) {
 	cfg := testConfig(t, map[string]map[string]any{
@@ -413,11 +413,11 @@ func TestPlanCreateWithReference(t *testing.T) {
 	if got := fmt.Sprintf("%v", beta.UnknownAfter); got != "[echo id name]" {
 		t.Errorf("beta unknown_after = %v, want [echo id name]", beta.UnknownAfter)
 	}
-	wantAlphaAfter := `{"echo":null,"id":null,"name":"alpha","replace_me":null,"tags":null}`
+	wantAlphaAfter := `{"echo":null,"id":null,"name":"alpha","replace_me":null,"rules":null,"tags":null}`
 	if string(alpha.After) != wantAlphaAfter {
 		t.Errorf("alpha after = %s, want %s", alpha.After, wantAlphaAfter)
 	}
-	wantBetaAfter := `{"echo":null,"id":null,"name":null,"replace_me":null,"tags":null}`
+	wantBetaAfter := `{"echo":null,"id":null,"name":null,"replace_me":null,"rules":null,"tags":null}`
 	if string(beta.After) != wantBetaAfter {
 		t.Errorf("beta after = %s, want %s", beta.After, wantBetaAfter)
 	}
@@ -502,7 +502,7 @@ func TestPlanUpdateAndReplace(t *testing.T) {
 	if got := fmt.Sprintf("%v", ch.RequiresReplace); got != "[replace_me]" {
 		t.Errorf("requires_replace = %v, want [replace_me]", ch.RequiresReplace)
 	}
-	wantAfter := `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"new","tags":null}`
+	wantAfter := `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"new","rules":null,"tags":null}`
 	if string(ch.After) != wantAfter {
 		t.Errorf("after = %s, want %s", ch.After, wantAfter)
 	}
@@ -578,8 +578,8 @@ func TestPlanDestroy(t *testing.T) {
 		"tchoritest_thing.beta":  {"name": "${tchoritest_thing.alpha.id}"},
 	})
 	st := stateWith(t, 7, map[string]string{
-		"tchoritest_thing.alpha": `{"echo":"alpha","id":"id-alpha","name":"alpha","replace_me":null,"tags":null}`,
-		"tchoritest_thing.beta":  `{"echo":"id-alpha","id":"id-id-alpha","name":"id-alpha","replace_me":null,"tags":null}`,
+		"tchoritest_thing.alpha": `{"echo":"alpha","id":"id-alpha","name":"alpha","replace_me":null,"rules":null,"tags":null}`,
+		"tchoritest_thing.beta":  `{"echo":"id-alpha","id":"id-id-alpha","name":"id-alpha","replace_me":null,"rules":null,"tags":null}`,
 	})
 	p := newPlanner(t, cfg, st)
 	p.Destroy = true
@@ -651,5 +651,105 @@ func TestPlanUnsupportedResourceType(t *testing.T) {
 	if !found {
 		t.Errorf("diagnostics = %+v, want one with summary containing %q and detail containing %q",
 			ds, "unsupported schema", "nested_type")
+	}
+}
+
+// serverAssignedApplied is tchoritest_server_assigned.tunnel exactly as apply
+// would have stored it: the operator's "name" plus three attributes the
+// remote API decided.
+const serverAssignedApplied = `{"created_at":"2026-01-01T00:00:00Z","id":"id-tunnel","name":"tunnel","status":"inactive"}`
+
+// TestPlanConvergesWhenProviderTrustsProposedNewState is the regression test
+// for issue #59.
+//
+// Config declares only "name". The other three attributes are Computed, so
+// the engine must propose the values already in state rather than null — a
+// null there tells the provider the operator wants those fields cleared, and
+// the plan never converges.
+//
+// tchoritest_server_assigned is used rather than tchoritest_thing precisely
+// because it does NOT repair computed attributes on its own: it echoes the
+// proposed new state back. That makes it behave like the providers this bug
+// was reported against, where a perpetual diff turned into a PATCH carrying
+// nulls.
+func TestPlanConvergesWhenProviderTrustsProposedNewState(t *testing.T) {
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_server_assigned.tunnel": {"name": "tunnel"},
+	})
+	st := stateWith(t, 1, map[string]string{"tchoritest_server_assigned.tunnel": serverAssignedApplied})
+	p := newPlanner(t, cfg, st)
+
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+	if len(pl.Changes) != 1 {
+		t.Fatalf("len(changes) = %d, want 1", len(pl.Changes))
+	}
+	ch := pl.Changes[0]
+	if ch.Action != "no-op" {
+		t.Errorf("action = %q, want no-op — an unchanged config must not plan an update\nafter: %s", ch.Action, ch.After)
+	}
+	if string(ch.After) != serverAssignedApplied {
+		t.Errorf("after  = %s\nwant   = %s", ch.After, serverAssignedApplied)
+	}
+	if pl.HasChanges() {
+		t.Error("HasChanges() = true, want false: this resource can never converge while it plans an update every run")
+	}
+}
+
+// A second plan over the state a first apply produced must also be a no-op —
+// the "every run" half of #59.
+func TestPlanServerAssignedIsStableAcrossRuns(t *testing.T) {
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_server_assigned.tunnel": {"name": "tunnel"},
+	})
+	st := stateWith(t, 1, map[string]string{"tchoritest_server_assigned.tunnel": serverAssignedApplied})
+
+	for run := 1; run <= 2; run++ {
+		p := newPlanner(t, cfg, st)
+		pl, ds := p.Plan(context.Background())
+		if ds.HasErrors() {
+			t.Fatalf("run %d: Plan diagnostics: %+v", run, ds)
+		}
+		if pl.HasChanges() {
+			t.Fatalf("run %d: plan reports changes for an unchanged config: %s", run, pl.Changes[0].After)
+		}
+	}
+}
+
+// Changing the one attribute the operator owns must still plan an update, and
+// must carry the server-assigned attributes through untouched rather than
+// clearing them.
+func TestPlanServerAssignedUpdateKeepsComputedValues(t *testing.T) {
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_server_assigned.tunnel": {"name": "renamed"},
+	})
+	st := stateWith(t, 1, map[string]string{"tchoritest_server_assigned.tunnel": serverAssignedApplied})
+	p := newPlanner(t, cfg, st)
+
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+	ch := pl.Changes[0]
+	if ch.Action != "update" {
+		t.Fatalf("action = %q, want update", ch.Action)
+	}
+	var after map[string]any
+	if err := json.Unmarshal(ch.After, &after); err != nil {
+		t.Fatalf("cannot decode after: %v", err)
+	}
+	if after["name"] != "renamed" {
+		t.Errorf("after.name = %v, want %q", after["name"], "renamed")
+	}
+	for attr, want := range map[string]any{
+		"id":         "id-tunnel",
+		"status":     "inactive",
+		"created_at": "2026-01-01T00:00:00Z",
+	} {
+		if after[attr] != want {
+			t.Errorf("after.%s = %v, want %v — a rename must not clear server-assigned fields", attr, after[attr], want)
+		}
 	}
 }

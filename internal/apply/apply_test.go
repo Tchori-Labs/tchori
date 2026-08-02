@@ -523,7 +523,7 @@ func TestApplyCreateIgnoresStalePriorState(t *testing.T) {
 			addr: {
 				Type:       "tchoritest_thing",
 				Provider:   "tchoritest",
-				Attributes: json.RawMessage(`{"echo":"stale","id":"stale-id","name":"stale","replace_me":null,"tags":"not-a-map"}`),
+				Attributes: json.RawMessage(`{"echo":"stale","id":"stale-id","name":"stale","replace_me":null,"rules":null,"tags":"not-a-map"}`),
 			},
 		},
 	}
@@ -658,5 +658,155 @@ func TestApplyUnsupportedResourceType(t *testing.T) {
 	if !found {
 		t.Errorf("diagnostics = %+v, want one with summary containing %q and detail containing %q",
 			ds, "unsupported schema", "nested_type")
+	}
+}
+
+// rulesRef builds a tchoritest_thing "rules" config value: a one-element
+// list of a map whose "token_id" is the whole-string ${...} reference to
+// refAddr's "id" attribute — the list-nested shape from issue #11
+// (cloudflare's policies[].include[].service_token.token_id) reproduced at
+// the fake-provider level via the "rules" list-of-object attribute added in
+// TC-033 (see testprovider's thingRuleType).
+func rulesRef(refAddr string) []any {
+	return []any{
+		map[string]any{"token_id": "${" + refAddr + ".id}"},
+	}
+}
+
+// stateRules re-decodes a saved resource's "rules" attribute (via
+// stateAttrs) into the one-element []any{map[string]any{"token_id": ...}}
+// shape rulesRef produces, and returns the single element's token_id.
+func stateRulesTokenID(t *testing.T, path, addr string) string {
+	t.Helper()
+	attrs := stateAttrs(t, path, addr)
+	rules, ok := attrs["rules"].([]any)
+	if !ok || len(rules) != 1 {
+		t.Fatalf("%s rules = %#v, want a one-element list", addr, attrs["rules"])
+	}
+	elem, ok := rules[0].(map[string]any)
+	if !ok {
+		t.Fatalf("%s rules[0] = %#v, want a map", addr, rules[0])
+	}
+	tokenID, _ := elem["token_id"].(string)
+	return tokenID
+}
+
+// TestApplySingleApplyResolvesListNestedRefCreateUpdate is the exact
+// create+update reproduction of Tchori-Labs/tchori#11 (TC-033): resource
+// "b" already exists in state (applied in a prior run with no rules), then
+// a single plan+apply both creates resource "a" and updates "b" so that
+// b's "rules" list holds a reference to a's (not-yet-applied-at-plan-time)
+// computed "id". Before the TC-033 fix, resolvePlannedUnknowns left the
+// list-nested reference unknown at apply, so it reached the fake provider
+// as null (and, for the real cloudflare provider, a 400); after the fix,
+// one apply suffices — b's saved rules[0].token_id equals a's saved id.
+func TestApplySingleApplyResolvesListNestedRefCreateUpdate(t *testing.T) {
+	h := newHarness(t, map[string]*config.Resource{
+		"tchoritest_thing.b": thing("b", "b"),
+	})
+	ctx := context.Background()
+
+	// Seed state: "b" alone, no rules.
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "create" {
+		t.Fatalf("seed plan = %+v, want exactly one create change", pl.Changes)
+	}
+	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("seed Apply: %+v", ds)
+	}
+	if saved := loadState(t, h.statePath); saved.Serial != 1 {
+		t.Fatalf("seed state serial = %d, want 1", saved.Serial)
+	}
+
+	// Now add "a" (create) and give "b" a rules list referencing a's id
+	// (making b an update).
+	h.cfg.Resources["tchoritest_thing.a"] = thing("a", "a")
+	h.cfg.Resources["tchoritest_thing.b"].Config["rules"] = rulesRef("tchoritest_thing.a")
+
+	st = loadState(t, h.statePath)
+	pl = h.plan(t, st, false)
+	if len(pl.Changes) != 2 {
+		t.Fatalf("plan has %d changes, want 2: %+v", len(pl.Changes), pl.Changes)
+	}
+	actions := map[string]string{}
+	for _, ch := range pl.Changes {
+		actions[ch.Address] = ch.Action
+	}
+	if actions["tchoritest_thing.a"] != "create" {
+		t.Errorf("a action = %q, want %q", actions["tchoritest_thing.a"], "create")
+	}
+	if actions["tchoritest_thing.b"] != "update" {
+		t.Errorf("b action = %q, want %q", actions["tchoritest_thing.b"], "update")
+	}
+
+	// One apply must suffice: zero error diagnostics.
+	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("single Apply (create a + update b with list-nested ref): %+v", ds)
+	}
+
+	aAttrs := stateAttrs(t, h.statePath, "tchoritest_thing.a")
+	aID, _ := aAttrs["id"].(string)
+	if aID == "" {
+		t.Fatalf("a id = %#v, want a non-empty string", aAttrs["id"])
+	}
+
+	if got := stateRulesTokenID(t, h.statePath, "tchoritest_thing.b"); got != aID {
+		t.Errorf("b rules[0].token_id = %q, want %q (a's applied id, resolved within the single apply)", got, aID)
+	}
+
+	// Exactly one save per change across both apply runs: seed apply saved
+	// once (serial 1), this apply saves a and b (2 more changes) -> 3.
+	if saved := loadState(t, h.statePath); saved.Serial != 3 {
+		t.Errorf("state serial = %d, want 3 (one save per change across both applies)", saved.Serial)
+	}
+}
+
+// TestApplySingleApplyResolvesListNestedRefCreateCreate covers the
+// create+create shape (both "a" and "b" new in the same plan), with the
+// dependent ("a_ref") address-sorting BEFORE its dependency
+// ("z_target") — mirroring TestApplyRefOrderBeatsAddressOrder — so the
+// test also proves execution follows cfg.Order(), not plan-document order,
+// for a list-nested reference.
+func TestApplySingleApplyResolvesListNestedRefCreateCreate(t *testing.T) {
+	aRef := thing("a_ref", "a_ref")
+	aRef.Config["rules"] = rulesRef("tchoritest_thing.z_target")
+	h := newHarness(t, map[string]*config.Resource{
+		"tchoritest_thing.a_ref":    aRef,
+		"tchoritest_thing.z_target": thing("z_target", "z_target"),
+	})
+	ctx := context.Background()
+
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	if len(pl.Changes) != 2 {
+		t.Fatalf("plan has %d changes, want 2: %+v", len(pl.Changes), pl.Changes)
+	}
+	for _, ch := range pl.Changes {
+		if ch.Action != "create" {
+			t.Fatalf("change %s action = %q, want %q", ch.Address, ch.Action, "create")
+		}
+	}
+
+	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("single Apply (create a_ref + create z_target with list-nested ref): %+v", ds)
+	}
+
+	zAttrs := stateAttrs(t, h.statePath, "tchoritest_thing.z_target")
+	zID, _ := zAttrs["id"].(string)
+	if zID == "" {
+		t.Fatalf("z_target id = %#v, want a non-empty string", zAttrs["id"])
+	}
+
+	if got := stateRulesTokenID(t, h.statePath, "tchoritest_thing.a_ref"); got != zID {
+		t.Errorf("a_ref rules[0].token_id = %q, want %q (z_target's applied id, resolved within the single apply)", got, zID)
+	}
+
+	saved := loadState(t, h.statePath)
+	if saved.Serial != 2 {
+		t.Errorf("state serial = %d, want 2 (one save per change)", saved.Serial)
+	}
+	if len(saved.Resources) != 2 {
+		t.Errorf("state has %d resources, want 2", len(saved.Resources))
 	}
 }

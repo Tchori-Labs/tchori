@@ -335,11 +335,38 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 // resolvePlannedUnknowns walks planned and cfgVal together (both at the same
 // schema type) and replaces any unknown leaf in planned with the
 // corresponding value from cfgVal, provided cfgVal actually has a concrete
-// (known, non-null) value there. Composite values (objects, maps) recurse
-// per-element; lists, sets and primitives are returned unchanged since
-// nothing in this MVP nests a forward reference inside an ordered
-// collection and per-index merging would be unsound without a stronger
-// correspondence guarantee.
+// (known, non-null) value there. Composite values recurse per-element:
+// objects and maps per-attribute/per-key (as before), and — fixing
+// Tchori-Labs/tchori#11 (TC-033) — lists and tuples per-index, plus a
+// wholesale substitution rule for sets. Before this fix, a ${...} reference
+// nested inside a list (e.g. cloudflare's policies[].include[].
+// service_token.token_id) stayed unknown at apply and was sent to the
+// provider as null, requiring a second apply once the referenced resource
+// was in state; a plain create+create or create+update within a single
+// apply now resolves such nested references in one pass.
+//
+// Soundness argument for lists/tuples: planned and cfgVal decode the SAME
+// raw config at the SAME schema type, so when their lengths agree, index i
+// of planned and index i of cfgVal both derive from the same configured
+// element — the same correspondence guarantee that already justifies the
+// map branch's per-key merge, just keyed by position instead of by map key.
+// A wholly-unknown list/tuple is already replaced wholesale by the
+// top-of-function !planned.IsKnown() branch, so this per-index recursion
+// only ever runs on a list/tuple whose *elements* are individually
+// known/unknown. When lengths disagree (a provider-side length change, or
+// cfgVal not actually known/non-null), no sound positional correspondence
+// exists, so planned is returned unchanged rather than risk misaligning
+// elements.
+//
+// Sets have no stable per-element index at all (cty sets are unordered and
+// de-duplicated), so there is no sound per-element merge rule. Instead, if
+// planned is not wholly known and cfgVal is a known, non-null, wholly-known
+// set, the whole set is substituted with cfgVal; otherwise planned passes
+// through unchanged. This trades away preserving any provider-planned
+// modification to an individual set element in favor of resolving the
+// reference — acceptable here because this branch only ever fires when the
+// set actually contains unresolved unknowns (a wholly-known planned set is
+// returned unchanged, same as any other known leaf).
 func resolvePlannedUnknowns(planned, cfgVal cty.Value) cty.Value {
 	if !planned.IsKnown() {
 		if cfgVal.IsKnown() && !cfgVal.IsNull() {
@@ -384,6 +411,71 @@ func resolvePlannedUnknowns(planned, cfgVal cty.Value) cty.Value {
 			elems[key] = resolvePlannedUnknowns(v, sub)
 		}
 		return cty.MapVal(elems)
+
+	case ty.IsListType():
+		if planned.LengthInt() == 0 {
+			return planned
+		}
+		elemTy := ty.ElementType()
+		var cfgElems []cty.Value
+		haveCfg := cfgVal.IsKnown() && !cfgVal.IsNull() && cfgVal.LengthInt() == planned.LengthInt()
+		if haveCfg {
+			cfgElems = cfgVal.AsValueSlice()
+		}
+		if !haveCfg {
+			// No sound positional correspondence (cfgVal unknown/null, or a
+			// length mismatch) — recurse each element against null so any
+			// provider-computed unknowns still pass through unchanged, but
+			// never risk misaligning elements across differing lengths.
+			elems := make([]cty.Value, 0, planned.LengthInt())
+			for it := planned.ElementIterator(); it.Next(); {
+				_, v := it.Element()
+				elems = append(elems, resolvePlannedUnknowns(v, cty.NullVal(elemTy)))
+			}
+			return cty.ListVal(elems)
+		}
+		elems := make([]cty.Value, 0, planned.LengthInt())
+		i := 0
+		for it := planned.ElementIterator(); it.Next(); i++ {
+			_, v := it.Element()
+			elems = append(elems, resolvePlannedUnknowns(v, cfgElems[i]))
+		}
+		return cty.ListVal(elems)
+
+	case ty.IsTupleType():
+		atys := ty.TupleElementTypes()
+		if len(atys) == 0 {
+			return planned
+		}
+		plannedElems := planned.AsValueSlice()
+		haveCfg := cfgVal.IsKnown() && !cfgVal.IsNull()
+		var cfgElems []cty.Value
+		if haveCfg {
+			cfgElems = cfgVal.AsValueSlice()
+			haveCfg = len(cfgElems) == len(plannedElems)
+		}
+		if !haveCfg {
+			elems := make([]cty.Value, len(plannedElems))
+			for i, v := range plannedElems {
+				elems[i] = resolvePlannedUnknowns(v, cty.NullVal(atys[i]))
+			}
+			return cty.TupleVal(elems)
+		}
+		elems := make([]cty.Value, len(plannedElems))
+		for i, v := range plannedElems {
+			elems[i] = resolvePlannedUnknowns(v, cfgElems[i])
+		}
+		return cty.TupleVal(elems)
+
+	case ty.IsSetType():
+		// Sets have no stable per-element index, so there is no sound
+		// per-element merge; substitute the whole set only when planned
+		// actually contains unresolved unknowns and cfgVal is a concrete,
+		// wholly-known replacement. Otherwise leave planned untouched.
+		if !planned.IsWhollyKnown() && cfgVal.IsKnown() && !cfgVal.IsNull() && cfgVal.IsWhollyKnown() {
+			return cfgVal
+		}
+		return planned
 
 	default:
 		return planned

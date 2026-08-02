@@ -77,6 +77,15 @@ non-null planned value (unknowns included) is preserved separately in
 `planned_raw` for apply to use — `after` is the reviewable, JSON-native
 view; `planned_raw` is the executable one.
 
+At apply time, an unknown left over from planning that turns out to be a
+`${...}` reference to another resource created earlier in the same run is
+resolved against that resource's real, just-applied value before the
+provider is called — this covers references nested arbitrarily deep inside
+lists, sets, tuples, objects, and maps (e.g. a policy list whose element
+holds a reference inside a further-nested object), not just top-level or
+object/map-nested attributes, so a single `tchori apply` suffices even when
+the reference is nested inside an ordered collection (Tchori-Labs/tchori#11).
+
 ### Exit-code contract
 
 | Command | 0 | 2 | 1 |

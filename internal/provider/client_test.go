@@ -123,6 +123,7 @@ func TestLaunchAndSchemas(t *testing.T) {
 		"name":       cty.String,
 		"tags":       cty.Map(cty.String),
 		"replace_me": cty.String,
+		"rules":      cty.List(cty.Object(map[string]cty.Type{"token_id": cty.String})),
 		"id":         cty.String,
 		"echo":       cty.String,
 	})

@@ -58,13 +58,28 @@ func TestResolvePlannedUnknowns(t *testing.T) {
 			want:    cty.MapValEmpty(cty.String),
 		},
 		{
-			// Lists are returned unchanged (not recursed into), so an
-			// unknown element inside a list passes through untouched even
-			// though cfgVal holds a concrete list of the same length.
-			name: "unknown inside a list passes through unchanged",
+			// TC-033 / Tchori-Labs/tchori#11 regression: lists now recurse
+			// per-index, so an unknown element resolves to the corresponding
+			// concrete cfg element while a known planned element is left
+			// untouched even though cfgVal differs there.
+			name: "unknown inside a list resolves per-index",
 			planned: cty.ListVal([]cty.Value{
 				cty.UnknownVal(cty.String),
 				cty.StringVal("known"),
+			}),
+			cfgVal: cty.ListVal([]cty.Value{
+				cty.StringVal("cfg1"),
+				cty.StringVal("cfg2-different"),
+			}),
+			want: cty.ListVal([]cty.Value{
+				cty.StringVal("cfg1"),
+				cty.StringVal("known"),
+			}),
+		},
+		{
+			name: "list length mismatch returns planned unchanged",
+			planned: cty.ListVal([]cty.Value{
+				cty.UnknownVal(cty.String),
 			}),
 			cfgVal: cty.ListVal([]cty.Value{
 				cty.StringVal("cfg1"),
@@ -72,7 +87,110 @@ func TestResolvePlannedUnknowns(t *testing.T) {
 			}),
 			want: cty.ListVal([]cty.Value{
 				cty.UnknownVal(cty.String),
+			}),
+		},
+		{
+			// Mirrors the empty-map guard: cty.ListVal panics on an empty
+			// slice, so the empty-list branch must return before ever
+			// touching cfgVal (deliberately null here too).
+			name:    "empty-list guard (no panic)",
+			planned: cty.ListValEmpty(cty.String),
+			cfgVal:  cty.NullVal(cty.List(cty.String)),
+			want:    cty.ListValEmpty(cty.String),
+		},
+		{
+			name: "unknown list element with null cfg element stays unknown",
+			planned: cty.ListVal([]cty.Value{
+				cty.UnknownVal(cty.String),
 				cty.StringVal("known"),
+			}),
+			cfgVal: cty.ListVal([]cty.Value{
+				cty.NullVal(cty.String),
+				cty.StringVal("cfg2"),
+			}),
+			want: cty.ListVal([]cty.Value{
+				cty.UnknownVal(cty.String),
+				cty.StringVal("known"),
+			}),
+		},
+		{
+			// The issue's exact nesting shape: a list of objects, each
+			// holding another list of objects with a string leaf, two
+			// levels deep. An unknown leaf resolves to the concrete cfg
+			// value while a sibling null/computed attr (e.g. a
+			// provider-assigned "id") stays untouched.
+			name: "nested list-of-object-of-list-of-object resolves deep unknown",
+			planned: cty.ListVal([]cty.Value{
+				cty.ObjectVal(map[string]cty.Value{
+					"id": cty.UnknownVal(cty.String),
+					"include": cty.ListVal([]cty.Value{
+						cty.ObjectVal(map[string]cty.Value{
+							"token_id": cty.UnknownVal(cty.String),
+						}),
+					}),
+				}),
+			}),
+			cfgVal: cty.ListVal([]cty.Value{
+				cty.ObjectVal(map[string]cty.Value{
+					"id": cty.NullVal(cty.String),
+					"include": cty.ListVal([]cty.Value{
+						cty.ObjectVal(map[string]cty.Value{
+							"token_id": cty.StringVal("concrete-token-id"),
+						}),
+					}),
+				}),
+			}),
+			want: cty.ListVal([]cty.Value{
+				cty.ObjectVal(map[string]cty.Value{
+					"id": cty.UnknownVal(cty.String),
+					"include": cty.ListVal([]cty.Value{
+						cty.ObjectVal(map[string]cty.Value{
+							"token_id": cty.StringVal("concrete-token-id"),
+						}),
+					}),
+				}),
+			}),
+		},
+		{
+			name: "set with unknown element substituted wholesale by wholly-known cfg set",
+			planned: cty.SetVal([]cty.Value{
+				cty.UnknownVal(cty.String),
+				cty.StringVal("known"),
+			}),
+			cfgVal: cty.SetVal([]cty.Value{
+				cty.StringVal("cfg1"),
+				cty.StringVal("cfg2"),
+			}),
+			want: cty.SetVal([]cty.Value{
+				cty.StringVal("cfg1"),
+				cty.StringVal("cfg2"),
+			}),
+		},
+		{
+			name: "set with null cfg returns planned unchanged",
+			planned: cty.SetVal([]cty.Value{
+				cty.UnknownVal(cty.String),
+				cty.StringVal("known"),
+			}),
+			cfgVal: cty.NullVal(cty.Set(cty.String)),
+			want: cty.SetVal([]cty.Value{
+				cty.UnknownVal(cty.String),
+				cty.StringVal("known"),
+			}),
+		},
+		{
+			name: "tuple per-index merge",
+			planned: cty.TupleVal([]cty.Value{
+				cty.UnknownVal(cty.String),
+				cty.NumberIntVal(1),
+			}),
+			cfgVal: cty.TupleVal([]cty.Value{
+				cty.StringVal("concrete"),
+				cty.NumberIntVal(2),
+			}),
+			want: cty.TupleVal([]cty.Value{
+				cty.StringVal("concrete"),
+				cty.NumberIntVal(1),
 			}),
 		},
 	}
