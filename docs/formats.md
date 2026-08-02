@@ -206,40 +206,85 @@ creates.
 `Save` (`internal/state/state.go`):
 
 1. Acquires an flock-based lock at `path+".lock"` (`github.com/gofrs/flock`),
-   polling every 50ms up to a 10-second timeout, and releases it via
-   `defer`.
-2. Re-reads the on-disk serial and compares it with the base serial observed
-   by `Load` or the preceding successful `Save`. If another process committed
-   in the meantime, `Save` returns `state.ErrConcurrentModification` with the
+   polling every 50ms up to a 10-second timeout, and releases it via `defer`.
+   If the name exists, `Save` first requires it to be a regular file on every
+   platform. On POSIX, no-follow and nonblocking open flags additionally make
+   a symlink or filesystem FIFO raced in after that check fail fast rather
+   than be followed or hang. After acquisition on every platform, the held
+   descriptor must be regular and the same inode as a fresh `Lstat` of the
+   name. An existing regular lock is reused untouched: it is not replaced,
+   truncated, or chmod'ed, so its permissions remain as found.
+2. Re-reads the on-disk serial and compares it with the base serial observed by
+   `Load` or the preceding successful `Save`. If another process committed in
+   the meantime, `Save` returns `state.ErrConcurrentModification` with the
    state path and re-run guidance; neither the state nor its backup is touched.
-3. Copies the current file at `path` to `path+".backup"` before overwriting
-   — a no-op on the very first save, since there's nothing to back up yet. On
-   permission-supporting platforms, each backup is created or re-tightened to
-   owner read/write mode (`0600`).
+3. Copies the current file at `path` to a fresh same-directory temporary file
+   before renaming it to `path+".backup"`. The rename replaces that name
+   without writing through it: this is an atomic replace on POSIX, while
+   Windows uses `MoveFileEx` replacement semantics. A planted symlink is
+   replaced, never followed, and the result is a new regular file. On POSIX
+   its permissions are owner-only and never broader than `0600`, subject to
+   the process umask; Windows uses its own permission semantics. A directory
+   at the backup name is rejected when there is state to copy. The backup step
+   is a no-op before inspecting that name on the first save, so anything at
+   the backup name cannot prevent an initial state write.
 4. Increments `Serial`, marshals with `MarshalIndent`, writes a temp file
    (`.state-*.tmp`) in the same directory, and fsyncs the complete file before
-   closing it.
-5. Atomically renames the temp file over `path`, then runs the platform's
-   directory-durability barrier before reporting success. On POSIX this
-   fsyncs the containing directory (`internal/state/sync_dir_unix.go`). On
-   Windows this barrier is a documented no-op
-   (`internal/state/sync_dir_windows.go`): `File.Sync` maps to
-   `FlushFileBuffers`, which requires a write-capable handle that `os.Open`
-   never returns for a directory, and directory fsync is not a supported or
-   necessary durability primitive on Windows — NTFS journals rename metadata
-   itself. Failures before rename remove the temp file and leave the
-   in-memory serial unchanged. A post-rename directory-sync failure (POSIX
-   only — the Windows barrier never fails) is returned without deleting the
-   newly committed state; the in-memory serial and compare-and-swap base
-   advance to match that visible replacement so a retry does not report a
-   false concurrent modification. A successful commit becomes the next base,
-   so apply's per-resource saves can continue sequentially.
+   closing it. It atomically renames the temp file over `path`, then runs the
+   platform's directory-durability barrier before reporting success. On POSIX
+   this fsyncs the containing directory; on Windows the barrier is a documented
+   no-op because directory fsync is not a supported primitive and NTFS journals
+   rename metadata. Failures before rename remove the temp file and leave the
+   in-memory serial unchanged. A post-rename directory-sync failure returns
+   without deleting the newly committed state; the in-memory serial and
+   compare-and-swap base advance to match that visible replacement so a retry
+   does not report a false concurrent modification.
 
 Together, the file fsync and the platform directory-durability barrier mean a
 `nil` return confirms the state contents reached stable storage across abrupt
 process or host failure — on POSIX this additionally confirms the atomic
 directory-entry replacement itself was fsynced; on Windows the rename's
 durability is covered by the NTFS metadata journal instead.
+
+#### Symlink handling
+
+The sidecar guarantee is deliberately path- and platform-specific:
+
+1. Writes to `state.json` and `state.json.backup` never traverse a symlink on
+   any platform. Each uses a fresh, same-directory `O_EXCL` temporary file with
+   mode `0600` requested and a rename that replaces the destination name. A
+   symlink target is never truncated or modified, and the result is a new
+   regular file. Replacement is atomic on POSIX. Windows `os.Rename` uses
+   `MoveFileEx` replacement semantics, but does not have the same formal
+   atomicity guarantee and may fail when another process has the destination
+   open. On POSIX, umask can only clear requested bits, so permissions are
+   owner-only and never broader than `0600`; Windows mode bits do not describe
+   the resulting ACL and the platform's permission semantics apply.
+2. A non-regular lock entry present during the preflight `Lstat` is rejected
+   before opening on every platform. On POSIX, `O_NOFOLLOW|O_NONBLOCK` also
+   refuses a symlink raced in before open and makes a raced filesystem FIFO
+   return promptly. Everywhere, after acquisition, `Save` verifies that the
+   held descriptor is regular and the same inode as the lock name. Where the
+   guard constant is zero, notably Windows, a raced entry can be traversed
+   before this verification detects it; a dangling symlink target may already
+   have been created empty, but existing data cannot be destroyed because the
+   lock open has no `O_TRUNC`. Windows named pipes use the `\\.\pipe\`
+   namespace rather than filesystem FIFO paths.
+3. Existing regular lock files are reused exactly as found, including their
+   contents, inode, and permissions. The lock stores no state data, and
+   replacing or mutating an inode held by another process would weaken flock's
+   mutual exclusion.
+4. `Load` intentionally uses `os.ReadFile`, so it follows a symlink at the
+   state path for a read-only operation performed with the invoking user's
+   privileges.
+
+Hardlinks and symlinked parent-directory components are outside this mechanism.
+State and backup permission bits remain subject to umask as the owner-only upper
+bound described above. The nonblocking claim is measured for filesystem FIFOs
+on the shipped Linux and Darwin targets; it is not a claim that arbitrary device
+nodes cannot block. The guard flags apply to every unix build, but on the
+unshipped aix, solaris, and illumos targets flock opens with `O_RDWR`, and POSIX
+leaves `O_RDWR|O_NONBLOCK` FIFO-open behavior undefined.
 
 ### Determinism
 
