@@ -31,16 +31,22 @@ Status: **0.1.0-dev** — pre-MVP, under active development, built in public.
 4. **Built-in MCP server.** `tchori mcp` serves state and plans to any MCP
    client over stdio. Read + plan only — there is deliberately no apply tool.
 
-## Providers: protocol 6 only (MVP)
+## Providers: protocol 6 and 5
 
 tchori speaks plugin protocol **6** (tfplugin6) — the protocol every
-provider built on terraform-plugin-framework speaks. The classic hashicorp
-utility providers (`null`, `random`, `time`, `local`) publish
-protocol-5-only binaries: `tchori providers install` still downloads them,
-PGP-verifies the registry's signed `SHA256SUMS`, and SHA256-verifies the
-archive, but launching one fails fast with a structured diagnostic naming the
-protocol mismatch (`provider protocol unsupported`). A tfplugin5 adapter is a
-recorded post-MVP roadmap item.
+provider built on terraform-plugin-framework speaks — natively, and protocol
+**5** (tfplugin5) through an in-process translation adapter
+(`internal/provider/tfplugin5_adapter.go`). The classic hashicorp utility
+providers (`null`, `random`, `time`, `local`) and legacy-SDK providers like
+`oracle/oci` publish protocol-5-only binaries; `tchori providers install`
+downloads them exactly as it always has (PGP-verifies the registry's signed
+`SHA256SUMS`, SHA256-verifies the archive), and `Launch` now negotiates
+whichever of protocol 6 or 5 the binary offers — go-plugin picks the highest
+mutually supported version, so protocol-6 providers are unaffected and a
+protocol-5 connection is transparently wrapped in the adapter before the rest
+of tchori ever sees it. A provider offering neither protocol still fails fast
+with a structured diagnostic naming the mismatch (`provider protocol
+unsupported: tchori speaks plugin protocols 6 (tfplugin6) and 5 (tfplugin5)`).
 
 ```sh
 tchori providers install NAMESPACE/NAME VERSION   # PGP-verify sums + SHA256-verify archive
@@ -72,8 +78,10 @@ for copy-pasteable commands.
 
 ## Quickstart
 
-No credential-free protocol-6 provider exists on the public registry yet, so
-the quickstart uses tchori's in-repo test provider via `--plugin-dir`:
+Credential-free registry providers now exist (`opentofu/null`, `opentofu/random`,
+and friends, via the tfplugin5 adapter above), but the quickstart still uses
+tchori's in-repo test provider via `--plugin-dir` — it needs no install step
+and no network access:
 
 ```sh
 git clone https://github.com/tchori-labs/tchori
@@ -187,13 +195,13 @@ claude mcp add tchori -- tchori mcp
 
 ## Scope (MVP)
 
-In: any tfplugin6 provider · `${type.name.attr}` references · plan/apply/
-destroy through plan documents · provider install from the OpenTofu registry
-(SHA256-verified) · import · MCP read + plan.
+In: any tfplugin6 or tfplugin5 provider (the latter via the tfplugin5
+adapter) · `${type.name.attr}` references · plan/apply/destroy through plan
+documents · provider install from the OpenTofu registry (SHA256-verified) ·
+import · MCP read + plan.
 
-Out (recorded deferrals): tfplugin5 adapter (the classic null/random/time/
-local providers), modules, count/for_each, an expression language, HCL,
-remote state backends, workspaces, registry GPG verification,
+Out (recorded deferrals): modules, count/for_each, an expression language,
+HCL, remote state backends, workspaces, registry GPG verification,
 apply-via-MCP, Homebrew tap (post-0.1).
 
 ## Development
@@ -201,9 +209,10 @@ apply-via-MCP, Homebrew tap (post-0.1).
 ```sh
 go test ./...                         # unit + protocol tests (in-process fake provider)
 go test -race -timeout=2m ./...       # full untagged suite under the race detector
-go test -tags e2e ./e2e -v            # built binary: fake-provider lifecycle, real
-                                      # registry install, protocol-5 graceful failure
-                                      # (network required)
+go test -tags e2e ./e2e -v            # built binary: fake-provider lifecycle, fixture
+                                      # registry install, protocol-5 adapter lifecycle
+                                      # against a real protocol-5-only binary
+                                      # (fixture-based; no network required)
 ```
 
 CI runs the full race suite directly inside the required `check` job. It

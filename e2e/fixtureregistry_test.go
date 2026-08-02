@@ -15,6 +15,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
 )
 
 // newFixtureRegistry serves opentofu/null at nullVersion for the running
@@ -45,6 +48,33 @@ func newFixtureRegistry(t *testing.T, providerBinary string) *httptest.Server {
 	sum := sha256.Sum256(archiveBytes)
 	sumHex := hex.EncodeToString(sum[:])
 	filename := fmt.Sprintf("terraform-provider-null_%s_%s_%s.zip", nullVersion, runtime.GOOS, runtime.GOARCH)
+	sumsBytes := []byte(fmt.Sprintf("%s  %s\n", sumHex, filename))
+
+	// Ephemeral signing key: internal/registry.Install requires a detached
+	// OpenPGP signature over the exact SHA256SUMS bytes, authenticated
+	// against a directly advertised signing key (same contract as the real
+	// registry protocol — see cmd/tchori/cli_test.go's newCLIRegistryFixture
+	// for the identical pattern).
+	entity, err := openpgp.NewEntity("tchori-e2e-fixture", "e2e fixture signing key", "e2e@example.com", nil)
+	if err != nil {
+		t.Fatalf("openpgp.NewEntity: %v", err)
+	}
+	var publicArmor bytes.Buffer
+	armorWriter, err := armor.Encode(&publicArmor, openpgp.PublicKeyType, nil)
+	if err != nil {
+		t.Fatalf("armor.Encode: %v", err)
+	}
+	if err := entity.Serialize(armorWriter); err != nil {
+		t.Fatalf("serialize public key: %v", err)
+	}
+	if err := armorWriter.Close(); err != nil {
+		t.Fatalf("close public-key armor: %v", err)
+	}
+	keyID := fmt.Sprintf("%016X", entity.PrimaryKey.KeyId)
+	var signature bytes.Buffer
+	if err := openpgp.DetachSign(&signature, entity, bytes.NewReader(sumsBytes), nil); err != nil {
+		t.Fatalf("openpgp.DetachSign: %v", err)
+	}
 
 	var srv *httptest.Server
 	mux := http.NewServeMux()
@@ -64,18 +94,28 @@ func newFixtureRegistry(t *testing.T, providerBinary string) *httptest.Server {
 			http.NotFound(w, r)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"filename":     filename,
-			"download_url": srv.URL + "/dl/" + filename,
-			"shasums_url":  srv.URL + "/dl/SHA256SUMS",
-			"shasum":       sumHex,
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"filename":              filename,
+			"download_url":          srv.URL + "/dl/" + filename,
+			"shasums_url":           srv.URL + "/dl/SHA256SUMS",
+			"shasums_signature_url": srv.URL + "/dl/SHA256SUMS.sig",
+			"shasum":                sumHex,
+			"signing_keys": map[string]any{
+				"gpg_public_keys": []map[string]string{{
+					"key_id":      keyID,
+					"ascii_armor": publicArmor.String(),
+				}},
+			},
 		})
 	})
 	mux.HandleFunc("GET /dl/"+filename, func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(archiveBytes)
 	})
 	mux.HandleFunc("GET /dl/SHA256SUMS", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprintf(w, "%s  %s\n", sumHex, filename)
+		_, _ = w.Write(sumsBytes)
+	})
+	mux.HandleFunc("GET /dl/SHA256SUMS.sig", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(signature.Bytes())
 	})
 
 	srv = httptest.NewServer(mux)

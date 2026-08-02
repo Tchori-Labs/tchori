@@ -116,7 +116,7 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
-      - name: e2e (fake provider lifecycle + real registry install + protocol-5 failure)
+      - name: e2e (fake provider lifecycle + real registry install + protocol-5 adapter lifecycle)
         run: go test -tags e2e ./e2e -v
 
   goreleaser:

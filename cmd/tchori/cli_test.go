@@ -55,6 +55,8 @@ func testMain(m *testing.M) int {
 		{tchoriBin, "github.com/tchori-labs/tchori/cmd/tchori"},
 		{filepath.Join(pluginDir, "terraform-provider-tchoritest"),
 			"github.com/tchori-labs/tchori/internal/provider/testprovider"},
+		{filepath.Join(pluginDir, "terraform-provider-tchoritest5"),
+			"github.com/tchori-labs/tchori/internal/provider/testprovider5"},
 	}
 	for _, b := range builds {
 		cmd := exec.Command("go", "build", "-o", b.target, b.pkg) //nolint:gosec // fixed command; targets are temp-dir artifacts
@@ -122,6 +124,30 @@ func writeConfig(t *testing.T, dir, name string) {
   },
   "resources": {
     "tchoritest_thing.demo": {
+      "config": {"name": %q}
+    }
+  }
+}`, name)
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+// writeConfig5 writes a one-provider one-resource config against the
+// protocol-5 fake provider (tchoritest5_thing -> tchoritest5), proving the
+// tfplugin5 adapter composes with the full command surface.
+func writeConfig5(t *testing.T, dir, name string) {
+	t.Helper()
+	cfg := fmt.Sprintf(`{
+  "providers": {
+    "tchoritest5": {
+      "source": "tchori-labs/tchoritest5",
+      "version": "0.0.1",
+      "config": {"prefix": "t-"}
+    }
+  },
+  "resources": {
+    "tchoritest5_thing.demo": {
       "config": {"name": %q}
     }
   }
@@ -368,6 +394,89 @@ func TestCLILifecycle(t *testing.T) {
 	stdout, _, code = runCLI(t, dir, "state", "list")
 	if code != 0 || stdout != "" {
 		t.Fatalf("state list after destroy: exit %d, stdout %q; want 0 and empty", code, stdout)
+	}
+}
+
+// TestCLILifecycleProtocol5 proves the tfplugin5 adapter composes with the
+// full CLI command surface, not just package-level RPCs: validate -> plan
+// (exit 2) -> apply (exit 0) -> plan (exit 0, no changes) -> import against
+// the protocol-5-only fake provider (testprovider5), launched via
+// --plugin-dir exactly like any protocol-6 provider.
+func TestCLILifecycleProtocol5(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig5(t, dir, "demo")
+	pd := "--plugin-dir=" + pluginDir
+
+	// validate: clean config -> exit 0.
+	if _, stderr, code := runCLI(t, dir, "validate", pd); code != 0 {
+		t.Fatalf("validate: exit %d, want 0\nstderr: %s", code, stderr)
+	}
+
+	// plan with a pending create -> exit 2.
+	stdout, stderr, code := runCLI(t, dir, "plan", pd)
+	if code != 2 {
+		t.Fatalf("plan: exit %d, want 2\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "1 to create") {
+		t.Errorf("plan stdout missing human summary: %q", stdout)
+	}
+
+	// plan -out -> plan file written, still exit 2.
+	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "plan.json"); code != 2 {
+		t.Fatalf("plan -out: exit %d, want 2\nstderr: %s", code, stderr)
+	}
+
+	// apply the saved plan -> exit 0.
+	if stdout, stderr, code := runCLI(t, dir, "apply", pd, "plan.json"); code != 0 {
+		t.Fatalf("apply: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+
+	// state show -> attributes include the apply-computed id ("t-" prefix
+	// from provider config proves ConfigureProvider ran through the adapter).
+	stdout, _, code = runCLI(t, dir, "state", "show", "tchoritest5_thing.demo")
+	if code != 0 {
+		t.Fatalf("state show: exit %d, want 0", code)
+	}
+	if !strings.Contains(stdout, "t-id-demo") {
+		t.Errorf("state show missing computed id t-id-demo: %q", stdout)
+	}
+
+	// plan after apply: no changes -> exit 0.
+	stdout, stderr, code = runCLI(t, dir, "plan", pd)
+	if code != 0 {
+		t.Fatalf("plan (no changes): exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "No changes") {
+		t.Errorf("plan (no changes) stdout = %q, want it to say No changes", stdout)
+	}
+
+	// destroy -out writes a delete plan -> exit 2; applying it empties state.
+	if _, stderr, code := runCLI(t, dir, "destroy", pd, "-out", "destroy.json"); code != 2 {
+		t.Fatalf("destroy -out: exit %d, want 2\nstderr: %s", code, stderr)
+	}
+	if _, stderr, code := runCLI(t, dir, "apply", pd, "destroy.json"); code != 0 {
+		t.Fatalf("apply destroy.json: exit %d, want 0\nstderr: %s", code, stderr)
+	}
+
+	// import the just-destroyed resource back by id -> exit 0. Proves
+	// ImportResourceState composes with the adapter through the full CLI
+	// import command, not just the package-level RPC.
+	stdout, stderr, code = runCLI(t, dir, "import", pd, "tchoritest5_thing.demo", "t-id-demo")
+	if code != 0 {
+		t.Fatalf("import: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "tchoritest5_thing.demo") {
+		t.Errorf("import stdout missing confirmation: %q", stdout)
+	}
+
+	// Idempotence: config's name ("demo") matches the id-derived imported
+	// name, so plan reports no changes.
+	stdout, stderr, code = runCLI(t, dir, "plan", pd)
+	if code != 0 {
+		t.Fatalf("plan after import: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "No changes") {
+		t.Errorf("plan after import stdout = %q, want it to say No changes", stdout)
 	}
 }
 

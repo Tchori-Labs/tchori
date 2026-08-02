@@ -357,3 +357,142 @@ func TestProviderRPCImportResourceState(t *testing.T) {
 		t.Fatalf("ImportResource(no id- marker): want error diagnostics, got none")
 	}
 }
+
+// buildFakeProvider5ForRPC compiles the protocol-5 fake provider
+// (testprovider5) into a temp dir and returns the binary path.
+func buildFakeProvider5ForRPC(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "terraform-provider-tchoritest5")
+	//nolint:gosec // G204: fixed "go build" argv; only variable part is t.TempDir(), not external input.
+	cmd := exec.Command("go", "build", "-o", bin, "./internal/provider/testprovider5")
+	cmd.Dir = filepath.Join("..", "..")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build testprovider5: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// TestProviderRPCDialogueProtocol5 drives the full RPC dialogue through the
+// tfplugin5 adapter against testprovider5: Configure -> Validate (ok +
+// error) -> Plan create -> Apply (unknowns resolved) -> Read -> Import,
+// plus a diagnostics-carrying apply failure ("explode") proving
+// Diagnostic/AttributePath conversion on a real wire exchange.
+func TestProviderRPCDialogueProtocol5(t *testing.T) {
+	ctx := context.Background()
+	bin := buildFakeProvider5ForRPC(t)
+
+	c, err := Launch(ctx, bin)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Logf("Close: %v", err)
+		}
+	})
+
+	schemas, ds := c.Schemas(ctx)
+	if ds.HasErrors() {
+		t.Fatalf("Schemas: %v", ds)
+	}
+	thingSchema := schemas.ResourceTypes["tchoritest5_thing"]
+	if thingSchema == nil {
+		t.Fatalf("resource type tchoritest5_thing missing from schemas: %v", schemas.ResourceTypes)
+	}
+	thingTy := thingSchema.Block.ImpliedType()
+
+	// 1. Configure with prefix="X".
+	provCfg := cty.ObjectVal(map[string]cty.Value{"prefix": cty.StringVal("X")})
+	if ds := c.Configure(ctx, provCfg); ds.HasErrors() {
+		t.Fatalf("Configure: %v", ds)
+	}
+
+	// 2. Validate ok: no diagnostics.
+	okCfg := thingVal(cty.StringVal("foo"), cty.NullVal(cty.String),
+		cty.NullVal(cty.String), cty.NullVal(cty.String))
+	if ds := c.ValidateResource(ctx, "tchoritest5_thing", okCfg); len(ds) != 0 {
+		t.Fatalf("ValidateResource(ok): unexpected diagnostics %v", ds)
+	}
+
+	// 3. Validate name="invalid": error diagnostic converted through the
+	// adapter's Diagnostic/AttributePath translation.
+	badCfg := thingVal(cty.StringVal("invalid"), cty.NullVal(cty.String),
+		cty.NullVal(cty.String), cty.NullVal(cty.String))
+	ds = c.ValidateResource(ctx, "tchoritest5_thing", badCfg)
+	if !ds.HasErrors() {
+		t.Fatalf("ValidateResource(invalid): want error diagnostics, got %v", ds)
+	}
+	if ds[0].Summary != "invalid name" {
+		t.Fatalf("ValidateResource(invalid): summary = %q, want %q", ds[0].Summary, "invalid name")
+	}
+
+	// 4. Plan create: id and echo unknown.
+	prior := cty.NullVal(thingTy)
+	pc, ds := c.PlanResource(ctx, "tchoritest5_thing", prior, okCfg, okCfg, []byte("p1"))
+	if ds.HasErrors() {
+		t.Fatalf("PlanResource(create): %v", ds)
+	}
+	if pc.State.GetAttr("id").IsKnown() {
+		t.Fatalf("PlanResource(create): id known %#v, want unknown", pc.State.GetAttr("id"))
+	}
+	if string(pc.Private) != "p1" {
+		t.Fatalf("PlanResource(create): private = %q, want %q passed through", pc.Private, "p1")
+	}
+
+	// 5. Apply create: id = "Xid-foo".
+	applied, newPriv, ds := c.ApplyResource(ctx, "tchoritest5_thing", prior, pc.State, okCfg, pc.Private)
+	if ds.HasErrors() {
+		t.Fatalf("ApplyResource: %v", ds)
+	}
+	if got := applied.GetAttr("id"); !got.RawEquals(cty.StringVal("Xid-foo")) {
+		t.Fatalf("ApplyResource: id = %#v, want %q", got, "Xid-foo")
+	}
+	if string(newPriv) != "p1" {
+		t.Fatalf("ApplyResource: private = %q, want %q passed through", newPriv, "p1")
+	}
+
+	// 6. Read: fake provider echoes state and private unchanged.
+	readBack, readPriv, ds := c.ReadResource(ctx, "tchoritest5_thing", applied, newPriv)
+	if ds.HasErrors() {
+		t.Fatalf("ReadResource: %v", ds)
+	}
+	if !readBack.RawEquals(applied) {
+		t.Fatalf("ReadResource: state = %#v, want echo of %#v", readBack, applied)
+	}
+	if string(readPriv) != "p1" {
+		t.Fatalf("ReadResource: private = %q, want %q", readPriv, "p1")
+	}
+
+	// 7. Import: importing the applied id back yields the same state
+	// (import -> plan is a no-op).
+	imported, _, ds := c.ImportResource(ctx, "tchoritest5_thing", applied.GetAttr("id").AsString(), thingTy)
+	if ds.HasErrors() {
+		t.Fatalf("ImportResource: %v", ds)
+	}
+	if !imported.RawEquals(applied) {
+		t.Fatalf("ImportResource: state = %#v, want %#v (applied)", imported, applied)
+	}
+
+	// 8. Import "missing": not-found diagnostic, proving the adapter
+	// converts a real provider-side error diagnostic correctly.
+	_, _, ds = c.ImportResource(ctx, "tchoritest5_thing", "missing", thingTy)
+	if !ds.HasErrors() {
+		t.Fatalf("ImportResource(missing): want error diagnostics, got none")
+	}
+
+	// 9. Apply "explode": diagnostics-carrying apply failure, proving
+	// Diagnostic conversion on a real wire exchange that actually fails.
+	explodeCfg := thingVal(cty.StringVal("explode"), cty.NullVal(cty.String),
+		cty.NullVal(cty.String), cty.NullVal(cty.String))
+	pc2, ds := c.PlanResource(ctx, "tchoritest5_thing", prior, explodeCfg, explodeCfg, nil)
+	if ds.HasErrors() {
+		t.Fatalf("PlanResource(explode): %v", ds)
+	}
+	_, _, ds = c.ApplyResource(ctx, "tchoritest5_thing", prior, pc2.State, explodeCfg, pc2.Private)
+	if !ds.HasErrors() {
+		t.Fatalf("ApplyResource(explode): want error diagnostics, got none")
+	}
+	if ds[0].Summary != "apply exploded" {
+		t.Fatalf("ApplyResource(explode): summary = %q, want %q", ds[0].Summary, "apply exploded")
+	}
+}

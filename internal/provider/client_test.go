@@ -31,29 +31,120 @@ func buildTestProvider(t *testing.T) string {
 	return bin
 }
 
-func TestLaunch_Protocol5Unsupported(t *testing.T) {
-	t.Parallel()
-
-	bin := filepath.Join(t.TempDir(), "terraform-provider-protocol5")
+// buildTestProvider5 compiles the protocol-5 fake provider (testprovider5)
+// into a temp dir and returns the binary path.
+func buildTestProvider5(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "terraform-provider-tchoritest5")
 	cmd := exec.Command("go", "build", "-o", bin, //nolint:gosec // fixed command; bin is a t.TempDir artifact
 		"github.com/tchori-labs/tchori/internal/provider/testprovider5")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("building protocol-5 test provider: %v\n%s", err, out)
 	}
+	return bin
+}
+
+// TestLaunchProtocol5AndSchemas proves the tfplugin5 adapter end to end: a
+// protocol-5-only provider (testprovider5) launches successfully through
+// Launch's dual-protocol negotiation, and Schemas returns the same shapes
+// TestLaunchAndSchemas checks for the protocol-6 fake provider — implied
+// type equality across both fixtures proves the 5->6 schema conversion.
+func TestLaunchProtocol5AndSchemas(t *testing.T) {
+	bin := buildTestProvider5(t)
+	ctx := context.Background()
+
+	c, err := Launch(ctx, bin)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			_ = c.Close()
+		}
+	})
+
+	schemas, ds := c.Schemas(ctx)
+	if ds.HasErrors() {
+		t.Fatalf("Schemas returned error diagnostics: %+v", ds)
+	}
+	if schemas == nil || schemas.Provider == nil || schemas.Provider.Block == nil {
+		t.Fatal("nil provider schema")
+	}
+
+	prefix := schemas.Provider.Block.Attributes["prefix"]
+	if prefix == nil {
+		t.Fatal("provider schema missing attribute \"prefix\"")
+	}
+	if !prefix.Optional || !prefix.Type.Equals(cty.String) {
+		t.Errorf("prefix = %+v, want optional string", prefix)
+	}
+
+	thing := schemas.ResourceTypes["tchoritest5_thing"]
+	if thing == nil {
+		t.Fatalf("missing tchoritest5_thing resource schema; got resource types %v",
+			schemas.ResourceTypes)
+	}
+
+	want := cty.Object(map[string]cty.Type{
+		"name":       cty.String,
+		"tags":       cty.Map(cty.String),
+		"replace_me": cty.String,
+		"rules":      cty.List(cty.Object(map[string]cty.Type{"token_id": cty.String})),
+		"id":         cty.String,
+		"echo":       cty.String,
+	})
+	if got := thing.Block.ImpliedType(); !got.Equals(want) {
+		t.Errorf("ImpliedType = %#v, want %#v", got, want)
+	}
+
+	// Close terminates the subprocess (the Stop mapping through the adapter).
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	closed = true
+	deadline := time.Now().Add(5 * time.Second)
+	for !c.plugin.Exited() {
+		if time.Now().After(deadline) {
+			t.Fatal("protocol-5 provider subprocess still running 5s after Close")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestLaunchNegotiatesNeitherProtocolFails proves that a provider offering
+// neither protocol 6 nor 5 still fails fast with the structured
+// "provider protocol unsupported" diagnostic, now naming both supported
+// protocols. This exercises Launch's default branch on
+// pc.NegotiatedVersion(): the only way to force it deterministically from a
+// real binary is a provider that speaks solely an unrelated protocol, which
+// go-plugin itself rejects during the handshake before RPCs are ever
+// attempted — the same "incompatible API version with plugin" failure Launch
+// already classifies, just with go-plugin negotiating against neither 6 nor
+// 5 instead of just 6.
+func TestLaunchNegotiatesNeitherProtocolFails(t *testing.T) {
+	t.Parallel()
+
+	bin := filepath.Join(t.TempDir(), "terraform-provider-protocol4only")
+	cmd := exec.Command("go", "build", "-o", bin, //nolint:gosec // fixed command; bin is a t.TempDir artifact
+		"github.com/tchori-labs/tchori/internal/provider/testprovider4only")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("building protocol-4-only test provider: %v\n%s", err, out)
+	}
 
 	client, err := Launch(context.Background(), bin)
 	if client != nil {
 		t.Cleanup(func() { _ = client.Close() })
-		t.Fatal("Launch returned a client for a protocol-5-only provider")
+		t.Fatal("Launch returned a client for a provider offering neither protocol 6 nor 5")
 	}
 	if err == nil {
-		t.Fatal("Launch returned nil error for a protocol-5-only provider")
+		t.Fatal("Launch returned nil error for a provider offering neither protocol 6 nor 5")
 	}
 	if !strings.Contains(err.Error(), "provider protocol unsupported") {
 		t.Errorf("Launch error does not name the unsupported protocol: %q", err)
 	}
-	if !strings.Contains(err.Error(), "tfplugin6") {
-		t.Errorf("Launch error does not name tfplugin6: %q", err)
+	if !strings.Contains(err.Error(), "tfplugin6") || !strings.Contains(err.Error(), "tfplugin5") {
+		t.Errorf("Launch error does not name both tfplugin6 and tfplugin5: %q", err)
 	}
 }
 
