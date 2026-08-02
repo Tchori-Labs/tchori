@@ -7,9 +7,14 @@
 //     with a real cross-resource reference chain
 //   - registry_install: a download from an in-process fixture registry,
 //     SHA256-verified with cache layout asserted via `providers list -json`
-//   - protocol5_graceful_failure: launching the fixture-installed,
-//     protocol-5-only null provider fails with exit 1 and a structured
-//     diagnostic naming the protocol mismatch
+//   - protocol5_lifecycle: the fixture-installed, protocol-5-only
+//     provider (the in-repo testprovider5 binary, served by the fixture
+//     registry under the opentofu/null source name — see
+//     fixtureregistry_test.go) runs a full validate → plan → apply →
+//     plan (no-op) → destroy → apply lifecycle through the tfplugin5
+//     adapter, proving the adapter composes with the complete CLI path
+//     end to end (not just package-level RPCs, covered separately in
+//     internal/provider and cmd/tchori)
 //
 // Run with: go test -tags e2e ./e2e -v   (no network required)
 package e2e
@@ -29,8 +34,13 @@ import (
 
 // nullVersion pins opentofu/null per research-registry.md §6 (verified
 // 2026-07-10). Every published version of opentofu/null serves plugin
-// protocol 5 only (§2) — which is exactly what the graceful-failure subtest
-// needs. Do not swap in a different provider without re-verifying.
+// protocol 5 only (§2). This suite never touches the real opentofu/null
+// binary or the public registry (see fixtureregistry_test.go): the fixture
+// registry serves the in-repo testprovider5 binary under this version and
+// source name instead, so the download/cache-layout assertions and the
+// protocol-5 lifecycle both stay network-free while still exercising a
+// binary whose wire protocol is genuinely 5-only. Do not swap in a
+// different provider without re-verifying.
 const nullVersion = "3.3.0"
 
 // lifecycleConfig is the fake-provider workspace: two tchoritest_thing
@@ -59,16 +69,24 @@ const lifecycleConfig = `{
 }
 `
 
-// protocol5Config declares the registry-installed null provider (protocol 5
-// only). Any provider-launching command against it must exit 1 with a
-// structured diagnostic. fmt.Sprintf arg: nullVersion.
+// protocol5Config declares the registry-installed, protocol-5-only
+// provider (the fixture-served testprovider5 binary, named "null" here
+// since it stands in for opentofu/null in the download/cache-layout
+// assertions — see fixtureregistry_test.go). The resource address uses
+// testprovider5's own resource type (tchoritest5_thing) since that is what
+// the fixture binary actually implements; "provider": "null" overrides the
+// type-prefix provider-inference convention (tchoritest5_thing would
+// otherwise resolve to a provider named "tchoritest5") so the resource
+// still resolves against the "null" provider block. fmt.Sprintf arg:
+// nullVersion.
 const protocol5Config = `{
   "providers": {
-    "null": { "source": "opentofu/null", "version": "%s", "config": {} }
+    "null": { "source": "opentofu/null", "version": "%s", "config": { "prefix": "e2e5-" } }
   },
   "resources": {
-    "null_resource.demo": {
-      "config": { "triggers": { "k": "v" } }
+    "tchoritest5_thing.demo": {
+      "provider": "null",
+      "config": { "name": "demo" }
     }
   }
 }
@@ -277,27 +295,63 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
-	t.Run("protocol5_graceful_failure", func(t *testing.T) {
+	t.Run("protocol5_lifecycle", func(t *testing.T) {
 		work := t.TempDir()
 		cfg := fmt.Sprintf(protocol5Config, nullVersion)
 		if err := os.WriteFile(filepath.Join(work, "main.tchori.json"), []byte(cfg), 0o644); err != nil {
 			t.Fatal(err)
 		}
 
-		// plan discovers the null binary in the cache (installed by the
-		// registry_install subtest above), launches it, and must fail the
-		// protocol-6-only negotiation with exit 1 and a structured
-		// diagnostic naming the mismatch — not a hang, not a raw go-plugin
-		// stack trace. stderr is a pipe here, so diagnostics are JSON lines.
-		_, stderr := run(t, work, 1, "plan")
-		if !strings.Contains(stderr, `"severity":"error"`) {
-			t.Errorf("stderr carries no structured JSON error diagnostic: %q", stderr)
+		// 1. validate: launches the protocol-5-only binary (installed by the
+		//    registry_install subtest above) through the tfplugin5 adapter and
+		//    calls ValidateResourceConfig ⇒ exit 0 on a clean config.
+		run(t, work, 0, "validate")
+
+		// 2. plan -out: one pending create ⇒ exit 2, summary create=1.
+		run(t, work, 2, "plan", "-out", "plan.json")
+		var pl struct {
+			Summary struct {
+				Create  int `json:"create"`
+				Update  int `json:"update"`
+				Delete  int `json:"delete"`
+				Replace int `json:"replace"`
+			} `json:"summary"`
 		}
-		if !strings.Contains(stderr, "provider protocol unsupported") {
-			t.Errorf("stderr does not name the protocol mismatch: %q", stderr)
+		readJSON(t, filepath.Join(work, "plan.json"), &pl)
+		if pl.Summary.Create != 1 || pl.Summary.Update != 0 || pl.Summary.Delete != 0 || pl.Summary.Replace != 0 {
+			t.Fatalf("plan summary = %+v, want {Create:1 Update:0 Delete:0 Replace:0}", pl.Summary)
 		}
-		if !strings.Contains(stderr, "tfplugin6") {
-			t.Errorf("stderr does not say tchori speaks tfplugin6: %q", stderr)
+
+		// 3. apply the saved plan through the adapter.
+		run(t, work, 0, "apply", "plan.json")
+
+		// state.json holds the resource with a non-empty computed id. Legacy-
+		// SDK value quirks are tolerated: assert id is non-empty, not an exact
+		// value.
+		var st stateDoc
+		readJSON(t, filepath.Join(work, "state.json"), &st)
+		res, ok := st.Resources["tchoritest5_thing.demo"]
+		if !ok {
+			t.Fatalf("tchoritest5_thing.demo not in state after apply: %v", addresses(st))
+		}
+		var attrs struct {
+			ID string `json:"id"`
+		}
+		mustUnmarshal(t, res.Attributes, &attrs)
+		if attrs.ID == "" {
+			t.Fatal("tchoritest5_thing.demo id is empty after apply, want non-empty")
+		}
+
+		// 4. plan again: state matches config ⇒ no changes ⇒ exit 0 (idempotent).
+		run(t, work, 0, "plan")
+
+		// 5. destroy -out + apply: state ends empty.
+		run(t, work, 2, "destroy", "-out", "destroy.json")
+		run(t, work, 0, "apply", "destroy.json")
+		st = stateDoc{}
+		readJSON(t, filepath.Join(work, "state.json"), &st)
+		if len(st.Resources) != 0 {
+			t.Fatalf("state has %d resources after destroy, want 0: %v", len(st.Resources), addresses(st))
 		}
 	})
 }
