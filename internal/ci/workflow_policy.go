@@ -4,6 +4,7 @@ package ci
 import (
 	"bufio"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ type workflowJob struct {
 
 type workflowStep struct {
 	Run             string `yaml:"run"`
+	Uses            string `yaml:"uses"`
 	If              string `yaml:"if"`
 	ContinueOnError bool   `yaml:"continue-on-error"`
 }
@@ -45,6 +47,40 @@ func JobsMissingTimeout(workflowYAML []byte) ([]string, error) {
 	}
 	sort.Strings(missing)
 	return missing, nil
+}
+
+// unpinnedActionRefSHA matches a full 40-hex-character lowercase commit SHA,
+// the only ref form considered immutable enough for a `uses:` reference.
+var shaRefPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// UnpinnedActionRefs returns sorted "job/action@ref" identifiers for every
+// `uses:` step reference in a GitHub Actions workflow document that is not
+// pinned to a full 40-hex lowercase commit SHA. Local composite/reusable
+// actions referenced by relative path (e.g. "./.github/actions/foo") are
+// exempt: they resolve to content already inside this repository's own
+// commit, not a mutable external ref, so there is nothing to retarget.
+func UnpinnedActionRefs(workflowYAML []byte) ([]string, error) {
+	doc, err := parseWorkflow(workflowYAML)
+	if err != nil {
+		return nil, err
+	}
+
+	var violations []string
+	for jobName, job := range doc.Jobs {
+		for _, step := range job.Steps {
+			uses := strings.TrimSpace(step.Uses)
+			if uses == "" || strings.HasPrefix(uses, "./") || strings.HasPrefix(uses, "docker://") {
+				continue
+			}
+
+			_, ref, found := strings.Cut(uses, "@")
+			if !found || !shaRefPattern.MatchString(ref) {
+				violations = append(violations, fmt.Sprintf("%s/%s", jobName, uses))
+			}
+		}
+	}
+	sort.Strings(violations)
+	return violations, nil
 }
 
 // CheckJobEnforcesRaceDetector verifies that the required check job directly
