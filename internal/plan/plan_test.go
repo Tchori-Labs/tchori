@@ -205,7 +205,7 @@ func TestPlanWriteReadDeterminism(t *testing.T) {
 			Address:      "tchoritest_thing.demo",
 			Action:       "create",
 			Before:       json.RawMessage("null"),
-			After:        json.RawMessage(`{"echo":null,"id":null,"name":"demo","replace_me":null,"tags":null}`),
+			After:        json.RawMessage(`{"echo":null,"id":null,"name":"demo","replace_me":null,"rules":null,"tags":null}`),
 			UnknownAfter: []string{"echo", "id"},
 		}},
 		Summary: plan.Summary{Create: 1},
@@ -365,8 +365,8 @@ func newPlanner(t *testing.T, cfg *config.Config, st *state.State) *plan.Planner
 
 // Apply-shaped state attributes, exactly as ctyjson.Marshal would emit them
 // (compact, attribute keys sorted).
-const demoApplied = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":null,"tags":null}`
-const demoAppliedOld = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"old","tags":null}`
+const demoApplied = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":null,"rules":null,"tags":null}`
+const demoAppliedOld = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"old","rules":null,"tags":null}`
 
 func TestPlanCreateWithReference(t *testing.T) {
 	cfg := testConfig(t, map[string]map[string]any{
@@ -413,11 +413,11 @@ func TestPlanCreateWithReference(t *testing.T) {
 	if got := fmt.Sprintf("%v", beta.UnknownAfter); got != "[echo id name]" {
 		t.Errorf("beta unknown_after = %v, want [echo id name]", beta.UnknownAfter)
 	}
-	wantAlphaAfter := `{"echo":null,"id":null,"name":"alpha","replace_me":null,"tags":null}`
+	wantAlphaAfter := `{"echo":null,"id":null,"name":"alpha","replace_me":null,"rules":null,"tags":null}`
 	if string(alpha.After) != wantAlphaAfter {
 		t.Errorf("alpha after = %s, want %s", alpha.After, wantAlphaAfter)
 	}
-	wantBetaAfter := `{"echo":null,"id":null,"name":null,"replace_me":null,"tags":null}`
+	wantBetaAfter := `{"echo":null,"id":null,"name":null,"replace_me":null,"rules":null,"tags":null}`
 	if string(beta.After) != wantBetaAfter {
 		t.Errorf("beta after = %s, want %s", beta.After, wantBetaAfter)
 	}
@@ -502,7 +502,7 @@ func TestPlanUpdateAndReplace(t *testing.T) {
 	if got := fmt.Sprintf("%v", ch.RequiresReplace); got != "[replace_me]" {
 		t.Errorf("requires_replace = %v, want [replace_me]", ch.RequiresReplace)
 	}
-	wantAfter := `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"new","tags":null}`
+	wantAfter := `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"new","rules":null,"tags":null}`
 	if string(ch.After) != wantAfter {
 		t.Errorf("after = %s, want %s", ch.After, wantAfter)
 	}
@@ -578,8 +578,8 @@ func TestPlanDestroy(t *testing.T) {
 		"tchoritest_thing.beta":  {"name": "${tchoritest_thing.alpha.id}"},
 	})
 	st := stateWith(t, 7, map[string]string{
-		"tchoritest_thing.alpha": `{"echo":"alpha","id":"id-alpha","name":"alpha","replace_me":null,"tags":null}`,
-		"tchoritest_thing.beta":  `{"echo":"id-alpha","id":"id-id-alpha","name":"id-alpha","replace_me":null,"tags":null}`,
+		"tchoritest_thing.alpha": `{"echo":"alpha","id":"id-alpha","name":"alpha","replace_me":null,"rules":null,"tags":null}`,
+		"tchoritest_thing.beta":  `{"echo":"id-alpha","id":"id-id-alpha","name":"id-alpha","replace_me":null,"rules":null,"tags":null}`,
 	})
 	p := newPlanner(t, cfg, st)
 	p.Destroy = true

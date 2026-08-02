@@ -46,14 +46,16 @@ func buildFakeProviderForRPC(t *testing.T) string {
 	return bin
 }
 
-// thingVal builds a tchoritest_thing object value with all five attributes
-// present (tags always null here), matching the resource's implied type.
+// thingVal builds a tchoritest_thing object value with all six attributes
+// present (tags and rules always null here), matching the resource's
+// implied type.
 func thingVal(name, replaceMe, id, echo cty.Value) cty.Value {
 	return cty.ObjectVal(map[string]cty.Value{
 		"echo":       echo,
 		"id":         id,
 		"name":       name,
 		"replace_me": replaceMe,
+		"rules":      cty.NullVal(cty.List(cty.Object(map[string]cty.Type{"token_id": cty.String}))),
 		"tags":       cty.NullVal(cty.Map(cty.String)),
 	})
 }

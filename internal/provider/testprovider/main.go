@@ -33,12 +33,23 @@ var providerSchema = &tfprotov6.Schema{
 }
 
 // thingType is the wire shape of the tchoritest_thing resource.
+// thingRuleType is the wire shape of one element of thingType's "rules"
+// list attribute: a single string leaf, token_id, mirroring the cloudflare
+// access-policy shape from issue #11 (policies[].include[].service_token.
+// token_id) closely enough to reproduce the bug at the fake-provider level.
+var thingRuleType = tftypes.Object{
+	AttributeTypes: map[string]tftypes.Type{
+		"token_id": tftypes.String,
+	},
+}
+
 var thingType = tftypes.Object{
 	AttributeTypes: map[string]tftypes.Type{
 		"echo":       tftypes.String,                           // Computed: always equals name
 		"id":         tftypes.String,                           // Computed: "<prefix>id-<name>" at apply
 		"name":       tftypes.String,                           // Required
 		"replace_me": tftypes.String,                           // Optional: change forces replacement
+		"rules":      tftypes.List{ElementType: thingRuleType}, // Optional: list-of-object, TC-033 fixture
 		"tags":       tftypes.Map{ElementType: tftypes.String}, // Optional
 	},
 }
@@ -51,6 +62,7 @@ var thingSchema = &tfprotov6.Schema{
 			{Name: "id", Type: tftypes.String, Computed: true},
 			{Name: "name", Type: tftypes.String, Required: true},
 			{Name: "replace_me", Type: tftypes.String, Optional: true},
+			{Name: "rules", Type: tftypes.List{ElementType: thingRuleType}, Optional: true},
 			{Name: "tags", Type: tftypes.Map{ElementType: tftypes.String}, Optional: true},
 		},
 	},
@@ -657,6 +669,7 @@ func (s *server) ImportResourceState(ctx context.Context, req *tfprotov6.ImportR
 		"name":       tftypes.NewValue(tftypes.String, name),
 		"echo":       tftypes.NewValue(tftypes.String, name),
 		"replace_me": tftypes.NewValue(tftypes.String, nil),
+		"rules":      tftypes.NewValue(tftypes.List{ElementType: thingRuleType}, nil),
 		"tags":       tftypes.NewValue(tftypes.Map{ElementType: tftypes.String}, nil),
 	}
 	dv, err := tfprotov6.NewDynamicValue(thingType, tftypes.NewValue(thingType, attrs))
