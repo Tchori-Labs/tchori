@@ -100,6 +100,7 @@ func newRootCmd() *cobra.Command {
 		newPlanCmd(),
 		newApplyCmd(),
 		newDestroyCmd(),
+		newImportCmd(),
 		newStateCmd(),
 		newProvidersCmd(),
 		newMCPCmd(),

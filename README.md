@@ -137,6 +137,32 @@ values a provider *derives* from env-sourced secrets can end up recorded
 there too — treat both files as sensitive (redaction is a recorded post-MVP
 item, not yet implemented).
 
+### Importing existing infrastructure
+
+`tchori import ADDRESS ID` adopts a real-world resource that already exists
+outside tchori's management into `state.json`, under a resource block you
+have already declared in config:
+
+```sh
+tchori import $PD tchoritest_thing.demo t-id-demo
+```
+
+Rules, matching Terraform's classic `import`:
+
+- `ADDRESS` must already be declared in config so its provider and type
+  resolve — import does not create config for you.
+- `ADDRESS` must **not** already exist in `state.json` — import never
+  overwrites; adopt each real resource exactly once.
+- tchori calls the provider's `ImportResourceState`, then refreshes the
+  result via `ReadResource` before persisting it. A null refresh result
+  ("resource does not exist") errors without writing state.
+- Exit codes: `0` on success, `1` on any error. Import never uses exit code
+  `2` — it is not a plan/apply command.
+
+After a successful import, run `tchori plan` to confirm it landed cleanly: a
+correctly declared config block should show no changes against the newly
+imported state.
+
 ## MCP server
 
 `tchori mcp` serves MCP over stdio from the directory holding your config and
@@ -163,11 +189,11 @@ claude mcp add tchori -- tchori mcp
 
 In: any tfplugin6 provider · `${type.name.attr}` references · plan/apply/
 destroy through plan documents · provider install from the OpenTofu registry
-(SHA256-verified) · MCP read + plan.
+(SHA256-verified) · import · MCP read + plan.
 
 Out (recorded deferrals): tfplugin5 adapter (the classic null/random/time/
 local providers), modules, count/for_each, an expression language, HCL,
-remote state backends, workspaces, import, registry GPG verification,
+remote state backends, workspaces, registry GPG verification,
 apply-via-MCP, Homebrew tap (post-0.1).
 
 ## Development

@@ -15,6 +15,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/zclconf/go-cty/cty"
+	ctyjson "github.com/zclconf/go-cty/cty/json"
 	"golang.org/x/term"
 
 	"github.com/tchori-labs/tchori/internal/apply"
@@ -330,6 +331,98 @@ func runDestroy(cmd *cobra.Command, out string) (int, error) {
 		return 1, nil
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Destroy complete: %d deleted.\n", pl.Summary.Delete)
+	return 0, nil
+}
+
+// --- import ------------------------------------------------------------------
+
+func newImportCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "import ADDRESS ID",
+		Short: "Adopt an existing real-world resource into state under a config-declared address",
+		Args:  cobra.ExactArgs(2),
+		RunE:  exitRun(runImport),
+	}
+}
+
+// runImport maps a real resource to a config-declared address: the address
+// must exist in config (so provider/type resolve, matching Terraform's
+// classic import requirement) and must not already exist in state (no
+// overwrite). It calls the provider's ImportResourceState, refreshes the
+// imported object via ReadResource, and persists the result on success. A
+// null refreshed value ("resource does not exist") errors without writing
+// state.
+func runImport(cmd *cobra.Command, args []string) (int, error) {
+	ctx := cmd.Context()
+	address, id := args[0], args[1]
+
+	rt, cleanup, ds := buildRuntime(ctx, flagPluginDir)
+	emitDiags(ds)
+	if ds.HasErrors() {
+		return 1, nil
+	}
+	defer cleanup()
+
+	res, ok := rt.Config.Resources[address]
+	if !ok {
+		return 1, fmt.Errorf("%s is not declared in configuration; import requires a matching resource block", address)
+	}
+
+	st, err := state.Load(stateFileName)
+	if err != nil {
+		return 1, err
+	}
+	if _, exists := st.Resources[address]; exists {
+		return 1, fmt.Errorf("%s already exists in state; import does not overwrite", address)
+	}
+
+	client, ok := rt.Providers[res.Provider]
+	if !ok {
+		return 1, fmt.Errorf("%s: provider %q is not configured", address, res.Provider)
+	}
+	ps, ok := rt.Schemas[res.Provider]
+	if !ok {
+		return 1, fmt.Errorf("%s: provider %q has no schemas loaded", address, res.Provider)
+	}
+	schema, unsupported, known := ps.LookupResourceType(res.Type)
+	if !known {
+		return 1, fmt.Errorf("%s: provider %q has no schema for resource type %q", address, res.Provider, res.Type)
+	}
+	if schema == nil {
+		return 1, fmt.Errorf("%s: unsupported schema for resource type %q: %s", address, res.Type, unsupported)
+	}
+	ty := schema.Block.ImpliedType()
+
+	imported, private, ds := client.ImportResource(ctx, res.Type, id, ty)
+	emitDiags(ds)
+	if ds.HasErrors() {
+		return 1, nil
+	}
+
+	refreshed, refreshedPrivate, ds := client.ReadResource(ctx, res.Type, imported, private)
+	emitDiags(ds)
+	if ds.HasErrors() {
+		return 1, nil
+	}
+	if refreshed.IsNull() {
+		return 1, fmt.Errorf("%s: resource %q does not exist", address, id)
+	}
+
+	attrs, err := ctyjson.Marshal(refreshed, ty)
+	if err != nil {
+		return 1, fmt.Errorf("%s: encoding imported state: %w", address, err)
+	}
+	st.Resources[address] = &state.ResourceState{
+		Type:       res.Type,
+		Provider:   res.Provider,
+		Attributes: attrs,
+		Private:    refreshedPrivate,
+	}
+	if err := st.Save(stateFileName); err != nil {
+		return 1, err
+	}
+
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Imported %s (id=%s).\n", address, id)
 	return 0, nil
 }
 

@@ -171,6 +171,42 @@ func (c *Client) ReadResource(ctx context.Context, typeName string, current cty.
 	return newState, resp.Private, ds
 }
 
+// ImportResource runs ImportResourceState for a real-world resource ID and
+// decodes the single returned imported object's state at ty (the resource
+// type's ImpliedType). MVP supports exactly one imported resource per call:
+// zero results is an error ("provider imported nothing"), and more than one
+// is an error ("multi-resource import not supported") — providers that
+// import into multiple resources per ID are out of scope for now. This layer
+// does not touch state; callers persist the returned value themselves.
+func (c *Client) ImportResource(ctx context.Context, typeName, id string, ty cty.Type) (cty.Value, []byte, diag.Diagnostics) {
+	resp, err := c.grpc.ImportResourceState(ctx, &tfplugin6.ImportResourceState_Request{
+		TypeName: typeName,
+		Id:       id,
+	})
+	if err != nil {
+		return cty.NilVal, nil, diag.Diagnostics{diag.Errorf("", "ImportResourceState RPC failed", err.Error())}
+	}
+	ds := rpcDiagnostics(resp.Diagnostics)
+	if ds.HasErrors() {
+		return cty.NilVal, nil, ds
+	}
+	switch len(resp.ImportedResources) {
+	case 0:
+		return cty.NilVal, nil, diag.Diagnostics{diag.Errorf("", "provider imported nothing", "")}
+	case 1:
+		// fall through
+	default:
+		return cty.NilVal, nil, diag.Diagnostics{diag.Errorf("", "multi-resource import not supported", "")}
+	}
+	imported := resp.ImportedResources[0]
+	state, moreDs := decodeRPCState(imported.State, ty, "imported state")
+	ds = append(ds, moreDs...)
+	if ds.HasErrors() {
+		return cty.NilVal, nil, ds
+	}
+	return state, imported.Private, ds
+}
+
 // --- helpers -----------------------------------------------------------------
 
 // encodeRPCValue wraps EncodeDynamic (typeconv.go) with a diagnostic error.
