@@ -126,6 +126,10 @@ State is a deterministic, git-diffable `state.json` in the working directory
 platforms, each backup is forced to owner read/write mode (`0600`). Commits
 fsync the complete temp file before atomic replacement and fsync the directory
 before returning, so reported success is durable across abrupt host failure.
+On Windows the directory-fsync step is a documented no-op (directory fsync is
+not a supported primitive there; NTFS journals rename metadata itself), so
+only the temp-file fsync provides the explicit barrier -- the effective
+durability outcome is unchanged.
 Format reference: [docs/formats.md](docs/formats.md).
 
 Provider responses are stored verbatim in `state.json` and `plan.json`, so
