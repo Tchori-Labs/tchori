@@ -93,12 +93,16 @@ func Load(path string) (*State, error) {
 // if any) before overwriting, increments Serial, then commits crash-durably:
 // MarshalIndent with two-space indent plus a trailing newline to a temp file in
 // the same directory, fsync the complete temp file, close it, atomically rename
-// it over path, then fsync the containing directory before reporting success.
-// Failures before rename remove the temp file and leave Serial unchanged. A
-// directory-sync failure is returned without removing the state file because
-// the rename already took effect; Serial and the compare-and-swap base advance
-// to match that visible replacement, allowing a caller to retry safely. Save
-// reports success only after the directory sync completes.
+// it over path, then runs the platform's directory-durability barrier before
+// reporting success: on POSIX this fsyncs the containing directory; on
+// Windows, where directory fsync is not a supported primitive, this barrier
+// is a documented no-op (see sync_dir_windows.go) and NTFS's own metadata
+// journal covers rename durability instead. Failures before rename remove the
+// temp file and leave Serial unchanged. A directory-sync failure (POSIX only)
+// is returned without removing the state file because the rename already took
+// effect; Serial and the compare-and-swap base advance to match that visible
+// replacement, allowing a caller to retry safely. Save reports success only
+// after the directory-durability barrier completes.
 func (s *State) Save(path string) error {
 	lock := flock.New(path + ".lock")
 	defer func() { _ = lock.Close() }()
@@ -171,23 +175,6 @@ func (s *State) Save(path string) error {
 	s.baseSerial = next.Serial
 	if err := syncDir(dir); err != nil {
 		return fmt.Errorf("sync state directory %s: %w", dir, err)
-	}
-	return nil
-}
-
-// defaultSyncDir persists a completed rename's directory entry before Save
-// reports success.
-func defaultSyncDir(dir string) error {
-	f, err := os.Open(dir) //nolint:gosec // G304: dir is derived from the operator-supplied state path, not attacker-controlled
-	if err != nil {
-		return fmt.Errorf("open directory: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("sync directory: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("close directory: %w", err)
 	}
 	return nil
 }

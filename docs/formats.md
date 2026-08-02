@@ -210,18 +210,27 @@ creates.
 4. Increments `Serial`, marshals with `MarshalIndent`, writes a temp file
    (`.state-*.tmp`) in the same directory, and fsyncs the complete file before
    closing it.
-5. Atomically renames the temp file over `path`, then fsyncs the containing
-   directory before reporting success. Failures before rename remove the temp
-   file and leave the in-memory serial unchanged. A post-rename directory-sync
-   failure is returned without deleting the newly committed state; the
-   in-memory serial and compare-and-swap base advance to match that visible
-   replacement so a retry does not report a false concurrent modification. A
-   successful commit becomes the next base, so apply's per-resource saves can
-   continue sequentially.
+5. Atomically renames the temp file over `path`, then runs the platform's
+   directory-durability barrier before reporting success. On POSIX this
+   fsyncs the containing directory (`internal/state/sync_dir_unix.go`). On
+   Windows this barrier is a documented no-op
+   (`internal/state/sync_dir_windows.go`): `File.Sync` maps to
+   `FlushFileBuffers`, which requires a write-capable handle that `os.Open`
+   never returns for a directory, and directory fsync is not a supported or
+   necessary durability primitive on Windows — NTFS journals rename metadata
+   itself. Failures before rename remove the temp file and leave the
+   in-memory serial unchanged. A post-rename directory-sync failure (POSIX
+   only — the Windows barrier never fails) is returned without deleting the
+   newly committed state; the in-memory serial and compare-and-swap base
+   advance to match that visible replacement so a retry does not report a
+   false concurrent modification. A successful commit becomes the next base,
+   so apply's per-resource saves can continue sequentially.
 
-Together, the file and directory fsync barriers mean a `nil` return confirms
-both the state contents and the atomic directory-entry replacement reached
-stable storage across abrupt process or host failure.
+Together, the file fsync and the platform directory-durability barrier mean a
+`nil` return confirms the state contents reached stable storage across abrupt
+process or host failure — on POSIX this additionally confirms the atomic
+directory-entry replacement itself was fsynced; on Windows the rename's
+durability is covered by the NTFS metadata journal instead.
 
 ### Determinism
 
