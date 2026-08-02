@@ -3,6 +3,7 @@ package ci
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -124,6 +125,90 @@ func TestCheckJobEnforcesRaceDetectorFixtures(t *testing.T) {
 			}
 			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
 				t.Fatalf("CheckJobEnforcesRaceDetector() error = %v, want error containing %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func TestActionRefsPinnedLiveWorkflows(t *testing.T) {
+	root := repositoryRoot(t)
+	workflowsDir := filepath.Join(root, ".github", "workflows")
+
+	matches, err := filepath.Glob(filepath.Join(workflowsDir, "*.yml"))
+	if err != nil {
+		t.Fatalf("glob workflow files: %v", err)
+	}
+	yamlMatches, err := filepath.Glob(filepath.Join(workflowsDir, "*.yaml"))
+	if err != nil {
+		t.Fatalf("glob workflow files: %v", err)
+	}
+	matches = append(matches, yamlMatches...)
+
+	if len(matches) < 3 {
+		t.Fatalf("expected at least 3 workflow files under %s, found %v", workflowsDir, matches)
+	}
+
+	sort.Strings(matches)
+	for _, path := range matches {
+		path := filepath.Clean(path)
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			workflowYAML, err := os.ReadFile(path) //nolint:gosec // G304: test reads fixed in-repo workflow files under .github/workflows.
+			if err != nil {
+				t.Fatalf("read workflow %s: %v", path, err)
+			}
+
+			violations, err := UnpinnedActionRefs(workflowYAML)
+			if err != nil {
+				t.Fatalf("check unpinned action refs in %s: %v", path, err)
+			}
+			if len(violations) != 0 {
+				t.Fatalf("%s has unpinned action refs: %v", path, violations)
+			}
+		})
+	}
+}
+
+func TestUnpinnedActionRefsFixtures(t *testing.T) {
+	tests := []struct {
+		name          string
+		workflowYAML  string
+		wantViolation []string
+	}{
+		{
+			name: "tag ref is flagged",
+			workflowYAML: `jobs:
+  secretscan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+`,
+			wantViolation: []string{"secretscan/actions/checkout@v7"},
+		},
+		{
+			name: "sha pin with version comment and run-only step pass",
+			workflowYAML: `jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: go test ./...
+`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			violations, err := UnpinnedActionRefs([]byte(tt.workflowYAML))
+			if err != nil {
+				t.Fatalf("UnpinnedActionRefs() error = %v", err)
+			}
+			if len(violations) != len(tt.wantViolation) {
+				t.Fatalf("UnpinnedActionRefs() = %v, want %v", violations, tt.wantViolation)
+			}
+			for i, v := range tt.wantViolation {
+				if violations[i] != v {
+					t.Fatalf("UnpinnedActionRefs() = %v, want %v", violations, tt.wantViolation)
+				}
 			}
 		})
 	}
