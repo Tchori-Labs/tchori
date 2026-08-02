@@ -6,7 +6,10 @@ local protocol tests from the live public-registry smoke.
 ## Required PR suites
 
 The required `check` job runs the repository checks from `AGENTS.md`, including
-`go test ./...`. That test run covers:
+`go test ./...`. It also uses the pinned actionlint release to statically
+validate every `.yml` and `.yaml` file under `.github/workflows`; the shared
+verification script self-tests syntax and expression detection and a clean
+control before the required context can pass. The Go test run covers:
 
 - `tchori providers install` through an in-process registry fixture, including
   registry metadata, archive download, SHA256SUMS verification, cache layout,

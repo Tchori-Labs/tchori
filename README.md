@@ -242,8 +242,8 @@ path. To update Gitleaks, identify a stable release, verify its `go.mod` module
 path, and change the exact version in both this section and the `secretscan`
 install step in `.github/workflows/ci.yml`. Reinstall it, inspect `gitleaks
 --help` for command changes, and rerun both real scans, the synthetic self-test,
-and `actionlint .github/workflows/ci.yml` before merging. Never use `@latest` in
-CI.
+`scripts/actionlint-verify.sh`, and the repository checks before merging. Never
+use `@latest` in CI.
 
 Secret findings fail the gate by default. Revoke and remove real credentials,
 then track any coordinated history purge as focused follow-up work; never
@@ -252,6 +252,31 @@ narrowest practical, individually commented rule/path/regex entry in
 `.gitleaks.toml`—never a blanket exclusion. A temporary baseline is exceptional:
 every entry requires an explicit written rationale and a remediation task
 reference.
+
+### Workflow linting
+
+Install the same pinned actionlint release used by CI, then validate every
+workflow under `.github/workflows` and run the detector self-test:
+
+```sh
+go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+bash scripts/actionlint-verify.sh
+```
+
+The script discovers both `.yml` and `.yaml` files from disk and fails if none
+exist. Its runtime-generated fixtures prove malformed YAML syntax and malformed
+expressions are detected while a well-formed control remains clean. The
+invocation explicitly disables actionlint's shellcheck and pyflakes integrations
+so hosts with those optional binaries installed produce the same result as
+hosts without them.
+
+To update actionlint, list released versions with `go list -m -versions
+github.com/rhysd/actionlint`, choose a stable semantic version, and update all
+three pins: the install step in `.github/workflows/ci.yml`,
+`ACTIONLINT_VERSION` in `scripts/actionlint-verify.sh`, and the install command
+above. Reinstall the tool, inspect `actionlint -h` for flag or output changes,
+and rerun the verification script plus all repository checks. Never use
+`@latest`.
 
 ### Vulnerability scanning
 

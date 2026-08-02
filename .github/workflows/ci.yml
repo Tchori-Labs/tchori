@@ -42,6 +42,14 @@ jobs:
         with:
           version: v2.12
 
+      - name: install actionlint
+        timeout-minutes: 5
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: validate GitHub Actions workflows
+        timeout-minutes: 3
+        run: bash scripts/actionlint-verify.sh
+
       - name: go test
         run: go test ./...
 

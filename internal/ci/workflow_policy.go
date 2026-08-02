@@ -51,7 +51,12 @@ func JobsMissingTimeout(workflowYAML []byte) ([]string, error) {
 
 // unpinnedActionRefSHA matches a full 40-hex-character lowercase commit SHA,
 // the only ref form considered immutable enough for a `uses:` reference.
-var shaRefPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+var (
+	shaRefPattern            = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	actionlintInstallPattern = regexp.MustCompile(`github\.com/rhysd/actionlint/cmd/actionlint@([^\s;&|]+)`)
+	actionlintSemverPattern  = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+$`)
+	actionlintScriptPin      = regexp.MustCompile(`(?m)^ACTIONLINT_VERSION=(v[0-9]+\.[0-9]+\.[0-9]+)$`)
+)
 
 // UnpinnedActionRefs returns sorted "job/action@ref" identifiers for every
 // `uses:` step reference in a GitHub Actions workflow document that is not
@@ -121,6 +126,100 @@ func CheckJobEnforcesRaceDetector(workflowYAML []byte) error {
 		}
 	}
 	return fmt.Errorf("check job must directly run go test with -race, an explicit -timeout, and all packages")
+}
+
+// CheckJobRunsWorkflowLint verifies that the required check job installs an
+// immutable actionlint release and unconditionally runs the repository's
+// workflow-verification script without suppressing failures.
+func CheckJobRunsWorkflowLint(workflowYAML []byte) error {
+	doc, err := parseWorkflow(workflowYAML)
+	if err != nil {
+		return err
+	}
+
+	check, ok := doc.Jobs["check"]
+	if !ok {
+		return fmt.Errorf("workflow declares no check job")
+	}
+	if strings.TrimSpace(check.If) != "" {
+		return fmt.Errorf("check job must not declare a job-level if condition for workflow lint")
+	}
+
+	var lintStep *workflowStep
+	var installRef string
+	installCandidate := false
+	for i := range check.Steps {
+		step := &check.Steps[i]
+		if strings.Contains(step.Run, "scripts/actionlint-verify.sh") {
+			lintStep = step
+		}
+		if strings.Contains(step.Run, "github.com/rhysd/actionlint/cmd/actionlint") &&
+			!strings.Contains(step.Run, "scripts/actionlint-verify.sh") {
+			installCandidate = true
+			if match := actionlintInstallPattern.FindStringSubmatch(step.Run); match != nil {
+				installRef = match[1]
+			}
+		}
+	}
+
+	if lintStep == nil {
+		return fmt.Errorf("check job must run scripts/actionlint-verify.sh")
+	}
+	if strings.TrimSpace(lintStep.If) != "" {
+		return fmt.Errorf("workflow lint step must not declare an if condition")
+	}
+	if lintStep.ContinueOnError {
+		return fmt.Errorf("workflow lint step must not allow failures with continue-on-error")
+	}
+	if strings.Contains(lintStep.Run, "|| true") {
+		return fmt.Errorf("workflow lint command must not suppress failures with || true")
+	}
+	if strings.Contains(lintStep.Run, "set +e") {
+		return fmt.Errorf("workflow lint command must not be preceded by set +e")
+	}
+	if !installCandidate {
+		return fmt.Errorf("check job must include an actionlint install step")
+	}
+	if !actionlintSemverPattern.MatchString(installRef) {
+		if installRef == "" {
+			return fmt.Errorf("actionlint install step must pin an explicit semver version")
+		}
+		return fmt.Errorf("actionlint install step must pin an explicit semver version, found @%s", installRef)
+	}
+	return nil
+}
+
+// ActionlintPinConsistency checks that CI, the verification script, and the
+// contributor documentation all name the same exact actionlint release.
+func ActionlintPinConsistency(workflowYAML, script, readme []byte) error {
+	workflowMatch := actionlintInstallPattern.FindSubmatch(workflowYAML)
+	if workflowMatch == nil || !actionlintSemverPattern.Match(workflowMatch[1]) {
+		return fmt.Errorf("actionlint version absent from workflow install command")
+	}
+	scriptMatch := actionlintScriptPin.FindSubmatch(script)
+	if scriptMatch == nil {
+		return fmt.Errorf("ACTIONLINT_VERSION absent from verification script")
+	}
+	readmeMatch := actionlintInstallPattern.FindSubmatch(readme)
+	if readmeMatch == nil || !actionlintSemverPattern.Match(readmeMatch[1]) {
+		return fmt.Errorf("actionlint version absent from README install command")
+	}
+
+	workflowVersion := string(workflowMatch[1])
+	scriptVersion := string(scriptMatch[1])
+	readmeVersion := string(readmeMatch[1])
+	switch {
+	case workflowVersion == scriptVersion && scriptVersion == readmeVersion:
+		return nil
+	case scriptVersion == readmeVersion:
+		return fmt.Errorf("workflow pin %s differs from script pin %s", workflowVersion, scriptVersion)
+	case workflowVersion == readmeVersion:
+		return fmt.Errorf("script pin %s differs from README pin %s", scriptVersion, readmeVersion)
+	case workflowVersion == scriptVersion:
+		return fmt.Errorf("README pin %s differs from workflow pin %s", readmeVersion, workflowVersion)
+	default:
+		return fmt.Errorf("actionlint pins all differ: workflow=%s script=%s README=%s", workflowVersion, scriptVersion, readmeVersion)
+	}
 }
 
 func parseWorkflow(workflowYAML []byte) (workflowDoc, error) {
