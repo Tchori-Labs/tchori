@@ -11,6 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -89,22 +90,37 @@ func Load(path string) (*State, error) {
 // Save acquires path+".lock" via flock and compares the on-disk serial with
 // the base serial observed by Load or the preceding successful Save. If they
 // differ, Save returns ErrConcurrentModification without changing the state or
-// its backup. Otherwise, Save writes path+".backup" (copy of the existing file,
-// if any) before overwriting, increments Serial, then commits crash-durably:
-// MarshalIndent with two-space indent plus a trailing newline to a temp file in
-// the same directory, fsync the complete temp file, close it, atomically rename
-// it over path, then runs the platform's directory-durability barrier before
-// reporting success: on POSIX this fsyncs the containing directory; on
-// Windows, where directory fsync is not a supported primitive, this barrier
-// is a documented no-op (see sync_dir_windows.go) and NTFS's own metadata
-// journal covers rename durability instead. Failures before rename remove the
-// temp file and leave Serial unchanged. A directory-sync failure (POSIX only)
-// is returned without removing the state file because the rename already took
-// effect; Serial and the compare-and-swap base advance to match that visible
-// replacement, allowing a caller to retry safely. Save reports success only
-// after the directory-durability barrier completes.
+// its backup. Otherwise, Save copies an existing state through a fresh temporary
+// file and renames it to path+".backup" before overwriting, so a planted backup
+// symlink is replaced rather than followed. It then increments Serial and
+// commits crash-durably: MarshalIndent with two-space indent plus a trailing
+// newline to a temp file in the same directory, fsync the complete temp file,
+// close it, atomically rename it over path, then runs the platform's
+// directory-durability barrier before reporting success. On POSIX this fsyncs
+// the containing directory; on Windows, where directory fsync is not supported,
+// this barrier is a documented no-op. Failures before rename remove the temp
+// file and leave Serial unchanged. A directory-sync failure is returned without
+// removing the state file because the rename already took effect; Serial and the
+// compare-and-swap base advance to match that visible replacement, allowing a
+// caller to retry safely. Save reports success only after the durability barrier
+// completes.
 func (s *State) Save(path string) error {
-	lock := flock.New(path + ".lock")
+	lockPath := path + ".lock"
+	// Preflight rejects ordinary non-regular entries with an operator-facing
+	// error before a lock is taken. The open-time flags below, not this check,
+	// close the POSIX race window and raced-filesystem-FIFO hang.
+	info, err := os.Lstat(lockPath)
+	if err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("lock path %s is not a regular file", lockPath)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("inspect lock path %s: %w", lockPath, err)
+	}
+
+	// Existing regular lock files are reused exactly as-is: replacing,
+	// truncating, or chmod'ing an inode another process may hold would weaken
+	// flock synchronization, and the lock contains no sensitive data.
+	lock := flock.New(lockPath, flock.SetFlag(lockOpenFlags()))
 	defer func() { _ = lock.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), lockTimeout)
@@ -112,10 +128,13 @@ func (s *State) Save(path string) error {
 
 	locked, err := lock.TryLockContext(ctx, 50*time.Millisecond)
 	if err != nil {
-		return fmt.Errorf("acquire lock %s: %w", path+".lock", err)
+		return fmt.Errorf("acquire lock %s: %w", lockPath, err)
 	}
 	if !locked {
-		return fmt.Errorf("timed out acquiring lock %s", path+".lock")
+		return fmt.Errorf("timed out acquiring lock %s", lockPath)
+	}
+	if err := verifyLockedSidecar(lock, lockPath); err != nil {
+		return err
 	}
 
 	onDiskSerial, err := readSerial(path)
@@ -201,9 +220,56 @@ func readSerial(path string) (uint64, error) {
 	return header.Serial, nil
 }
 
+// lockOpenFlags mirrors gofrs/flock v0.13.0 flock.go:62: O_CREATE plus
+// O_RDWR on aix/solaris/illumos and O_RDONLY elsewhere. Unix builds add
+// O_NOFOLLOW and O_NONBLOCK; the latter guarantee is measured for filesystem
+// FIFOs on the shipped Linux and Darwin targets, not arbitrary device nodes.
+func lockOpenFlags() int {
+	flags := os.O_CREATE | os.O_RDONLY
+	switch runtime.GOOS {
+	case "aix", "solaris", "illumos":
+		flags = os.O_CREATE | os.O_RDWR
+	}
+	return flags | lockGuardFlags
+}
+
+// verifyLockedSidecar checks the held descriptor rather than trusting the
+// preflight path lookup. Regularity rejects a raced FIFO even though SameFile
+// is true; identity rejects a followed symlink on platforms whose guard flag
+// is zero even though its target is regular.
+//
+// Hardlinks and symlinked parent directories are outside this mechanism. On
+// Windows, a raced symlink may be traversed before this check and create an
+// empty target, but O_TRUNC is absent so existing data is not destroyed;
+// filesystem-path FIFOs do not exist there. O_NONBLOCK's claim is limited to
+// filesystem FIFOs on shipped POSIX targets, not arbitrary devices. The
+// unshipped aix/solaris/illumos targets use O_RDWR, whose nonblocking FIFO-open
+// behavior is POSIX-undefined.
+func verifyLockedSidecar(lock *flock.Flock, lockPath string) error {
+	heldInfo, err := lock.Stat()
+	if err != nil {
+		return fmt.Errorf("verify lock path %s: stat held descriptor: %w", lockPath, err)
+	}
+	pathInfo, err := os.Lstat(lockPath)
+	if err != nil {
+		return fmt.Errorf("verify lock path %s: lstat: %w", lockPath, err)
+	}
+	if !heldInfo.Mode().IsRegular() || !os.SameFile(heldInfo, pathInfo) {
+		return fmt.Errorf("verify lock path %s: held descriptor is not the same regular file", lockPath)
+	}
+	return nil
+}
+
 // backupExisting copies the current file at path to path+".backup" before it
-// is overwritten, forcing mode 0600 where permissions are supported. It is a
-// no-op when path does not yet exist — there is nothing to back up on first save.
+// is overwritten. The source is opened first: when it does not exist, the
+// backup is a no-op without inspecting a hostile entry at the backup path.
+// Once a source exists, a directory at the backup path is rejected because it
+// cannot be renamed over. Every other entry is safely replaced via a fresh
+// same-directory temporary file and os.Rename. This replaces the name without
+// writing through it (an atomic replace on POSIX), so rejecting symlinks would
+// only enable denial of service. CreateTemp requests mode 0600; on POSIX umask
+// can only narrow that to owner-only bits, while Windows uses its own permission
+// semantics. No chmod is needed because the renamed file is always a new inode.
 func backupExisting(path string) error {
 	src, err := os.Open(path) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
 	if err != nil {
@@ -214,17 +280,35 @@ func backupExisting(path string) error {
 	}
 	defer func() { _ = src.Close() }()
 
-	dst, err := os.OpenFile(path+".backup", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
+	backupPath := path + ".backup"
+	info, err := os.Lstat(backupPath)
+	if err == nil && info.IsDir() {
+		return fmt.Errorf("backup path %s is a directory", backupPath)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("inspect backup path %s: %w", backupPath, err)
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".state-backup-*.tmp")
 	if err != nil {
-		return fmt.Errorf("create backup %s: %w", path+".backup", err)
+		return fmt.Errorf("create temporary backup %s: %w", backupPath, err)
 	}
-	if err := dst.Chmod(0o600); err != nil {
-		_ = dst.Close()
-		return fmt.Errorf("chmod backup %s: %w", path+".backup", err)
+	tmpPath := tmp.Name()
+	cleanupTemp := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
 	}
-	if _, err := io.Copy(dst, src); err != nil {
-		_ = dst.Close()
-		return fmt.Errorf("copy backup %s: %w", path+".backup", err)
+	if _, err := io.Copy(tmp, src); err != nil {
+		cleanupTemp()
+		return fmt.Errorf("copy backup %s: %w", backupPath, err)
 	}
-	return dst.Close()
+	if err := tmp.Close(); err != nil {
+		cleanupTemp()
+		return fmt.Errorf("close backup %s: %w", backupPath, err)
+	}
+	if err := os.Rename(tmpPath, backupPath); err != nil {
+		cleanupTemp()
+		return fmt.Errorf("rename backup %s: %w", backupPath, err)
+	}
+	return nil
 }

@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/gofrs/flock"
 )
 
 // TestLoadMissing verifies Load returns an empty, well-formed state when
@@ -742,5 +744,344 @@ func TestLoadRejectsMissingFormatVersion(t *testing.T) {
 
 	if _, err := Load(path); err == nil {
 		t.Fatal("Load accepted a state.json with no format_version")
+	}
+}
+func assertOwnerOnly(t *testing.T, path string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Log("skipping POSIX permission assertion on Windows")
+		return
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("os.Lstat(%q) = %v", path, err)
+	}
+	if got := info.Mode().Perm() &^ 0o600; got != 0 {
+		t.Errorf("permissions outside owner read/write = %o, want 0", got)
+	}
+}
+
+func mustSymlink(t *testing.T, oldname, newname string) {
+	t.Helper()
+	if err := os.Symlink(oldname, newname); err != nil {
+		t.Skipf("symlink creation unsupported on this platform: %v", err)
+	}
+}
+
+// TestSaveBackupReplacesPlantedSymlinkWithoutClobbering reproduces the
+// arbitrary-file truncation reported in Tchori-Labs/tchori#34.
+func TestSaveBackupReplacesPlantedSymlinkWithoutClobbering(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	backupPath := path + ".backup"
+	victim := filepath.Join(dir, "victim.txt")
+	if err := os.WriteFile(victim, []byte("PRECIOUS DATA"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatalf("Save #1 = %v", err)
+	}
+	before, err := os.ReadFile(path) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, victim, backupPath)
+	if err := s.Save(path); err != nil {
+		t.Fatalf("Save #2 = %v, want nil", err)
+	}
+	gotVictim, err := os.ReadFile(victim) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotVictim) != "PRECIOUS DATA" {
+		t.Fatalf("victim content = %q, want %q", gotVictim, "PRECIOUS DATA")
+	}
+	info, err := os.Lstat(backupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("backup mode = %v, want regular file", info.Mode())
+	}
+	gotBackup, err := os.ReadFile(backupPath) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotBackup, before) {
+		t.Fatalf("backup content = %q, want %q", gotBackup, before)
+	}
+	assertOwnerOnly(t, backupPath)
+}
+
+func TestSaveLockRejectsNonRegularSidecar(t *testing.T) {
+	t.Run("symlink to victim", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "state.json")
+		lockPath := path + ".lock"
+		victim := filepath.Join(dir, "victim")
+		if err := os.WriteFile(victim, []byte("keep"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mustSymlink(t, victim, lockPath)
+		s, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.Save(path)
+		if err == nil || !strings.Contains(err.Error(), lockPath) {
+			t.Fatalf("Save error = %v, want error naming %q", err, lockPath)
+		}
+		got, readErr := os.ReadFile(victim) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
+		if readErr != nil || string(got) != "keep" {
+			t.Fatalf("victim = %q, err = %v, want keep", got, readErr)
+		}
+		info, lstatErr := os.Lstat(lockPath)
+		if lstatErr != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("lock path mode = %v, err = %v, want unchanged symlink", info, lstatErr)
+		}
+		assertNoStateOrBackup(t, path)
+	})
+
+	t.Run("dangling symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "state.json")
+		lockPath := path + ".lock"
+		target := filepath.Join(dir, "missing-target")
+		mustSymlink(t, target, lockPath)
+		s, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = s.Save(path)
+		if err == nil || !strings.Contains(err.Error(), lockPath) {
+			t.Fatalf("Save error = %v, want error naming %q", err, lockPath)
+		}
+		if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
+			t.Fatalf("os.Stat(target) error = %v, want IsNotExist", statErr)
+		}
+		info, lstatErr := os.Lstat(lockPath)
+		if lstatErr != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("lock path mode = %v, err = %v, want unchanged symlink", info, lstatErr)
+		}
+		assertNoStateOrBackup(t, path)
+	})
+}
+
+func TestSaveBackupReplacesDanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	backupPath := path + ".backup"
+	target := filepath.Join(dir, "missing-target")
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, target, backupPath)
+	if err := s.Save(path); err != nil {
+		t.Fatalf("Save = %v, want nil", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("os.Stat(target) error = %v, want IsNotExist", err)
+	}
+	info, err := os.Lstat(backupPath)
+	if err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("os.Lstat(backup) = %v, %v, want regular file", info, err)
+	}
+	got, err := os.ReadFile(backupPath) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
+	if err != nil || !bytes.Equal(got, before) {
+		t.Fatalf("backup = %q, err = %v, want %q", got, err, before)
+	}
+	assertOwnerOnly(t, backupPath)
+}
+
+func TestSaveRejectsBackupDirectoryWithoutChangingState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	backupPath := path + ".backup"
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(backupPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Save(path)
+	if err == nil || !strings.Contains(err.Error(), backupPath) {
+		t.Fatalf("Save error = %v, want error naming %q", err, backupPath)
+	}
+	assertStateFileUnchanged(t, path, before)
+	info, statErr := os.Stat(backupPath)
+	if statErr != nil || !info.IsDir() {
+		t.Fatalf("backup directory = %v, %v, want directory", info, statErr)
+	}
+	assertNoSidecarTempFiles(t, dir)
+}
+
+func TestSaveFirstSaveSucceedsWithDirectoryAtBackupPath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	backupPath := path + ".backup"
+	if err := os.Mkdir(backupPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatalf("Save = %v, want nil", err)
+	}
+	if s.Serial != 1 {
+		t.Fatalf("Serial = %d, want 1", s.Serial)
+	}
+	info, err := os.Stat(backupPath)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("backup path = %v, %v, want directory", info, err)
+	}
+}
+
+func TestSaveLeavesExistingRegularLockFileUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	lockPath := path + ".lock"
+	if err := os.WriteFile(lockPath, []byte("keep"), 0o644); err != nil { //nolint:gosec // G306: permissive mode verifies an existing lock is untouched
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(lockPath, 0o644); err != nil { //nolint:gosec // G302: test deliberately seeds a permissive lock
+			t.Fatal(err)
+		}
+	}
+	before, err := os.Lstat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatalf("Save = %v, want nil", err)
+	}
+	got, err := os.ReadFile(lockPath) //nolint:gosec // G304: test-controlled path under t.TempDir(), not attacker input
+	if err != nil || string(got) != "keep" {
+		t.Fatalf("lock content = %q, err = %v, want keep", got, err)
+	}
+	after, err := os.Lstat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("regular lock inode was replaced")
+	}
+	if runtime.GOOS != "windows" && after.Mode().Perm() != before.Mode().Perm() {
+		t.Fatalf("lock mode changed from %o to %o", before.Mode().Perm(), after.Mode().Perm())
+	}
+}
+
+func TestSaveRejectsDirectoryLockSidecar(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	lockPath := path + ".lock"
+	if err := os.Mkdir(lockPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.Save(path)
+	if err == nil || !strings.Contains(err.Error(), lockPath) {
+		t.Fatalf("Save error = %v, want error naming %q", err, lockPath)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("os.Stat(state) error = %v, want IsNotExist", err)
+	}
+	if _, err := os.Stat(path + ".backup"); !os.IsNotExist(err) {
+		t.Fatalf("os.Stat(backup) error = %v, want IsNotExist", err)
+	}
+}
+
+func TestVerifyLockedSidecar(t *testing.T) {
+	t.Run("regular", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.json.lock")
+		lock := flock.New(path, flock.SetFlag(os.O_CREATE|os.O_RDONLY))
+		locked, err := lock.TryLock()
+		defer func() { _ = lock.Close() }()
+		if err != nil || !locked {
+			t.Fatalf("TryLock = %v, %v", locked, err)
+		}
+		if err := verifyLockedSidecar(lock, path); err != nil {
+			t.Fatalf("verifyLockedSidecar = %v, want nil", err)
+		}
+	})
+
+	t.Run("followed symlink", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "state.json.lock")
+		target := filepath.Join(dir, "target")
+		if err := os.WriteFile(target, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		mustSymlink(t, target, path)
+		lock := flock.New(path, flock.SetFlag(os.O_CREATE|os.O_RDONLY))
+		locked, err := lock.TryLock()
+		defer func() { _ = lock.Close() }()
+		if err != nil || !locked {
+			t.Fatalf("TryLock = %v, %v", locked, err)
+		}
+		err = verifyLockedSidecar(lock, path)
+		if err == nil || !strings.Contains(err.Error(), path) {
+			t.Fatalf("verifyLockedSidecar error = %v, want error naming %q", err, path)
+		}
+	})
+}
+
+func TestLockOpenFlags(t *testing.T) {
+	if lockOpenFlags()&os.O_CREATE == 0 {
+		t.Fatal("lockOpenFlags lacks O_CREATE")
+	}
+	if runtime.GOOS != "windows" && lockGuardFlags == 0 {
+		t.Fatal("lockGuardFlags = 0 on POSIX")
+	}
+}
+
+func assertNoStateOrBackup(t *testing.T, path string) {
+	t.Helper()
+	for _, candidate := range []string{path, path + ".backup"} {
+		if _, err := os.Stat(candidate); !os.IsNotExist(err) {
+			t.Fatalf("os.Stat(%q) error = %v, want IsNotExist", candidate, err)
+		}
+	}
+}
+
+func assertNoSidecarTempFiles(t *testing.T, dir string) {
+	t.Helper()
+	for _, pattern := range []string{".state-*.tmp", ".state-backup-*.tmp"} {
+		matches, err := filepath.Glob(filepath.Join(dir, pattern))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("temporary files remain for %q: %v", pattern, matches)
+		}
 	}
 }
