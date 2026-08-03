@@ -28,7 +28,11 @@
         "additionalProperties": false,
         "properties": {
           "provider": { "type": "string" },
-          "config": { "type": "object" }
+          "config": { "type": "object" },
+          "sensitive_attributes": {
+            "type": "array",
+            "items": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+(?:\\.[a-zA-Z0-9_-]+)*$" }
+          }
         }
       }
     }

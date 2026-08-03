@@ -25,6 +25,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/plan"
 	"github.com/tchori-labs/tchori/internal/provider"
 	"github.com/tchori-labs/tchori/internal/registry"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 	"github.com/tchori-labs/tchori/internal/state"
 	"github.com/tchori-labs/tchori/internal/version"
 )
@@ -375,6 +376,25 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 	if _, exists := st.Resources[address]; exists {
 		return 1, fmt.Errorf("%s already exists in state; import does not overwrite", address)
 	}
+	st.SetSensitiveResolver(func(addr string, rs *state.ResourceState) (state.Resolution, bool) {
+		r := rt.Config.Resources[addr]
+		if r == nil {
+			return state.Resolution{}, false
+		}
+		ps := rt.Schemas[r.Provider]
+		if ps == nil {
+			return state.Resolution{}, false
+		}
+		sch, _, known := ps.LookupResourceType(r.Type)
+		if !known || sch == nil {
+			return state.Resolution{}, false
+		}
+		spec, rds := sensitive.Resolve(sch.Block, r.SensitiveAttributes, r.Config)
+		if rds.HasErrors() {
+			return state.Resolution{}, false
+		}
+		return state.Resolution{Paths: spec.Paths(), ExemptInstances: spec.ExemptInstances()}, true
+	})
 
 	client, ok := rt.Providers[res.Provider]
 	if !ok {
@@ -408,18 +428,32 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 		return 1, fmt.Errorf("%s: resource %q does not exist", address, id)
 	}
 
-	attrs, err := ctyjson.Marshal(refreshed, ty)
+	spec, sds := sensitive.Resolve(schema.Block, res.SensitiveAttributes, res.Config)
+	emitDiags(sds)
+	if sds.HasErrors() {
+		return 1, nil
+	}
+	redacted, redactedPaths, err := spec.Redact(refreshed)
+	if err != nil {
+		return 1, fmt.Errorf("%s: redacting imported state: %w", address, err)
+	}
+	attrs, err := ctyjson.Marshal(redacted, ty)
 	if err != nil {
 		return 1, fmt.Errorf("%s: encoding imported state: %w", address, err)
 	}
+	st.NoteSensitive(address, spec.Paths())
 	st.Resources[address] = &state.ResourceState{
-		Type:       res.Type,
-		Provider:   res.Provider,
-		Attributes: attrs,
-		Private:    refreshedPrivate,
+		Type: res.Type, Provider: res.Provider, Attributes: attrs, Private: refreshedPrivate,
+		Redacted: redactedPaths, SensitivePaths: spec.Paths(), SensitiveScanned: true,
+	}
+	if len(redactedPaths) != 0 {
+		emitDiags(diag.Diagnostics{diag.Warnf(address, "sensitive attributes withheld from state", fmt.Sprintf("withheld paths: %s", strings.Join(redactedPaths, ", ")))})
 	}
 	if err := st.Save(stateFileName); err != nil {
 		return 1, err
+	}
+	for _, unresolved := range st.UnresolvedSensitiveAddresses() {
+		emitDiags(diag.Diagnostics{diag.Warnf(unresolved, "state entry could not be checked for sensitive values", "provider schema or live configuration was unavailable")})
 	}
 
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Imported %s (id=%s).\n", address, id)
@@ -470,12 +504,36 @@ func runStateShow(cmd *cobra.Command, args []string) (int, error) {
 	if !ok {
 		return 1, fmt.Errorf("no resource %q in state", args[0])
 	}
-	b, err := json.MarshalIndent(rs, "", "  ")
+	shown := *rs
+	if len(rs.SensitivePaths) != 0 {
+		// Provider-free read rendering is deliberately path-level: no raw config
+		// is available, and masking an authored literal in output is safer than
+		// echoing a credential. The on-disk state is never modified.
+		attrs, changed, err := sensitive.RedactJSON(rs.Attributes, rs.SensitivePaths, nil)
+		if err != nil {
+			return 1, err
+		}
+		shown.Attributes = attrs
+		shown.Redacted = mergePaths(rs.Redacted, changed)
+	} else if !rs.SensitiveScanned {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Note: this state entry was not checked for sensitive values and may contain unredacted values; it will be checked on the next save-producing apply.")
+	}
+	b, err := json.MarshalIndent(&shown, "", "  ")
 	if err != nil {
 		return 1, err
 	}
 	_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(b))
 	return 0, nil
+}
+
+func mergePaths(groups ...[]string) []string {
+	set := map[string]bool{}
+	for _, group := range groups {
+		for _, path := range group {
+			set[path] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(set))
 }
 
 // --- providers ---------------------------------------------------------------

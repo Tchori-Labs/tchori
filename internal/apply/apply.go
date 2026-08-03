@@ -29,6 +29,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/plan"
 	"github.com/tchori-labs/tchori/internal/provider"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 	"github.com/tchori-labs/tchori/internal/state"
 )
 
@@ -61,7 +62,26 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 			pl.StateSerial, st.Serial))}
 	}
 
-	ex := &executor{cfg: cfg, providers: providers, schemas: schemas, st: st, statePath: statePath}
+	ex := &executor{cfg: cfg, providers: providers, schemas: schemas, st: st, statePath: statePath, applied: map[string]cty.Value{}}
+	st.SetSensitiveResolver(func(addr string, rs *state.ResourceState) (state.Resolution, bool) {
+		if cfg == nil || cfg.Resources[addr] == nil {
+			return state.Resolution{}, false
+		}
+		res := cfg.Resources[addr]
+		ps := schemas[res.Provider]
+		if ps == nil {
+			return state.Resolution{}, false
+		}
+		sch, _, known := ps.LookupResourceType(res.Type)
+		if !known || sch == nil {
+			return state.Resolution{}, false
+		}
+		spec, rds := sensitive.Resolve(sch.Block, res.SensitiveAttributes, res.Config)
+		if rds.HasErrors() {
+			return state.Resolution{}, false
+		}
+		return state.Resolution{Paths: spec.Paths(), ExemptInstances: spec.ExemptInstances()}, true
+	})
 
 	byAddr := make(map[string]*plan.Change, len(pl.Changes))
 	for _, ch := range pl.Changes {
@@ -176,6 +196,7 @@ type executor struct {
 	schemas   map[string]*provider.ProviderSchemas
 	st        *state.State
 	statePath string
+	applied   map[string]cty.Value // full in-process values for same-run references
 }
 
 // applyChange executes one plan change and persists its result.
@@ -218,6 +239,22 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 			fmt.Sprintf("unsupported schema for resource type %q", typeName), unsupported)}
 	}
 	ty := schema.Block.ImpliedType()
+	// Register full effective paths before any destroy removes the entry; the
+	// same save's backup must still scrub the departing resource.
+	var declared []string
+	var rawCfg map[string]any
+	if ex.cfg != nil && ex.cfg.Resources[addr] != nil {
+		declared = ex.cfg.Resources[addr].SensitiveAttributes
+		rawCfg = ex.cfg.Resources[addr].Config
+	}
+	spec, sds := sensitive.Resolve(schema.Block, declared, rawCfg)
+	if sds.HasErrors() {
+		return sds
+	}
+	ex.st.NoteSensitive(addr, spec.Paths())
+	if rs := ex.st.Resources[addr]; rs != nil {
+		ex.st.NoteSensitive(addr, rs.SensitivePaths)
+	}
 
 	// Prior value and private bytes come from state (null/nil if absent) —
 	// except for "create", where the plan document is trusted over state
@@ -277,7 +314,7 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 	if err := ex.st.Save(ex.statePath); err != nil {
 		return append(ds, diag.Errorf(addr, "saving state", err.Error()))
 	}
-	return ds
+	return append(ds, unresolvedWarnings(ex.st)...)
 }
 
 // createOrUpdate decodes the planned value captured at plan time (msgpack,
@@ -332,21 +369,49 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	if newState.IsNull() || !newState.IsKnown() {
 		return append(ds, consistencyDs...)
 	}
-	attrs, err := ctyjson.Marshal(newState, ty)
+	spec, specDs := sensitive.Resolve(block, res.SensitiveAttributes, res.Config)
+	ds = append(ds, specDs...)
+	if specDs.HasErrors() {
+		return append(ds, consistencyDs...)
+	}
+	// Keep the full result only in memory so same-run references resolve even
+	// though the durable state withholds the source value.
+	ex.applied[addr] = newState
+	redactedState, redactedPaths, err := spec.Redact(newState)
+	if err != nil {
+		return append(ds, diag.Errorf(addr, "redacting new state", err.Error()))
+	}
+	attrs, err := ctyjson.Marshal(redactedState, ty)
 	if err != nil {
 		ds = append(ds, consistencyDs...)
 		return append(ds, diag.Errorf(addr, "encoding new state", err.Error()))
 	}
+	ex.st.NoteSensitive(addr, spec.Paths())
 	ex.st.Resources[addr] = &state.ResourceState{
-		Type:       typeName,
-		Provider:   providerName,
-		Attributes: attrs,
-		Private:    newPrivate,
+		Type:             typeName,
+		Provider:         providerName,
+		Attributes:       attrs,
+		Private:          newPrivate,
+		Redacted:         redactedPaths,
+		SensitivePaths:   spec.Paths(),
+		SensitiveScanned: true,
+	}
+	if len(redactedPaths) != 0 {
+		ds = append(ds, diag.Warnf(addr, "sensitive attributes withheld from state", fmt.Sprintf("withheld paths: %s; capture provider-issued credentials in a secret store", strings.Join(redactedPaths, ", "))))
 	}
 	if err := ex.st.Save(ex.statePath); err != nil {
 		return append(ds, diag.Errorf(addr, "saving state", err.Error()))
 	}
+	ds = append(ds, unresolvedWarnings(ex.st)...)
 	return append(ds, consistencyDs...)
+}
+
+func unresolvedWarnings(st *state.State) diag.Diagnostics {
+	var ds diag.Diagnostics
+	for _, addr := range st.UnresolvedSensitiveAddresses() {
+		ds = append(ds, diag.Warnf(addr, "state entry could not be checked for sensitive values", "provider schema or live configuration was unavailable; inspect and rotate any credentials manually"))
+	}
+	return ds
 }
 
 // resolvePlannedUnknowns walks planned and cfgVal together (both at the same
@@ -506,6 +571,9 @@ func resolvePlannedUnknowns(planned, cfgVal cty.Value) cty.Value {
 // has already applied and its post-apply value already recorded in state
 // (and saved).
 func (ex *executor) resolveRef(ref config.Ref) (cty.Value, diag.Diagnostics) {
+	if full, ok := ex.applied[ref.Address]; ok {
+		return resolveRefValue(full, ref)
+	}
 	rs := ex.st.Resources[ref.Address]
 	if rs == nil {
 		return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address, "reference to missing resource",
@@ -530,10 +598,14 @@ func (ex *executor) resolveRef(ref config.Ref) (cty.Value, diag.Diagnostics) {
 		return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address, "corrupt state attributes", err.Error())}
 	}
 
+	return resolveRefValue(v, ref)
+}
+
+func resolveRefValue(v cty.Value, ref config.Ref) (cty.Value, diag.Diagnostics) {
 	for _, seg := range strings.Split(ref.Attr, ".") {
 		if v.IsNull() {
-			return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address, "reference through null value",
-				fmt.Sprintf("cannot resolve %q in ${%s.%s}: intermediate value is null", seg, ref.Address, ref.Attr))}
+			return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address, "value was withheld from state",
+				fmt.Sprintf("cannot resolve ${%s.%s}: the value is null or was withheld; provide it again through configuration or a secret store", ref.Address, ref.Attr))}
 		}
 		vty := v.Type()
 		switch {

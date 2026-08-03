@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/zclconf/go-cty/cty"
@@ -15,6 +14,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/config"
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/provider"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 	"github.com/tchori-labs/tchori/internal/state"
 )
 
@@ -92,6 +92,11 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 			return nil, ds
 		}
 		ty := schema.Block.ImpliedType()
+		spec, specDs := sensitive.Resolve(schema.Block, res.SensitiveAttributes, res.Config)
+		ds = append(ds, specDs...)
+		if specDs.HasErrors() {
+			return nil, ds
+		}
 
 		// Prior value from state, decoded against the schema's implied type.
 		prior := cty.NullVal(ty)
@@ -105,6 +110,13 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 			}
 			prior = pv
 			priorPrivate = rs.Private
+			_, legacyPaths, err := spec.Redact(prior)
+			if err != nil {
+				return nil, append(ds, diag.Errorf(addr, "cannot inspect sensitive state", err.Error()))
+			}
+			if len(legacyPaths) != 0 {
+				ds = append(ds, diag.Warnf(addr, "plaintext sensitive value already exists in state", fmt.Sprintf("rotate credentials at paths %s and purge state.json, state.json.backup, and git history; plan writes no state and a no-op apply saves nothing, so manual purge may be required", strings.Join(legacyPaths, ", "))))
+			}
 		}
 
 		// Refresh: re-read the real object, use the result as prior, and keep
@@ -121,13 +133,20 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 				prior = cty.NullVal(ty)
 				priorPrivate = nil
 			} else {
-				attrs, err := ctyjson.Marshal(rv, ty)
+				redactedRefresh, redactedPaths, err := spec.Redact(rv)
+				if err != nil {
+					return nil, append(ds, diag.Errorf(addr, "cannot redact refreshed state", err.Error()))
+				}
+				attrs, err := ctyjson.Marshal(redactedRefresh, ty)
 				if err != nil {
 					ds = append(ds, diag.Errorf(addr, "cannot encode refreshed state", err.Error()))
 					return nil, ds
 				}
 				rs.Attributes = attrs
 				rs.Private = rpriv
+				rs.Redacted = redactedPaths
+				rs.SensitivePaths = spec.Paths()
+				rs.SensitiveScanned = true
 				prior = rv
 				priorPrivate = rpriv
 			}
@@ -163,7 +182,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		planned := pc.State
 		plannedValues[addr] = planned
 
-		ch, err := newChange(addr, prior, planned, ty, pc)
+		ch, err := newChange(addr, prior, planned, ty, pc, spec)
 		if err != nil {
 			ds = append(ds, diag.Errorf(addr, "cannot encode change", err.Error()))
 			return nil, ds
@@ -222,6 +241,19 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 		return nil, lds
 	}
 	ty := schema.Block.ImpliedType()
+	spec, sds := sensitive.Resolve(schema.Block, rs.SensitivePaths, nil)
+	lds = append(lds, sds...)
+	if sds.HasErrors() {
+		return nil, lds
+	}
+	paths := spec.Paths()
+	p.State.NoteSensitive(addr, paths)
+	// A state-only delete has no raw config and therefore no stable literal
+	// instance exemptions; its reporting copy is scrubbed path-level.
+	before, _, err := sensitive.RedactJSON(rs.Attributes, paths, nil)
+	if err != nil {
+		return nil, diag.Diagnostics{diag.Errorf(addr, "cannot sanitize delete state", err.Error())}
+	}
 	raw, err := msgpack.Marshal(cty.NullVal(ty), ty)
 	if err != nil {
 		return nil, diag.Diagnostics{diag.Errorf(addr, "cannot encode planned value", err.Error())}
@@ -229,7 +261,7 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 	return &Change{
 		Address:    addr,
 		Action:     "delete",
-		Before:     append(json.RawMessage(nil), rs.Attributes...),
+		Before:     before,
 		After:      json.RawMessage("null"),
 		PlannedRaw: raw,
 		Private:    rs.Private,
@@ -237,10 +269,14 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 }
 
 // newChange classifies and serializes one provider-planned resource change.
-func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.PlannedChange) (*Change, error) {
+func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.PlannedChange, spec *sensitive.Spec) (*Change, error) {
 	before := json.RawMessage("null") // JSON null for create
 	if !prior.IsNull() {
-		b, err := ctyjson.Marshal(prior, ty)
+		maskedPrior, _, err := spec.Redact(prior)
+		if err != nil {
+			return nil, fmt.Errorf("before redaction: %w", err)
+		}
+		b, err := ctyjson.Marshal(maskedPrior, ty)
 		if err != nil {
 			return nil, fmt.Errorf("before: %w", err)
 		}
@@ -249,8 +285,14 @@ func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.
 
 	after := json.RawMessage("null") // JSON null for delete
 	var unknownAfter []string
+	plannedForArtifact := planned
 	if !planned.IsNull() {
-		sanitized, paths, err := nullOutUnknowns(planned)
+		var err error
+		plannedForArtifact, err = spec.Unknown(planned)
+		if err != nil {
+			return nil, fmt.Errorf("sensitive unknowns: %w", err)
+		}
+		sanitized, paths, err := nullOutUnknowns(plannedForArtifact)
 		if err != nil {
 			return nil, fmt.Errorf("after: %w", err)
 		}
@@ -264,14 +306,14 @@ func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.
 
 	// PlannedRaw keeps the exact planned value, unknowns included, for the
 	// applier: cty/msgpack encodes unknowns as its extension type 0.
-	raw, err := msgpack.Marshal(planned, ty)
+	raw, err := msgpack.Marshal(plannedForArtifact, ty)
 	if err != nil {
 		return nil, fmt.Errorf("planned_raw: %w", err)
 	}
 
 	return &Change{
 		Address:         addr,
-		Action:          classify(prior, planned, pc.RequiresReplace),
+		Action:          classify(prior, planned, pc.RequiresReplace, spec),
 		Before:          before,
 		After:           after,
 		UnknownAfter:    unknownAfter,
@@ -285,15 +327,22 @@ func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.
 // create; prior and null planned => delete; RequiresReplace non-empty AND
 // planned differs on those paths => replace; planned == prior => no-op;
 // else update.
-func classify(prior, planned cty.Value, requiresReplace []string) string {
-	switch {
-	case prior.IsNull():
+func classify(prior, planned cty.Value, requiresReplace []string, spec *sensitive.Spec) string {
+	if prior.IsNull() {
 		return "create"
-	case planned.IsNull():
+	}
+	if planned.IsNull() {
 		return "delete"
-	case replaceRequired(prior, planned, requiresReplace):
+	}
+	maskedPrior, err1 := spec.Mask(prior)
+	maskedPlanned, err2 := spec.Mask(planned)
+	if err1 != nil || err2 != nil {
+		return "update"
+	}
+	switch {
+	case replaceRequired(maskedPrior, maskedPlanned, requiresReplace):
 		return "replace"
-	case planned.RawEquals(prior):
+	case maskedPlanned.RawEquals(maskedPrior):
 		return "no-op"
 	default:
 		return "update"
@@ -319,16 +368,8 @@ func replaceRequired(prior, planned cty.Value, paths []string) bool {
 	return false
 }
 
-// attrPath converts a dotted attribute path ("replace_me", "triggers.foo")
-// into a cty.Path of GetAttr steps.
-func attrPath(dotted string) cty.Path {
-	parts := strings.Split(dotted, ".")
-	path := cty.GetAttrPath(parts[0])
-	for _, part := range parts[1:] {
-		path = path.GetAttr(part)
-	}
-	return path
-}
+// attrPath retains the package-private call site while sharing one renderer/parser.
+func attrPath(dotted string) cty.Path { return sensitive.AttrPath(dotted) }
 
 // nullOutUnknowns is the research-digest workaround for ctyjson.Marshal
 // rejecting unknown values: replace every unknown with a typed null and
@@ -351,34 +392,8 @@ func nullOutUnknowns(v cty.Value) (cty.Value, []string, error) {
 	return out, paths, nil
 }
 
-// PathString renders a cty.Path as a dotted attribute path: "id",
-// "triggers.foo", `tags["env"]`, "items[0]". Adapted from the algorithm of
-// Terraform's internal tfdiags.FormatCtyPath (internal/tfdiags, BUSL-1.1,
-// not importable — reimplemented per research-cty.md §6), without the
-// leading dot. An empty path renders as an empty string.
-func PathString(path cty.Path) string {
-	var buf strings.Builder
-	for i, step := range path {
-		switch ts := step.(type) {
-		case cty.GetAttrStep:
-			if i > 0 {
-				buf.WriteByte('.')
-			}
-			buf.WriteString(ts.Name)
-		case cty.IndexStep:
-			key := ts.Key
-			switch {
-			case key.Type() == cty.Number && key.IsKnown() && !key.IsNull():
-				_, _ = fmt.Fprintf(&buf, "[%s]", key.AsBigFloat().Text('g', -1))
-			case key.Type() == cty.String && key.IsKnown() && !key.IsNull():
-				_, _ = fmt.Fprintf(&buf, "[%s]", strconv.Quote(key.AsString()))
-			default:
-				buf.WriteString("[...]")
-			}
-		}
-	}
-	return buf.String()
-}
+// PathString is retained for callers outside plan; implementation lives in the leaf package.
+func PathString(path cty.Path) string { return sensitive.PathString(path) }
 
 // sortedStateAddrs returns the state's resource addresses in sorted order.
 func sortedStateAddrs(st *state.State) []string {

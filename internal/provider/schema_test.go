@@ -215,3 +215,13 @@ func TestBlockFromProtoUnknownNestingMode(t *testing.T) {
 		t.Errorf("error = %q, want it to mention nested_type", err)
 	}
 }
+
+func TestProtocol6SensitiveAttributePropagation(t *testing.T) {
+	block, err := blockFromProto(&tfplugin6.Schema_Block{Attributes: []*tfplugin6.Schema_Attribute{{Name: "secret", Type: []byte(`"string"`), Computed: true, Sensitive: true}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !block.Attributes["secret"].Sensitive {
+		t.Fatal("protocol-6 Sensitive flag was dropped")
+	}
+}

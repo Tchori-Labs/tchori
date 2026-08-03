@@ -265,3 +265,17 @@ func TestSchema5to6(t *testing.T) {
 		t.Fatalf("schema not converted: %+v", got)
 	}
 }
+
+func TestProtocol5SensitiveAttributePropagation(t *testing.T) {
+	converted := schemaAttribute5to6(&tfplugin5.Schema_Attribute{Name: "secret", Type: []byte(`"string"`), Computed: true, Sensitive: true})
+	if converted == nil || !converted.Sensitive {
+		t.Fatal("protocol-5 adapter dropped Sensitive flag")
+	}
+	block, err := blockFromProto(&tfplugin6.Schema_Block{Attributes: []*tfplugin6.Schema_Attribute{converted}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !block.Attributes["secret"].Sensitive {
+		t.Fatal("adapted sensitivity did not reach provider Attr")
+	}
+}

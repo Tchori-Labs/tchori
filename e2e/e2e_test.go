@@ -42,6 +42,7 @@ import (
 // binary whose wire protocol is genuinely 5-only. Do not swap in a
 // different provider without re-verifying.
 const nullVersion = "3.3.0"
+const secretSentinelE2E = "tchori-e2e-super-secret-value" //nolint:gosec // fake credential sentinel must be absent from artifacts
 
 // lifecycleConfig is the fake-provider workspace: two tchoritest_thing
 // resources where b's tag references a's computed id — a real dependency
@@ -68,6 +69,15 @@ const lifecycleConfig = `{
   }
 }
 `
+
+const sensitiveConfig = `{
+  "providers": {"tchoritest":{"source":"tchori-labs/tchoritest","version":"0.0.1","config":{"prefix":"e2e-"}}},
+  "resources": {
+    "tchoritest_secretful.a":{"config":{"name":"a"}},
+    "tchoritest_secretful.b":{"config":{"name":"b","token":"${tchoritest_secretful.a.client_secret}"}},
+    "tchoritest_secretful.c":{"config":{"name":"c","rules":[{"token":"literal-token-ok"},{"token":"${tchoritest_secretful.a.client_secret}"}]}}
+  }
+}`
 
 // protocol5Config declares the registry-installed, protocol-5-only
 // provider (the fixture-served testprovider5 binary, named "null" here
@@ -246,6 +256,42 @@ func TestEndToEnd(t *testing.T) {
 		readJSON(t, filepath.Join(work, "state.json"), &st)
 		if len(st.Resources) != 0 {
 			t.Fatalf("state has %d resources after destroy, want 0: %v", len(st.Resources), addresses(st))
+		}
+	})
+
+	t.Run("sensitive_artifacts", func(t *testing.T) {
+		work := t.TempDir()
+		if err := os.WriteFile(filepath.Join(work, "main.tchori.json"), []byte(sensitiveConfig), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		pd := "--plugin-dir=" + pluginDir
+		stdout, stderr := run(t, work, 2, "plan", pd, "-out", "plan.json")
+		if strings.Contains(stdout+stderr, secretSentinelE2E) {
+			t.Fatal("plan output emitted secret sentinel")
+		}
+		stdout, stderr = run(t, work, 0, "apply", pd, "plan.json")
+		if strings.Contains(stdout+stderr, secretSentinelE2E) {
+			t.Fatal("apply output emitted secret sentinel")
+		}
+		for _, name := range []string{"state.json", "state.json.backup", "plan.json"} {
+			data, err := os.ReadFile(filepath.Join(work, name)) //nolint:gosec // test-controlled workspace artifact
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(data, []byte(secretSentinelE2E)) {
+				t.Fatalf("%s contains secret sentinel", name)
+			}
+			if name == "state.json" && !bytes.Contains(data, []byte("literal-token-ok")) {
+				t.Fatal("literal instance did not survive state save")
+			}
+		}
+		stdout, stderr = run(t, work, 0, "state", "show", "tchoritest_secretful.a")
+		if strings.Contains(stdout+stderr, secretSentinelE2E) {
+			t.Fatal("state show emitted secret sentinel")
+		}
+		stdout, stderr = run(t, work, 0, "plan", pd)
+		if strings.Contains(stdout+stderr, secretSentinelE2E) || !strings.Contains(stdout, "No changes") {
+			t.Fatalf("post-apply plan did not converge: stdout=%s stderr=%s", stdout, stderr)
 		}
 	})
 

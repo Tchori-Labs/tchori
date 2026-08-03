@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1083,5 +1084,113 @@ func assertNoSidecarTempFiles(t *testing.T, dir string) {
 		if len(matches) != 0 {
 			t.Fatalf("temporary files remain for %q: %v", pattern, matches)
 		}
+	}
+}
+
+func TestSaveSanitizesSensitiveStateAndBackup(t *testing.T) {
+	const sentinel = "tchori-e2e-super-secret-value"
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := `{"format_version":"1.0","serial":0,"resources":{"secret.a":{"type":"secret","provider":"test","attributes":{"client_secret":"` + sentinel + `"}}}}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetSensitiveResolver(func(string, *ResourceState) (Resolution, bool) {
+		return Resolution{Paths: []string{"client_secret"}}, true
+	})
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{path, path + ".backup"} {
+		b, err := os.ReadFile(p) //nolint:gosec // test-controlled state and backup paths under t.TempDir()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(b, []byte(sentinel)) {
+			t.Fatalf("sentinel persisted in %s", p)
+		}
+	}
+	if !s.Resources["secret.a"].SensitiveScanned || fmt.Sprint(s.Resources["secret.a"].SensitivePaths) != "[client_secret]" {
+		t.Fatalf("metadata = %#v", s.Resources["secret.a"])
+	}
+}
+
+func TestSaveSanitizesBackupFromEffectiveHintWhenValueNowNull(t *testing.T) {
+	const sentinel = "tchori-e2e-super-secret-value"
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := `{"format_version":"1.0","serial":0,"resources":{"secret.a":{"type":"secret","provider":"test","attributes":{"write_only_secret":"` + sentinel + `"}}}}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Resources["secret.a"].Attributes = json.RawMessage(`{"write_only_secret":null}`)
+	s.NoteSensitive("secret.a", []string{"write_only_secret"})
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled backup path under t.TempDir()
+	if bytes.Contains(b, []byte(sentinel)) {
+		t.Fatal("legacy write-only secret copied to backup")
+	}
+}
+
+func TestSavePreservesLiteralAndCurrentResolutionClearsRemovedPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	initial := `{"format_version":"1.0","serial":0,"resources":{` +
+		`"secret.literal":{"type":"secret","provider":"test","attributes":{"token":"literal-token-ok"},"sensitive_paths":["token"]},` +
+		`"secret.removed":{"type":"secret","provider":"test","attributes":{"note":null},"sensitive_paths":["note"],"redacted":["note"]}}}`
+	if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Resources["secret.removed"].Attributes = json.RawMessage(`{"note":"visible-again"}`)
+	s.SetSensitiveResolver(func(addr string, _ *ResourceState) (Resolution, bool) {
+		if addr == "secret.literal" {
+			return Resolution{Paths: []string{"token"}, ExemptInstances: []string{"token"}}, true
+		}
+		return Resolution{}, true
+	})
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path) //nolint:gosec // test-controlled state path under t.TempDir()
+	if !bytes.Contains(b, []byte("literal-token-ok")) || !bytes.Contains(b, []byte("visible-again")) {
+		t.Fatalf("live state clobbered: %s", b)
+	}
+	rs := s.Resources["secret.removed"]
+	if len(rs.SensitivePaths) != 0 || len(rs.Redacted) != 0 || !rs.SensitiveScanned {
+		t.Fatalf("stale metadata = %#v", rs)
+	}
+}
+
+func TestSaveResolverOutcomes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{"known": {Attributes: json.RawMessage(`{}`)}, "orphan": {Attributes: json.RawMessage(`{}`)}}}
+	s.SetSensitiveResolver(func(addr string, _ *ResourceState) (Resolution, bool) {
+		if addr == "known" {
+			return Resolution{}, true
+		}
+		return Resolution{}, false
+	})
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if !s.Resources["known"].SensitiveScanned {
+		t.Fatal("resolved non-sensitive entry not marked scanned")
+	}
+	if got := fmt.Sprint(s.UnresolvedSensitiveAddresses()); got != "[orphan]" {
+		t.Fatalf("unresolved = %s", got)
+	}
+	if s.Resources["orphan"].SensitiveScanned {
+		t.Fatal("unresolved entry marked scanned")
 	}
 }
