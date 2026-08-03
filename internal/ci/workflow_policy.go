@@ -17,18 +17,70 @@ type workflowDoc struct {
 }
 
 type workflowJob struct {
-	TimeoutMinutes  *int           `yaml:"timeout-minutes"`
-	Needs           any            `yaml:"needs"`
-	If              string         `yaml:"if"`
-	ContinueOnError bool           `yaml:"continue-on-error"`
-	Steps           []workflowStep `yaml:"steps"`
+	TimeoutMinutes  *int              `yaml:"timeout-minutes"`
+	Needs           any               `yaml:"needs"`
+	If              string            `yaml:"if"`
+	ContinueOnError bool              `yaml:"continue-on-error"`
+	Env             map[string]string `yaml:"env"`
+	Steps           []workflowStep    `yaml:"steps"`
 }
 
 type workflowStep struct {
-	Run             string `yaml:"run"`
-	Uses            string `yaml:"uses"`
-	If              string `yaml:"if"`
-	ContinueOnError bool   `yaml:"continue-on-error"`
+	Run             string            `yaml:"run"`
+	Uses            string            `yaml:"uses"`
+	If              string            `yaml:"if"`
+	ContinueOnError bool              `yaml:"continue-on-error"`
+	Env             map[string]string `yaml:"env"`
+}
+
+var e2eProxyEnv = map[string]string{
+	"HTTPS_PROXY": "http://127.0.0.1:1",
+	"HTTP_PROXY":  "http://127.0.0.1:1",
+	"NO_PROXY":    "127.0.0.1,localhost",
+}
+
+const e2eTestCommand = "go test -tags e2e ./e2e -v"
+
+// E2EProxyEnvIsStepScoped verifies that network denial applies only to the
+// e2e test command, leaving checkout, Go setup, and module download unproxied.
+func E2EProxyEnvIsStepScoped(workflowYAML []byte) error {
+	doc, err := parseWorkflow(workflowYAML)
+	if err != nil {
+		return err
+	}
+
+	e2e, ok := doc.Jobs["e2e"]
+	if !ok {
+		return fmt.Errorf("workflow declares no e2e job")
+	}
+	for name := range e2eProxyEnv {
+		if _, exists := e2e.Env[name]; exists {
+			return fmt.Errorf("e2e job must not declare %s at job scope", name)
+		}
+	}
+
+	testSteps := 0
+	for _, step := range e2e.Steps {
+		isE2ETest := strings.TrimSpace(step.Run) == e2eTestCommand
+		if isE2ETest {
+			testSteps++
+		}
+		for name, want := range e2eProxyEnv {
+			got, exists := step.Env[name]
+			switch {
+			case isE2ETest && !exists:
+				return fmt.Errorf("e2e test step must declare %s", name)
+			case isE2ETest && got != want:
+				return fmt.Errorf("e2e test step %s = %q, want %q", name, got, want)
+			case !isE2ETest && exists:
+				return fmt.Errorf("only the e2e test step may declare %s", name)
+			}
+		}
+	}
+	if testSteps != 1 {
+		return fmt.Errorf("e2e job must contain exactly one %q step, found %d", e2eTestCommand, testSteps)
+	}
+	return nil
 }
 
 // JobsMissingTimeout returns the sorted names of jobs in a GitHub Actions

@@ -28,11 +28,12 @@ a clean control before the required context can pass. The Go test run covers:
   `pull_request` or `push` trigger and prevents public-registry references from
   entering non-smoke e2e sources.
 
-The required `e2e` job runs the complete CLI lifecycle, fixture-registry
-install, and protocol-negotiation failure under dead HTTP and HTTPS proxies.
-`NO_PROXY=127.0.0.1,localhost` permits only the in-process `httptest` registry.
-A public-network dependency therefore fails fast instead of making PR results
-depend on DNS, CDN, or registry availability.
+The required `e2e` job runs checkout, Go setup, and module download with normal
+network access. Its e2e test step runs the complete CLI lifecycle,
+fixture-registry install, and protocol-negotiation failure under dead HTTP and
+HTTPS proxies. `NO_PROXY=127.0.0.1,localhost` permits only the in-process
+`httptest` registry. A public-network dependency therefore fails fast instead
+of making PR results depend on DNS, CDN, or registry availability.
 
 Run the hermetic suite locally:
 
