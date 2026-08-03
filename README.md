@@ -25,8 +25,11 @@ Status: **0.1.0-dev** — pre-MVP, under active development, built in public.
    dependency graph. A reference-shaped `${...}` that survives in a value
    tchori would send to a provider is a hard `unresolved reference` error at
    validate, plan, and apply; shell-style literals such as `${HOME}` remain
-   legal. Secrets come from the environment via `{"env": "VAR_NAME"}`
-   wrappers — they never live in config files.
+   legal. Provider and resource config values come from the environment via
+   `{"env": "VAR_NAME"}` or ordered fallback
+   `{"env": ["PRIMARY", "ALTERNATE"]}` wrappers, so secrets never need to
+   live in config files. `validate` treats unset environment values as unknown;
+   `plan` and `apply` require a candidate to be set. See [configuration and environment values](docs/configuration.md).
 3. **Machine-readable diagnostics.** Every error and warning is a structured
    JSON object on stderr (`{"severity","summary","detail","address"}`) — the
    agent retry loop, not a wall of prose. Pretty rendering only when stderr
@@ -129,6 +132,27 @@ tchori destroy $PD -out destroy.json # exit 2: destroy plan written
 tchori apply $PD destroy.json        # exit 0: everything deleted
 ```
 
+Human plans show the changed attributes, not only the resource address. A
+computed value that refresh found unhealthy remains visible even when its
+post-apply value is not known:
+
+```text
+~ coolify_service.web
+    ~ status = "degraded:unhealthy" -> (known after apply)
+Plan: 0 to create, 1 to update, 0 to delete, 0 to replace.
+```
+
+If refresh finds an out-of-band change but there is no pending action, the
+same signal is printed without changing the successful no-change exit code:
+
+```text
+Note: objects have changed outside tchori since the last apply.
+  ~ coolify_service.web
+    ~ status = "running:healthy" -> "degraded:unhealthy"
+
+No changes. Configuration matches state.
+```
+
 Exit codes follow the Terraform convention agents already know:
 `0` success / no changes · `2` plan has changes · `1` error.
 
@@ -143,7 +167,8 @@ success is durable across abrupt host failure. On Windows the directory-fsync
 step is a documented no-op (directory fsync is not a supported primitive there;
 NTFS journals rename metadata itself), so only the temp-file fsync provides the
 explicit barrier -- the effective durability outcome is unchanged.
-References: [plan and state formats](docs/formats.md) and the
+References: [configuration and environment values](docs/configuration.md),
+[plan and state formats](docs/formats.md), and the
 [diagnostic contract](docs/diagnostics.md).
 
 It also records whether the apply that last wrote it completed: `tchori state status`
@@ -176,8 +201,12 @@ tchori state status
 Tchori withholds provider-computed attributes marked `Sensitive` by the
 provider. State records JSON `null` plus `redacted`, `sensitive_paths`, and
 `sensitive_scanned` metadata; plans represent the value as unknown and ignore
-it for drift classification. Every save sanitizes every state entry, including
-the prior document written to `state.json.backup`.
+it for drift classification. Human plan stdout now renders non-sensitive
+attribute values and refresh drift too; schema-sensitive paths are shown only
+as `(sensitive value)`. Treat plan stdout, `plan.json`, and `state.json` as
+sensitive because a provider that omits its sensitivity flag can still return
+secrets. Every save sanitizes every state entry, including the prior document
+written to `state.json.backup`.
 
 For a provider that omits its sensitivity flag, declare an override:
 
@@ -273,7 +302,11 @@ redaction · MCP read + plan.
 
 Out (recorded deferrals): modules, count/for_each, an expression language,
 HCL, remote state backends, workspaces, registry GPG verification,
-apply-via-MCP, Homebrew tap (post-0.1).
+apply-via-MCP, Homebrew tap (post-0.1). For Coolify service health specifically,
+per-sub-service `applications[]` mapping remains third-party
+`coolify-terraform/coolify` provider work; policy that blocks plan/apply on a
+provider-specific unhealthy status also remains deferred until tchori has an
+explicit policy surface.
 
 ## Development
 

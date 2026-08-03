@@ -14,11 +14,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
+
+	"github.com/tchori-labs/tchori/internal/diag"
+	"github.com/tchori-labs/tchori/internal/plan"
 )
 
 // The CLI is tested end to end: TestMain builds the real tchori binary and
@@ -382,8 +386,8 @@ func TestCLIApplyReportsInconsistentProviderResult(t *testing.T) {
 		t.Fatalf("apply: exit %d, want 1; stderr %s", code, stderr)
 	}
 	ds := decodeDiagnosticLines(t, stderr)
-	if len(ds) != 2 {
-		t.Fatalf("diagnostics = %#v, want inconsistent-result error and incomplete-state warning", ds)
+	if len(ds) != 3 {
+		t.Fatalf("diagnostics = %#v, want inconsistent-result error, abort accounting, and incomplete-state warning", ds)
 	}
 	d := ds[0]
 	if d.Severity != "error" || d.Address != "tchoritest_lossy.svc" || !strings.Contains(d.Detail, "flag: planned true, applied false") || strings.Contains(d.Detail, "do-not-print") {
@@ -395,6 +399,179 @@ func TestCLIApplyReportsInconsistentProviderResult(t *testing.T) {
 	}
 	if !bytes.Contains(stateBytes, []byte(`"flag": false`)) {
 		t.Fatalf("state does not record provider's false: %s", stateBytes)
+	}
+}
+
+func assertAPIFailureDiagnostics(t *testing.T, stderr, address string) {
+	t.Helper()
+	diagnostics := decodeDiagnosticLines(t, stderr)
+	counts := map[string]int{}
+	for _, d := range diagnostics {
+		counts[d.Summary]++
+		switch d.Summary {
+		case "Error updating service":
+			if d.Severity != "error" || d.Detail != "api error (status 400): Invalid request" || d.Address != address {
+				t.Fatalf("provider diagnostic = %#v", d)
+			}
+		case "apply aborted", "attempted change":
+			if d.Severity != "warning" || d.Address != address || d.Detail == "" {
+				t.Fatalf("accounting diagnostic = %#v", d)
+			}
+			var pretty bytes.Buffer
+			diag.Emit(&pretty, diag.Diagnostics{{Severity: diag.Warning, Summary: d.Summary, Detail: d.Detail, Address: d.Address}}, true)
+			prettyText := pretty.String()
+			if !strings.HasPrefix(prettyText, "Warning: "+d.Summary+" ("+address+")\n") || strings.HasSuffix(prettyText, "\n\n") {
+				t.Fatalf("pretty diagnostic = %q", prettyText)
+			}
+			for _, line := range strings.Split(d.Detail, "\n") {
+				if !strings.Contains(prettyText, "  "+line+"\n") {
+					t.Fatalf("pretty detail did not indent source line %q: %q", line, prettyText)
+				}
+			}
+		}
+	}
+	for _, summary := range []string{"Error updating service", "apply aborted", "attempted change"} {
+		if counts[summary] != 1 {
+			t.Fatalf("%s count = %d, want 1; diagnostics = %#v", summary, counts[summary], diagnostics)
+		}
+	}
+}
+
+func TestCLIApplyReportsProvider400WithAbortAccounting(t *testing.T) {
+	dir := t.TempDir()
+	pd := "--plugin-dir=" + pluginDir
+	writeConfig(t, dir, "before")
+	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "seed.json"); code != 2 {
+		t.Fatalf("seed plan: exit %d, stderr %s", code, stderr)
+	}
+	if _, stderr, code := runCLI(t, dir, "apply", pd, "seed.json"); code != 0 {
+		t.Fatalf("seed apply: exit %d, stderr %s", code, stderr)
+	}
+	writeConfig(t, dir, "api_400")
+	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "failure.json"); code != 2 {
+		t.Fatalf("failure plan: exit %d, stderr %s", code, stderr)
+	}
+	_, stderr, code := runCLI(t, dir, "apply", pd, "-json", "failure.json")
+	if code != 1 {
+		t.Fatalf("apply: exit %d, want 1; stderr %s", code, stderr)
+	}
+	assertAPIFailureDiagnostics(t, stderr, "tchoritest_thing.demo")
+}
+
+func TestCLIProtocol5ApplyReportsProvider400WithAbortAccounting(t *testing.T) {
+	dir := t.TempDir()
+	pd := "--plugin-dir=" + pluginDir
+	writeConfig5(t, dir, "before")
+	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "seed.json"); code != 2 {
+		t.Fatalf("seed plan: exit %d, stderr %s", code, stderr)
+	}
+	if _, stderr, code := runCLI(t, dir, "apply", pd, "seed.json"); code != 0 {
+		t.Fatalf("seed apply: exit %d, stderr %s", code, stderr)
+	}
+	writeConfig5(t, dir, "api_400")
+	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "failure.json"); code != 2 {
+		t.Fatalf("failure plan: exit %d, stderr %s", code, stderr)
+	}
+	_, stderr, code := runCLI(t, dir, "apply", pd, "-json", "failure.json")
+	if code != 1 {
+		t.Fatalf("apply: exit %d, want 1; stderr %s", code, stderr)
+	}
+	assertAPIFailureDiagnostics(t, stderr, "tchoritest5_thing.demo")
+}
+
+func TestCLIRefreshDriftRenderedOnBothProtocols(t *testing.T) {
+	protocols := []struct {
+		name    string
+		write   func(*testing.T, string, string)
+		address string
+	}{
+		{name: "protocol6", write: writeConfig, address: "tchoritest_thing.demo"},
+		{name: "protocol5", write: writeConfig5, address: "tchoritest5_thing.demo"},
+	}
+	for _, protocol := range protocols {
+		protocol := protocol
+		t.Run(protocol.name+"_pending_update", func(t *testing.T) {
+			dir := t.TempDir()
+			seedAppliedResource(t, dir, protocol.write, "drift-a")
+			protocol.write(t, dir, "drift-b")
+			stdout, stderr, code := runCLI(t, dir, "plan", "--plugin-dir="+pluginDir, "-out", "pending.json")
+			if code != 2 {
+				t.Fatalf("plan: exit %d, want 2\nstdout: %s\nstderr: %s", code, stdout, stderr)
+			}
+			for _, text := range []string{"echo = \"degraded:unhealthy\" -> (known after apply)", "Note: objects have changed outside tchori"} {
+				if !strings.Contains(stdout, text) {
+					t.Errorf("plan stdout missing %q:\n%s", text, stdout)
+				}
+			}
+			assertSavedDrift(t, filepath.Join(dir, "pending.json"), protocol.address, "echo")
+		})
+
+		t.Run(protocol.name+"_no_pending_change", func(t *testing.T) {
+			dir := t.TempDir()
+			seedAppliedResource(t, dir, protocol.write, "drift-a")
+			stdout, stderr, code := runCLI(t, dir, "plan", "--plugin-dir="+pluginDir, "-out", "drift.json")
+			if code != 0 {
+				t.Fatalf("plan: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+			}
+			for _, text := range []string{"Note: objects have changed outside tchori", "degraded:unhealthy", "No changes. Configuration matches state."} {
+				if !strings.Contains(stdout, text) {
+					t.Errorf("plan stdout missing %q:\n%s", text, stdout)
+				}
+			}
+			assertSavedDrift(t, filepath.Join(dir, "drift.json"), protocol.address, "echo")
+		})
+	}
+}
+
+func TestCLIProtocol5VanishedObjectDrift(t *testing.T) {
+	dir := t.TempDir()
+	seedAppliedResource(t, dir, writeConfig5, "vanish")
+	stdout, stderr, code := runCLI(t, dir, "plan", "--plugin-dir="+pluginDir, "-out", "vanished.json")
+	if code != 2 {
+		t.Fatalf("plan: exit %d, want 2\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "tchoritest5_thing.demo (object no longer exists)") || !strings.Contains(stdout, "+ tchoritest5_thing.demo") {
+		t.Fatalf("vanished plan output missing drift/create markers:\n%s", stdout)
+	}
+	var pl plan.Plan
+	readJSONFile(t, filepath.Join(dir, "vanished.json"), &pl)
+	if len(pl.Drift) != 1 || pl.Drift[0].Address != "tchoritest5_thing.demo" || string(pl.Drift[0].After) != "null" {
+		t.Fatalf("vanished drift = %#v", pl.Drift)
+	}
+}
+
+func seedAppliedResource(t *testing.T, dir string, write func(*testing.T, string, string), name string) {
+	t.Helper()
+	write(t, dir, name)
+	pd := "--plugin-dir=" + pluginDir
+	if stdout, stderr, code := runCLI(t, dir, "plan", pd, "-out", "seed.json"); code != 2 {
+		t.Fatalf("seed plan: exit %d, want 2\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if stdout, stderr, code := runCLI(t, dir, "apply", pd, "seed.json"); code != 0 {
+		t.Fatalf("seed apply: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+}
+
+func assertSavedDrift(t *testing.T, path, address, changedPath string) {
+	t.Helper()
+	var pl plan.Plan
+	readJSONFile(t, path, &pl)
+	if pl.FormatVersion != "1.0" {
+		t.Fatalf("format_version = %q, want 1.0", pl.FormatVersion)
+	}
+	if len(pl.Drift) != 1 || pl.Drift[0].Address != address || !slices.Contains(pl.Drift[0].Paths, changedPath) {
+		t.Fatalf("drift = %#v, want one %s entry at %s", pl.Drift, changedPath, address)
+	}
+}
+
+func readJSONFile(t *testing.T, path string, target any) {
+	t.Helper()
+	b, err := os.ReadFile(path) //nolint:gosec // G304: test-only path is always rooted in t.TempDir
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if err := json.Unmarshal(b, target); err != nil {
+		t.Fatalf("decode %s: %v\n%s", path, err, b)
 	}
 }
 
@@ -428,6 +605,9 @@ func TestCLILifecycle(t *testing.T) {
 	}
 	if doc["format_version"] != "1.0" {
 		t.Errorf("plan -json format_version = %v, want %q", doc["format_version"], "1.0")
+	}
+	if _, exists := doc["drift"]; exists {
+		t.Errorf("drift-free plan -json unexpectedly contains drift: %s", stdout)
 	}
 
 	// plan -out -> plan file written, still exit 2.
@@ -734,6 +914,100 @@ func TestCLIRejectsEmbeddedReference(t *testing.T) {
 	}
 }
 
+func TestCLIResourceConfigEnvWrapperLifecycle(t *testing.T) {
+	const envName = "TCHORI_TEST_NAME"
+	t.Setenv(envName, "alpha")
+	dir := t.TempDir()
+	cfg := `{
+  "providers": {
+    "tchoritest": {
+      "source": "tchori-labs/tchoritest",
+      "version": "0.0.1",
+      "config": {"prefix": "t-"}
+    }
+  },
+  "resources": {
+    "tchoritest_thing.demo": {
+      "config": {"name": {"env": "TCHORI_TEST_NAME"}}
+    }
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	pd := "--plugin-dir=" + pluginDir
+	assertNoProviderOnlyError := func(command, stderr string) {
+		t.Helper()
+		if strings.Contains(stderr, "only allowed"+" in provider config") {
+			t.Errorf("%s stderr retains resource env-wrapper rejection: %q", command, stderr)
+		}
+	}
+
+	_, stderr, code := runCLI(t, dir, "validate", pd)
+	assertNoProviderOnlyError("validate", stderr)
+	if code != 0 {
+		t.Fatalf("validate: exit %d, want 0\nstderr: %s", code, stderr)
+	}
+
+	_, stderr, code = runCLI(t, dir, "plan", pd, "-out", "plan.json")
+	assertNoProviderOnlyError("plan", stderr)
+	if code != 2 {
+		t.Fatalf("plan -out: exit %d, want 2\nstderr: %s", code, stderr)
+	}
+
+	_, stderr, code = runCLI(t, dir, "apply", pd, "plan.json")
+	assertNoProviderOnlyError("apply", stderr)
+	if code != 0 {
+		t.Fatalf("apply: exit %d, want 0\nstderr: %s", code, stderr)
+	}
+
+	stateBytes, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // test temp directory
+	if err != nil {
+		t.Fatalf("read state.json: %v", err)
+	}
+	var stateDoc struct {
+		Resources map[string]struct {
+			Attributes map[string]any `json:"attributes"`
+		} `json:"resources"`
+	}
+	if err := json.Unmarshal(stateBytes, &stateDoc); err != nil {
+		t.Fatalf("decode state.json: %v", err)
+	}
+	if got := stateDoc.Resources["tchoritest_thing.demo"].Attributes["name"]; got != "alpha" {
+		t.Errorf("state name = %#v, want environment value %q", got, "alpha")
+	}
+
+	stdout, stderr, code := runCLI(t, dir, "plan", pd)
+	assertNoProviderOnlyError("follow-up plan", stderr)
+	if code != 0 || !strings.Contains(stdout, "No changes") {
+		t.Fatalf("follow-up plan: exit %d, want 0 and No changes\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+
+	if err := os.Unsetenv(envName); err != nil {
+		t.Fatalf("Unsetenv: %v", err)
+	}
+	_, stderr, code = runCLI(t, dir, "validate", pd)
+	assertNoProviderOnlyError("validate with unset variable", stderr)
+	if code != 0 {
+		t.Fatalf("validate with unset variable: exit %d, want 0\nstderr: %s", code, stderr)
+	}
+
+	_, stderr, code = runCLI(t, dir, "destroy", pd, "-out", "destroy.json")
+	assertNoProviderOnlyError("destroy", stderr)
+	if code != 2 {
+		t.Fatalf("destroy -out with unset variable: exit %d, want 2\nstderr: %s", code, stderr)
+	}
+	_, stderr, code = runCLI(t, dir, "apply", pd, "destroy.json")
+	assertNoProviderOnlyError("apply destroy", stderr)
+	if code != 0 {
+		t.Fatalf("apply destroy with unset variable: exit %d, want 0\nstderr: %s", code, stderr)
+	}
+	stdout, stderr, code = runCLI(t, dir, "state", "list")
+	if code != 0 || stdout != "" {
+		t.Fatalf("state list after destroy: exit %d, stdout %q, stderr %q; want empty", code, stdout, stderr)
+	}
+}
+
 func TestValidateInvalidName(t *testing.T) {
 	dir := t.TempDir()
 	writeConfig(t, dir, "invalid") // fake provider rejects name == "invalid"
@@ -805,6 +1079,74 @@ func TestChdirGlobalFlag(t *testing.T) {
 	_, stderr, code := runCLI(t, elsewhere, "-chdir="+cfgDir, "validate", "--plugin-dir="+pluginDir)
 	if code != 0 {
 		t.Fatalf("-chdir validate: exit %d, want 0\nstderr: %s", code, stderr)
+	}
+}
+
+func TestValidateChdirEnvCandidateFallback(t *testing.T) {
+	const (
+		baseURL  = "TCHORI_TEST_BASE_URL"
+		endpoint = "TCHORI_TEST_ENDPOINT"
+		resolved = "candidate-prefix-do-not-emit-"
+	)
+	for _, name := range []string{baseURL, endpoint} {
+		t.Setenv(name, "restore-for-cleanup")
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatalf("Unsetenv(%q): %v", name, err)
+		}
+	}
+
+	cfgDir := t.TempDir()
+	cfg := `{
+  "providers": {
+    "tchoritest": {
+      "source": "tchori-labs/tchoritest",
+      "version": "0.0.1",
+      "config": {"prefix": {"env": ["TCHORI_TEST_BASE_URL", "TCHORI_TEST_ENDPOINT"]}}
+    }
+  },
+  "resources": {
+    "tchoritest_thing.demo": {"config": {"name": "demo"}}
+  }
+}`
+	if err := os.WriteFile(filepath.Join(cfgDir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	elsewhere := t.TempDir() // exercise the reported command from outside the config directory
+	args := []string{"-chdir=" + cfgDir, "validate", "--plugin-dir=" + pluginDir}
+
+	_, stderr, code := runCLI(t, elsewhere, args...)
+	if code != 1 {
+		t.Fatalf("validate with all candidates unset: exit %d, want 1\nstderr: %s", code, stderr)
+	}
+	diags := decodeDiagnosticLines(t, stderr)
+	if len(diags) != 1 || diags[0].Summary != "environment variable not set" {
+		t.Fatalf("diagnostics = %+v, want one environment variable not set error\nstderr: %s", diags, stderr)
+	}
+	detail := diags[0].Detail
+	baseAt := strings.Index(detail, `"`+baseURL+`"`)
+	endpointAt := strings.Index(detail, `"`+endpoint+`"`)
+	if baseAt < 0 || endpointAt < baseAt {
+		t.Errorf("diagnostic does not name candidates in config order: %q", detail)
+	}
+	for _, want := range []string{`{"env": ...}`, "*.tchori.json", "no built-in or provider-specific", "add the name"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("diagnostic %q does not contain guidance %q", detail, want)
+		}
+	}
+	if strings.Contains(stderr, resolved) {
+		t.Errorf("unset diagnostic leaked a resolved environment value: %s", stderr)
+	}
+
+	t.Setenv(baseURL, resolved)
+	stdout, stderr, code := runCLI(t, elsewhere, args...)
+	if code != 0 {
+		t.Fatalf("validate with fallback candidate set: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Configuration is valid.") {
+		t.Errorf("stdout = %q, want validation success", stdout)
+	}
+	if strings.Contains(stderr, resolved) {
+		t.Errorf("successful validation leaked the resolved environment value to stderr: %s", stderr)
 	}
 }
 

@@ -14,7 +14,7 @@ Source of truth: `internal/plan/plan.go`, `internal/plan/planner.go`,
 
 | File | Written by | Read by | Purpose |
 | --- | --- | --- | --- |
-| `plan.json` | `tchori plan -out FILE`, `tchori destroy -out FILE` | `tchori apply FILE` | The reviewable, PR-able artifact: exactly the set of changes an apply will execute. There is no plan-less apply. |
+| `plan.json` | `tchori plan -out FILE`, `tchori destroy -out FILE` | `tchori apply FILE` | The reviewable, PR-able artifact: the exact changes an apply will execute plus optional informational refresh drift. There is no plan-less apply. |
 | `state.json` | `tchori apply`, `tchori destroy` (via `Save`) | `tchori plan`, `tchori apply`, `tchori state list/show`, `tchori mcp` | The record of what tchori believes is really deployed: one entry per managed resource, keyed by address. |
 
 ## Unresolved-reference safety
@@ -53,6 +53,7 @@ The guarantee has three deliberate boundaries:
 | `engine_version` | string | The tchori binary version that produced the plan (e.g. `"0.1.0-dev"`), from `internal/version.Version`. |
 | `state_serial` | integer | The state file's `serial` at the moment this plan was computed (`p.State.Serial`). `apply` compares this against the live state's serial to detect staleness — see below. |
 | `changes` | array of `Change` | Always sorted by `address` (`plan.finalize`). Document order is for byte-stability only; it carries no dependency information (`apply.Apply`'s ordering notes call this out explicitly — execution order comes from the config's topological sort, not from this array). |
+| `drift` | array of `Drift`, omitted if empty | Informational out-of-band differences between the value recorded in `state.json` and the value returned by refresh. Sorted by `address`. `apply` ignores this field; it never contributes to `summary` or `HasChanges()`. |
 | `summary` | object | Counts of `create`/`update`/`delete`/`replace` changes. All four keys are always present, even at zero (`Summary` has no `omitempty` tags). `no-op` changes are never counted. |
 
 ### Change fields
@@ -72,6 +73,28 @@ The guarantee has three deliberate boundaries:
 `[]byte` in Go; `encoding/json`'s default handling renders `[]byte` as
 standard base64 in the JSON document.
 
+### Drift fields
+
+| Field | JSON type | Meaning |
+| --- | --- | --- |
+| `address` | string | Resource address whose refreshed representation differs from the recorded state. |
+| `before` | object | The reporting-safe attributes recorded in `state.json` before refresh. |
+| `after` | object or `null` | The reporting-safe refreshed attributes, or `null` when the provider reports that the object no longer exists. |
+| `paths` | array of strings, omitted if empty | Sorted changed leaf paths. A vanished object has no paths because the whole object is absent. |
+
+A drift entry is a refresh observation, not an action. It is preserved by
+`plan.Write`/`plan.Read` and returned by the MCP `plan()` tool, but apply does
+not consume it. Sensitive leaves in `before` and `after` use the same
+schema/config-driven redaction as change values. A drift-free plan omits the
+field completely, preserving the bytes written before this field existed.
+
+> **Environment-sourced resource values:** An `{"env": "VAR"}` value in resource
+> config is resolved to a concrete string at plan time. It is persisted in
+> `plan.json` (visibly in `after` and inside `planned_raw`; base64 is encoding,
+> not encryption) and returned by the MCP `plan` tool. Values at paths marked
+> sensitive by the provider or `sensitive_attributes` follow the normal
+> redaction rules; treat unmarked plan values and plan results as sensitive.
+
 ### Action semantics (`plan.classify`)
 
 | Action | When |
@@ -86,6 +109,25 @@ standard base64 in the JSON document.
 every config resource) but never counted in `summary`, and `tchori plan`'s
 human-readable stdout output filters them out — only the JSON document keeps
 them.
+
+### Human plan output
+
+Human `plan` and `destroy` output keeps one action-symbol header per non-no-op
+change and prints changed leaf attributes under every non-delete header.
+Creates use `+`, removals use `-`, and updates use `~ before -> after`.
+Provider unknowns render as `(known after apply)`, replacement paths end with
+`# forces replacement`, and delete changes print only their header. Strings
+are quoted so `""` and `null` remain distinct; strings longer than 120 runes
+are truncated with an ellipsis and their full rune count.
+
+Schema-sensitive paths, including leaves under sensitive nested attributes,
+render as `(sensitive value)` on both sides. If an address cannot be resolved
+to a schema, human rendering fails closed and redacts its values. Drift uses
+the same formatting, truncation, and redaction path. It appears before planned
+changes under `Note: objects have changed outside tchori since the last
+apply.` A vanished object is shown as `<address> (object no longer exists)`.
+The note is printed even for a drift-only plan, followed by the existing `No
+changes. Configuration matches state.` line.
 
 ### How unknowns are represented
 
@@ -122,12 +164,16 @@ the reference is nested inside an ordered collection (Tchori-Labs/tchori#11).
 | `tchori state status` | state is converged | *(not used)* | state carries `incomplete_apply`, or cannot be read |
 
 `HasChanges()` is simply `create + update + delete + replace > 0` from
-`summary` — `no-op`-only plans exit `0`.
+`summary` — `no-op`-only and drift-only plans exit `0`. Drift is output, not a
+diagnostic: it does not change `HasErrors()` or any exit code.
 
 Diagnostics do not alter this exit-code contract. Every provider-RPC failure
-carries the resource or provider address that issued the RPC; see the
-[diagnostic contract](diagnostics.md) for the JSON shape, pretty rendering,
-address qualification, and advisory non-JSON-response hint.
+carries the resource or provider address that issued the RPC. Warning-severity
+`apply aborted` and `attempted change` diagnostics add
+[partial-apply accounting](#partial-apply-and-abort-accounting) without changing
+`HasErrors()` or the exit code. See the [diagnostic contract](diagnostics.md)
+for the JSON shape, pretty rendering, address qualification, and advisory
+non-JSON-response hint.
 
 ### format_version compatibility
 
@@ -135,6 +181,11 @@ address qualification, and advisory non-JSON-response hint.
 version this build of tchori writes (currently `"1.0"`) — a plan written by
 a future, schema-incompatible tchori is refused with an explicit error
 rather than silently misinterpreted.
+
+The optional `drift` field does **not** increment `format_version`: it is
+additive and informational, is omitted when empty, and is ignored by apply.
+Existing `1.0` readers continue to consume the action-bearing fields with
+unchanged meaning, while drift-free documents remain byte-identical.
 
 ### Example
 
@@ -244,6 +295,16 @@ marker, although it does clear a stale marker from an earlier run.
 Use `tchori state status` as the convergence gate: exit 0 means converged and
 exit 1 means incomplete. `plan`, `apply`, and `destroy` warn when loading a
 marked file, while planning remains available for recovery.
+
+An environment-sourced resource config value is written into the applied
+resource's `attributes` in `state.json`, just like any other concrete configured
+value. Values at sensitive paths follow the normal state redaction rules; treat
+unmarked state values as sensitive.
+
+`attributes` is encoded at the resource schema's deeply marker-free implied
+cty type. Optional-attribute markers belong only to schema conversion targets;
+they are never part of a value type constructed, decoded, or persisted by the
+engine.
 
 ### Serial semantics
 
@@ -427,6 +488,10 @@ against this state again produces two `no-op` changes and exits `0`.
 
 ## Staleness and configuration drift at apply
 
+This section's **configuration drift** means that config changed after a plan
+was written. It is distinct from the plan document's informational `drift`
+array, which records provider refresh differences from `state.json`.
+
 `apply.Apply` refuses to run, entirely and before any provider call or
 state save, in two situations:
 
@@ -489,6 +554,52 @@ update can therefore converge on a second plan and apply.
 
 Consistency diagnostic values follow the redaction rules below.
 
+## Partial apply and abort accounting
+
+Apply stops at the first erroring change, but every completed provider change
+has already been saved to `state.json`. The provider's error remains verbatim
+and in its original severity. Tchori then emits one warning-severity diagnostic
+with summary `apply aborted`, addressed to the failing resource. Its multi-line
+detail names the failing address and action, lists each completed change saved
+before the failure, lists every later change that was not attempted, and says
+to run `tchori plan` again. Empty lists are explicit: `nothing was applied ...`
+for a first-change failure and `no further changes were pending; nothing was
+left unattempted` for a last-change failure.
+
+Saved changes distinguish `recorded in state` from `removed from state`. The
+latter matters for a replace whose destroy leg succeeded and whose create leg
+failed: the resource is absent from durable state, rather than untouched or
+successfully replaced. Apply's durable incomplete marker also advances the
+state serial on a failed run, including a first-change failure. A saved plan
+therefore no longer matches `state.json`; run `tchori plan` before the next
+apply. The `apply aborted` warning is emitted once per failed execution loop;
+stale-plan, configuration-ordering, and configuration-drift refusals happen
+before that loop and do not emit it.
+
+When an update reaches `ApplyResourceChange` and the provider rejects it,
+tchori also emits one warning-severity diagnostic with summary `attempted
+change`, at the same resource address. Its detail lists the changed attribute
+paths as `path: before -> after`, using the prior state and the resolved planned
+value actually handed to the provider. Object and map paths are listed
+individually; ordered collections and sets are rendered at their container
+path. Unknowns and null transitions are explicit. Creates, replace create
+legs, and updates with no value difference have no before/after list and do
+not emit this warning.
+
+Both sides of every attempted-change entry use the same fail-closed schema
+redaction as the consistency diagnostic described above. A sensitive attribute
+renders `(sensitive value) -> (sensitive value)`. A nested block rendered as a
+whole is redacted when any descendant is sensitive, and an unresolvable schema
+path is redacted rather than exposed.
+
+An `api error (status <code>)` diagnostic is provider text describing a
+provider/API-side rejection. Tchori preserves that text, attributes it, and
+adds the surrounding abort and attempted-value accounting; it does not build,
+inspect, or repair the HTTP payload constructed inside a third-party provider.
+Because both additions are warnings, they never change `HasErrors()` or the
+[exit-code contract](#exit-code-contract): the original provider error still
+makes apply exit `1`.
+
 ## Sensitivity
 
 Tchori derives sensitive paths from provider schema `Sensitive` flags plus a
@@ -528,6 +639,8 @@ legacy plaintext remains on disk until a changed apply/import or manual purge.
 If plaintext was previously committed, rotate the credential and purge
 `state.json`, `state.json.backup`, and repository history.
 
-The consistency diagnostic follows the same schema sensitivity rules and never
-prints sensitive values. Provider `private` blobs remain opaque and are not
-inspected; providers must not rely on tchori to redact secrets stored there.
+The consistency diagnostic and the
+[`attempted change`](#partial-apply-and-abort-accounting) diagnostic follow the
+same schema sensitivity rules and never print sensitive values. Provider
+`private` blobs remain opaque and are not inspected; providers must not rely on
+tchori to redact secrets stored there.

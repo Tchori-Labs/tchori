@@ -17,7 +17,7 @@ func (ex *executor) composeConfig(addr string, ty cty.Type) (cty.Value, diag.Dia
 		return cty.NilVal, diag.Diagnostics{diag.Errorf(addr, "resource missing from configuration",
 			"the planned change address is not in the loaded configuration")}
 	}
-	value, ds := provider.Compose(ex.cfg.Resources[addr].Config, ty, false, ex.resolveRef)
+	value, ds := provider.Compose(ex.cfg.Resources[addr].Config, ty, provider.EnvResolve, ex.resolveRef)
 	for i := range ds {
 		if ds[i].Summary == "unresolved reference" && ds[i].Address == "" {
 			ds[i].Address = addr

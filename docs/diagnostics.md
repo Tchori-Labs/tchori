@@ -28,7 +28,8 @@ The fields are:
 
 A command can emit more than one object. Consumers should parse stderr one
 JSON diagnostic line at a time rather than treating the stream as one JSON
-array.
+array. Failed apply runs also emit the warning-severity
+[`apply aborted` and `attempted change` accounting](formats.md#partial-apply-and-abort-accounting).
 
 ## Pretty mode
 

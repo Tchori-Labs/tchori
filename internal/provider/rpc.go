@@ -2,13 +2,12 @@
 // ValidateResource / PlanResource / ApplyResource / ReadResource) directly
 // over the generated tfplugin6 gRPC stubs.
 //
-// Encoding invariant: every cty.Value passed to these methods is already at
-// the relevant schema implied type (provider config at the provider block's
-// ImpliedType, resource values at the resource type's ImpliedType — composed
-// by Compose or decoded from state; create/delete nulls are
-// cty.NullVal(impliedType)). Therefore v.Type() IS that implied type and
-// EncodeDynamic(v, v.Type()) encodes at the schema type as the protocol
-// requires. Responses decode at the matching request types.
+// Encoding invariant: every request and response cty.Value is at the relevant
+// schema's deeply marker-free ImpliedType (provider config at the provider
+// block type; resource values at the resource type). Optional-attribute
+// markers remain schema conversion targets only and never enter RPC values
+// (issue #50). Therefore v.Type() is the protocol encoding type; all response
+// decoding goes through the guarded DecodeDynamic boundary.
 package provider
 
 import (
@@ -224,7 +223,7 @@ func encodeRPCValue(v cty.Value, what string) (*tfplugin6.DynamicValue, diag.Dia
 // (a provider omitting the field) decodes to a null value of ty.
 func decodeRPCState(dv *tfplugin6.DynamicValue, ty cty.Type, what string) (cty.Value, diag.Diagnostics) {
 	if dv == nil {
-		return cty.NullVal(ty), nil
+		return cty.NullVal(ty.WithoutOptionalAttributesDeep()), nil
 	}
 	v, err := DecodeDynamic(dv, ty)
 	if err != nil {

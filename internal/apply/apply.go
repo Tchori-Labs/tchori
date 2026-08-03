@@ -29,7 +29,6 @@ import (
 
 	"github.com/zclconf/go-cty/cty"
 	ctyjson "github.com/zclconf/go-cty/cty/json"
-	ctymsgpack "github.com/zclconf/go-cty/cty/msgpack"
 
 	"github.com/tchori-labs/tchori/internal/config"
 	"github.com/tchori-labs/tchori/internal/diag"
@@ -207,6 +206,7 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 		step := ex.applyChange(ctx, ch)
 		ds = append(ds, step...)
 		if step.HasErrors() {
+			ds = append(ds, abortSummary(ex.statePath, ex.mutations, ch, ordered[i+1:])...)
 			// The per-change save happens inside applyChange, before this loop can
 			// advance the split. This final save is therefore authoritative.
 			st.Incomplete.FailedAddress = ch.Address
@@ -252,6 +252,7 @@ type executor struct {
 	st        *state.State
 	statePath string
 	applied   map[string]cty.Value // full in-process values for same-run references
+	mutations []stateMutation
 	saveCount int
 }
 
@@ -340,7 +341,7 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	var priorPrivate []byte
 	if ch.Action != "create" {
 		if rs := ex.st.Resources[addr]; rs != nil {
-			v, err := ctyjson.Unmarshal(rs.Attributes, ty)
+			v, err := provider.DecodeJSON(rs.Attributes, ty)
 			if err != nil {
 				return diag.Diagnostics{diag.Errorf(addr, "corrupt state attributes", err.Error())}
 			}
@@ -350,7 +351,7 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	}
 
 	if ch.Action == "delete" {
-		return ex.destroy(ctx, client, typeName, addr, ty, prior, priorPrivate)
+		return ex.destroy(ctx, client, typeName, addr, ch.Action, ty, prior, priorPrivate)
 	}
 
 	// Compose before selecting create/update/replace so an unresolved value
@@ -367,7 +368,7 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 		// Destroy-then-create: two explicit ApplyResource calls. The state
 		// entry is removed (and saved) after the destroy leg, then written
 		// back (and saved) after the create leg.
-		destroyDs := ex.destroy(ctx, client, typeName, addr, ty, prior, priorPrivate)
+		destroyDs := ex.destroy(ctx, client, typeName, addr, ch.Action, ty, prior, priorPrivate)
 		ds = append(ds, destroyDs...)
 		if destroyDs.HasErrors() {
 			return ds
@@ -380,7 +381,7 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 
 // destroy applies a null planned value — the plugin-protocol convention for
 // "destroy this object" — then removes the resource from state and saves.
-func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeName, addr string, ty cty.Type, prior cty.Value, priorPrivate []byte) diag.Diagnostics {
+func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeName, addr, action string, ty cty.Type, prior cty.Value, priorPrivate []byte) diag.Diagnostics {
 	newState, _, ds := client.ApplyResource(ctx, typeName, prior, cty.NullVal(ty), cty.NullVal(ty), priorPrivate)
 	ds = provider.Context(addr, ds)
 	if ds.HasErrors() {
@@ -394,6 +395,7 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 	if err := ex.save(); err != nil {
 		return append(ds, diag.Errorf(addr, "saving state", err.Error()))
 	}
+	ex.mutations = append(ex.mutations, stateMutation{addr: addr, action: action, removed: true})
 	return append(ds, unresolvedWarnings(ex.st)...)
 }
 
@@ -403,7 +405,7 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 // records the provider's returned state and saves. cfgVal was composed by
 // applyChange before any replace destroy leg.
 func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, addr string, block *provider.SchemaBlock, ty cty.Type, prior, cfgVal cty.Value, ch *plan.Change) diag.Diagnostics {
-	planned, err := ctymsgpack.Unmarshal(ch.PlannedRaw, ty)
+	planned, err := provider.DecodeMsgpack(ch.PlannedRaw, ty)
 	if err != nil {
 		return diag.Diagnostics{diag.Errorf(addr, "corrupt planned value", err.Error())}
 	}
@@ -432,6 +434,9 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	newState, newPrivate, applyDs := client.ApplyResource(ctx, typeName, prior, planned, cfgVal, ch.Private)
 	applyDs = provider.Context(addr, applyDs)
 	ds = append(ds, applyDs...)
+	if applyDs.HasErrors() {
+		return append(ds, attemptedChangeSummary(addr, ch.Action, block, prior, planned)...)
+	}
 	if ds.HasErrors() {
 		return ds
 	}
@@ -478,6 +483,7 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	if err := ex.save(); err != nil {
 		return append(ds, diag.Errorf(addr, "saving state", err.Error()))
 	}
+	ex.mutations = append(ex.mutations, stateMutation{addr: addr, action: ch.Action})
 	ds = append(ds, unresolvedWarnings(ex.st)...)
 	return append(ds, consistencyDs...)
 }
@@ -669,7 +675,7 @@ func (ex *executor) resolveRef(ref config.Ref) (cty.Value, diag.Diagnostics) {
 		return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address,
 			fmt.Sprintf("unsupported schema for resource type %q", rs.Type), unsupported)}
 	}
-	v, err := ctyjson.Unmarshal(rs.Attributes, schema.Block.ImpliedType())
+	v, err := provider.DecodeJSON(rs.Attributes, schema.Block.ImpliedType())
 	if err != nil {
 		return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address, "corrupt state attributes", err.Error())}
 	}
