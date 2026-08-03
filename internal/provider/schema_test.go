@@ -143,11 +143,40 @@ func TestBlockFromProtoNestedType(t *testing.T) {
 	}
 }
 
+func TestSchemaBlockImpliedTypeStripsOptionalMarkersDeeply(t *testing.T) {
+	inner := cty.ObjectWithOptionalAttrs(map[string]cty.Type{"flag": cty.Bool}, []string{"flag"})
+	block := &SchemaBlock{
+		Attributes: map[string]*Attr{
+			"single": {Type: inner, Optional: true},
+			"list":   {Type: cty.List(inner), Optional: true},
+			"set":    {Type: cty.Set(inner), Optional: true},
+			"map":    {Type: cty.Map(inner), Optional: true},
+		},
+		Blocks: map[string]*NestedBlock{},
+	}
+	got := block.ImpliedType()
+	wantInner := cty.Object(map[string]cty.Type{"flag": cty.Bool})
+	want := cty.Object(map[string]cty.Type{
+		"single": wantInner,
+		"list":   cty.List(wantInner),
+		"set":    cty.Set(wantInner),
+		"map":    cty.Map(wantInner),
+	})
+	if !got.Equals(want) || !got.Equals(got.WithoutOptionalAttributesDeep()) {
+		t.Fatalf("ImpliedType = %#v, want marker-free %#v", got, want)
+	}
+	for name, attr := range block.Attributes {
+		if attr.Type.Equals(attr.Type.WithoutOptionalAttributesDeep()) {
+			t.Errorf("Attr.Type %q lost its optional marker: %#v", name, attr.Type)
+		}
+	}
+}
+
 // TestBlockFromProtoNestedTypeOmittedComposesToNull confirms the concrete
 // acceptance shape from issue #7: a config that leaves a nested_type
 // attribute entirely unset must compose to a null value of that attribute's
-// converted type, and Compose must accept it without error (the whole point
-// of marking non-required nested attributes optional).
+// converted value type, and Compose must accept it without error. Attr.Type
+// remains marked for conversion, but composed values are always marker-free.
 func TestBlockFromProtoNestedTypeOmittedComposesToNull(t *testing.T) {
 	block, err := blockFromProto(&tfplugin6.Schema_Block{
 		Attributes: []*tfplugin6.Schema_Attribute{
@@ -177,7 +206,7 @@ func TestBlockFromProtoNestedTypeOmittedComposesToNull(t *testing.T) {
 	if !settings.IsNull() {
 		t.Errorf("settings = %#v, want null (omitted from config)", settings)
 	}
-	wantSettingsType := cty.ObjectWithOptionalAttrs(map[string]cty.Type{"flag": cty.Bool}, []string{"flag"})
+	wantSettingsType := cty.Object(map[string]cty.Type{"flag": cty.Bool})
 	if !settings.Type().Equals(wantSettingsType) {
 		t.Errorf("settings null value type = %#v, want %#v", settings.Type(), wantSettingsType)
 	}

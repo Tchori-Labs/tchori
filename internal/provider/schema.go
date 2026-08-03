@@ -72,10 +72,11 @@ func (ps *ProviderSchemas) LookupResourceType(typeName string) (schema *Schema, 
 	return nil, "", false
 }
 
-// ImpliedType returns the cty object type a value of this block must
-// conform to: one attribute per schema attribute plus one per nested block
-// (single = object, list = list(object), set = set(object),
-// map = map(object)).
+// ImpliedType returns the marker-free cty object type of engine values for
+// this block. Attr.Type may contain optional-attribute markers because it is a
+// conversion target, but markers are part of cty type identity and must never
+// enter constructed, decoded, or stored values (issue #50). Terraform's
+// configschema.Block.ImpliedType applies the same deep normalization.
 func (b *SchemaBlock) ImpliedType() cty.Type {
 	atys := make(map[string]cty.Type, len(b.Attributes)+len(b.Blocks))
 	for name, a := range b.Attributes {
@@ -94,7 +95,7 @@ func (b *SchemaBlock) ImpliedType() cty.Type {
 			atys[name] = cty.Map(inner)
 		}
 	}
-	return cty.Object(atys)
+	return cty.Object(atys).WithoutOptionalAttributesDeep()
 }
 
 // Schemas returns the provider's schemas, calling GetProviderSchema on the
@@ -236,7 +237,9 @@ func attrTypeFromProto(pa *tfplugin6.Schema_Attribute) (cty.Type, error) {
 // fills the missing key with cty.NullVal of the attribute's type either
 // way) and a source value with fewer attributes convert cleanly wherever a
 // nested value flows through cty/convert (e.g. resolving a ${ref} into a
-// nested attribute).
+// nested attribute). ImpliedType deliberately strips these markers before a
+// type is used for a value: marker-bearing null and concrete object values
+// cannot coexist in cty collections and caused issue #50.
 //
 // A nesting mode this function does not recognize (i.e. not
 // SINGLE/LIST/SET/MAP) is a genuinely unconvertible schema: the caller

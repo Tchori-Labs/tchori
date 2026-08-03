@@ -984,3 +984,27 @@ func TestPlanServerAssignedUpdateKeepsComputedValues(t *testing.T) {
 		}
 	}
 }
+
+func TestPlanRefreshMixedOptionalNestedObjects(t *testing.T) {
+	const attrs = `{"id":"id-demo","name":"demo","ingress":[{"service":"http://one","origin_request":null},{"service":"http://two","origin_request":{"connect_timeout":null,"no_tls_verify":null}}]}`
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_ingress_thing.demo": {
+			"name": "demo",
+			"ingress": []any{
+				map[string]any{"service": "http://one"},
+				map[string]any{"service": "http://two", "origin_request": map[string]any{}},
+			},
+		},
+	})
+	st := stateWith(t, 1, map[string]string{"tchoritest_ingress_thing.demo": attrs})
+	p := newPlanner(t, cfg, st)
+	p.Refresh = true
+
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+	if pl == nil {
+		t.Fatal("Plan returned nil without diagnostics")
+	}
+}

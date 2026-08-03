@@ -26,28 +26,57 @@ import (
 // msgpack: it is the only encoding in the protocol that can carry unknown
 // values (cty/msgpack encodes them as a msgpack extension).
 func EncodeDynamic(v cty.Value, ty cty.Type) (*tfplugin6.DynamicValue, error) {
-	b, err := msgpack.Marshal(v, ty)
+	b, err := msgpack.Marshal(v, ty.WithoutOptionalAttributesDeep())
 	if err != nil {
 		return nil, fmt.Errorf("msgpack encode: %w", err)
 	}
 	return &tfplugin6.DynamicValue{Msgpack: b}, nil
 }
 
+// DecodeMsgpack decodes msgpack at a deeply marker-free value type. The cty
+// decoder can panic while aggregating malformed heterogeneous collections;
+// issue #50 requires that provider data instead become an ordinary error.
+func DecodeMsgpack(b []byte, ty cty.Type) (v cty.Value, err error) {
+	ty = ty.WithoutOptionalAttributesDeep()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			v = cty.NilVal
+			err = fmt.Errorf("cty panic decoding %s: %v", ty.FriendlyName(), recovered)
+		}
+	}()
+	return msgpack.Unmarshal(b, ty)
+}
+
+// DecodeJSON decodes cty JSON at a deeply marker-free value type. As with
+// DecodeMsgpack, residual cty panics from malformed data are recovered and
+// returned as errors rather than crashing plan or apply (issue #50).
+func DecodeJSON(b []byte, ty cty.Type) (v cty.Value, err error) {
+	ty = ty.WithoutOptionalAttributesDeep()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			v = cty.NilVal
+			err = fmt.Errorf("cty panic decoding %s: %v", ty.FriendlyName(), recovered)
+		}
+	}()
+	return ctyjson.Unmarshal(b, ty)
+}
+
 // DecodeDynamic decodes a protocol DynamicValue as ty. Msgpack is preferred;
 // Json is accepted as a fallback for providers that answer in JSON. A nil or
 // empty DynamicValue decodes to a null value of ty.
 func DecodeDynamic(dv *tfplugin6.DynamicValue, ty cty.Type) (cty.Value, error) {
+	ty = ty.WithoutOptionalAttributesDeep()
 	switch {
 	case dv == nil:
 		return cty.NullVal(ty), nil
 	case len(dv.Msgpack) > 0:
-		v, err := msgpack.Unmarshal(dv.Msgpack, ty)
+		v, err := DecodeMsgpack(dv.Msgpack, ty)
 		if err != nil {
 			return cty.NilVal, fmt.Errorf("msgpack decode: %w", err)
 		}
 		return v, nil
 	case len(dv.Json) > 0:
-		v, err := ctyjson.Unmarshal(dv.Json, ty)
+		v, err := DecodeJSON(dv.Json, ty)
 		if err != nil {
 			return cty.NilVal, fmt.Errorf("json decode: %w", err)
 		}
@@ -83,6 +112,7 @@ const (
 // only because Compose has no resource address in scope. Values returned by
 // providers are not composed or scanned here.
 func Compose(raw map[string]any, ty cty.Type, env EnvPolicy, resolve RefResolver) (cty.Value, diag.Diagnostics) {
+	ty = ty.WithoutOptionalAttributesDeep()
 	if !ty.IsObjectType() {
 		return cty.NilVal, diag.Diagnostics{diag.Errorf("", "internal error: Compose requires an object type", "got "+ty.FriendlyName())}
 	}

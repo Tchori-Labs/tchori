@@ -260,6 +260,11 @@ resource's `attributes` in `state.json`, just like any other concrete configured
 value. Values at sensitive paths follow the normal state redaction rules; treat
 unmarked state values as sensitive.
 
+`attributes` is encoded at the resource schema's deeply marker-free implied
+cty type. Optional-attribute markers belong only to schema conversion targets;
+they are never part of a value type constructed, decoded, or persisted by the
+engine.
+
 ### Serial semantics
 
 - `state.Load` on a missing path returns a fresh, empty state:

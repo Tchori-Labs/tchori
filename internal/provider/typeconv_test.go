@@ -7,7 +7,10 @@ import (
 	"strings"
 	"testing"
 
+	vmmsgpack "github.com/vmihailenco/msgpack/v5"
 	"github.com/zclconf/go-cty/cty"
+	ctyjson "github.com/zclconf/go-cty/cty/json"
+	ctymsgpack "github.com/zclconf/go-cty/cty/msgpack"
 
 	"github.com/tchori-labs/tchori/internal/config"
 	"github.com/tchori-labs/tchori/internal/diag"
@@ -58,6 +61,143 @@ func TestDecodeDynamicJSONFallback(t *testing.T) {
 	want := cty.ObjectVal(map[string]cty.Value{"name": cty.StringVal("web")})
 	if !got.RawEquals(want) {
 		t.Fatalf("DecodeDynamic(json) = %#v, want %#v", got, want)
+	}
+}
+
+func mixedIngressTypes() (marked, concrete cty.Type, value cty.Value) {
+	originMarked := cty.ObjectWithOptionalAttrs(map[string]cty.Type{
+		"connect_timeout": cty.String,
+		"no_tls_verify":   cty.Bool,
+	}, []string{"connect_timeout", "no_tls_verify"})
+	elemMarked := cty.ObjectWithOptionalAttrs(map[string]cty.Type{
+		"service":        cty.String,
+		"origin_request": originMarked,
+	}, []string{"service", "origin_request"})
+	marked = cty.List(elemMarked)
+	concrete = marked.WithoutOptionalAttributesDeep()
+	originConcrete := originMarked.WithoutOptionalAttributesDeep()
+	elemConcrete := elemMarked.WithoutOptionalAttributesDeep()
+	value = cty.ListVal([]cty.Value{
+		cty.ObjectVal(map[string]cty.Value{
+			"service":        cty.StringVal("http://one"),
+			"origin_request": cty.NullVal(originConcrete),
+		}),
+		cty.ObjectVal(map[string]cty.Value{
+			"service": cty.StringVal("http://two"),
+			"origin_request": cty.ObjectVal(map[string]cty.Value{
+				"connect_timeout": cty.NullVal(cty.String),
+				"no_tls_verify":   cty.NullVal(cty.Bool),
+			}),
+		}),
+	})
+	if !value.Type().Equals(concrete) || !value.Type().ElementType().Equals(elemConcrete) {
+		panic("invalid mixed ingress test fixture")
+	}
+	return marked, concrete, value
+}
+
+func TestDecodeDynamicMixedOptionalNestedObject(t *testing.T) {
+	marked, wantType, want := mixedIngressTypes()
+	msgpackBytes, err := ctymsgpack.Marshal(want, wantType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jsonBytes, err := ctyjson.Marshal(want, wantType)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, dv := range map[string]*tfplugin6.DynamicValue{
+		"msgpack": {Msgpack: msgpackBytes},
+		"json":    {Json: jsonBytes},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := DecodeDynamic(dv, marked)
+			if err != nil {
+				t.Fatalf("DecodeDynamic: %v", err)
+			}
+			if !got.Type().Equals(wantType) || !got.Type().Equals(got.Type().WithoutOptionalAttributesDeep()) {
+				t.Fatalf("decoded type = %#v, want marker-free %#v", got.Type(), wantType)
+			}
+			if !got.RawEquals(want) {
+				t.Fatalf("decoded value = %#v, want %#v", got, want)
+			}
+			if !got.Index(cty.NumberIntVal(0)).GetAttr("origin_request").IsNull() {
+				t.Error("element 0 origin_request must remain null")
+			}
+			if got.Index(cty.NumberIntVal(1)).GetAttr("origin_request").IsNull() {
+				t.Error("element 1 origin_request must remain populated")
+			}
+		})
+	}
+}
+
+func TestDecodeDynamicOptionalNestedObjectShapes(t *testing.T) {
+	marked, concrete, mixed := mixedIngressTypes()
+	originType := concrete.ElementType().AttributeType("origin_request")
+	elem := func(service string, origin cty.Value) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{
+			"service": cty.StringVal(service), "origin_request": origin,
+		})
+	}
+	populated := cty.ObjectVal(map[string]cty.Value{
+		"connect_timeout": cty.NullVal(cty.String), "no_tls_verify": cty.NullVal(cty.Bool),
+	})
+	cases := map[string]cty.Value{
+		"all-null": cty.ListVal([]cty.Value{
+			elem("one", cty.NullVal(originType)), elem("two", cty.NullVal(originType)),
+		}),
+		"all-populated": cty.ListVal([]cty.Value{
+			elem("one", populated), elem("two", populated),
+		}),
+		"mixed": mixed,
+		"empty": cty.ListValEmpty(concrete.ElementType()),
+		"null":  cty.NullVal(concrete),
+	}
+	for shape, want := range cases {
+		for _, encoding := range []string{"msgpack", "json"} {
+			t.Run(shape+"/"+encoding, func(t *testing.T) {
+				dv := &tfplugin6.DynamicValue{}
+				var err error
+				if encoding == "msgpack" {
+					dv.Msgpack, err = ctymsgpack.Marshal(want, concrete)
+				} else {
+					dv.Json, err = ctyjson.Marshal(want, concrete)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := DecodeDynamic(dv, marked)
+				if err != nil {
+					t.Fatalf("DecodeDynamic: %v", err)
+				}
+				if !got.Type().Equals(concrete) || !got.RawEquals(want) {
+					t.Fatalf("got %#v (%#v), want %#v (%#v)", got, got.Type(), want, concrete)
+				}
+			})
+		}
+	}
+}
+
+func TestDecodeDynamicDegenerateObjectReturnsDiagnostic(t *testing.T) {
+	marked, _, _ := mixedIngressTypes()
+	payload, err := vmmsgpack.Marshal([]any{
+		map[string]any{"service": "one", "origin_request": map[string]any{}},
+		map[string]any{"service": "two", "origin_request": map[string]any{"connect_timeout": nil, "no_tls_verify": nil}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dv := &tfplugin6.DynamicValue{Msgpack: payload}
+	if _, err := DecodeDynamic(dv, marked); err == nil {
+		t.Fatal("DecodeDynamic succeeded for a degenerate object, want error")
+	}
+	_, ds := decodeRPCState(dv, marked, "resource tchoritest_ingress_thing.demo state")
+	if !ds.HasErrors() {
+		t.Fatal("decodeRPCState returned no error diagnostic")
+	}
+	if !strings.Contains(ds[0].Summary+ds[0].Detail, "tchoritest_ingress_thing.demo") {
+		t.Fatalf("diagnostic does not name decoded value: %+v", ds)
 	}
 }
 
@@ -588,6 +728,23 @@ func TestComposeUnexpectedAttribute(t *testing.T) {
 	}
 	if want := `unexpected attribute "nope"`; diags[0].Summary != want {
 		t.Errorf("summary = %q, want %q", diags[0].Summary, want)
+	}
+}
+
+func TestComposeMixedOptionalNestedObject(t *testing.T) {
+	marked, wantType, want := mixedIngressTypes()
+	raw := map[string]any{"ingress": []any{
+		map[string]any{"service": "http://one"},
+		map[string]any{"service": "http://two", "origin_request": map[string]any{}},
+	}}
+	rootMarked := cty.Object(map[string]cty.Type{"ingress": marked})
+	got, ds := Compose(raw, rootMarked, EnvResolve, nil)
+	if ds.HasErrors() {
+		t.Fatalf("Compose: %+v", ds)
+	}
+	got = got.GetAttr("ingress")
+	if !got.Type().Equals(wantType) || !got.RawEquals(want) {
+		t.Fatalf("Compose ingress = %#v (%#v), want %#v (%#v)", got, got.Type(), want, wantType)
 	}
 }
 

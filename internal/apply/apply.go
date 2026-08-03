@@ -29,7 +29,6 @@ import (
 
 	"github.com/zclconf/go-cty/cty"
 	ctyjson "github.com/zclconf/go-cty/cty/json"
-	ctymsgpack "github.com/zclconf/go-cty/cty/msgpack"
 
 	"github.com/tchori-labs/tchori/internal/config"
 	"github.com/tchori-labs/tchori/internal/diag"
@@ -342,7 +341,7 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	var priorPrivate []byte
 	if ch.Action != "create" {
 		if rs := ex.st.Resources[addr]; rs != nil {
-			v, err := ctyjson.Unmarshal(rs.Attributes, ty)
+			v, err := provider.DecodeJSON(rs.Attributes, ty)
 			if err != nil {
 				return diag.Diagnostics{diag.Errorf(addr, "corrupt state attributes", err.Error())}
 			}
@@ -406,7 +405,7 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 // records the provider's returned state and saves. cfgVal was composed by
 // applyChange before any replace destroy leg.
 func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, addr string, block *provider.SchemaBlock, ty cty.Type, prior, cfgVal cty.Value, ch *plan.Change) diag.Diagnostics {
-	planned, err := ctymsgpack.Unmarshal(ch.PlannedRaw, ty)
+	planned, err := provider.DecodeMsgpack(ch.PlannedRaw, ty)
 	if err != nil {
 		return diag.Diagnostics{diag.Errorf(addr, "corrupt planned value", err.Error())}
 	}
@@ -676,7 +675,7 @@ func (ex *executor) resolveRef(ref config.Ref) (cty.Value, diag.Diagnostics) {
 		return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address,
 			fmt.Sprintf("unsupported schema for resource type %q", rs.Type), unsupported)}
 	}
-	v, err := ctyjson.Unmarshal(rs.Attributes, schema.Block.ImpliedType())
+	v, err := provider.DecodeJSON(rs.Attributes, schema.Block.ImpliedType())
 	if err != nil {
 		return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address, "corrupt state attributes", err.Error())}
 	}

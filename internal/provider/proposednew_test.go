@@ -378,3 +378,43 @@ func TestProposedNewEmptyNestedCollections(t *testing.T) {
 		})
 	}
 }
+
+func TestProposedNewListNormalizesMissingPriorElementType(t *testing.T) {
+	markedSettings := cty.ObjectWithOptionalAttrs(
+		map[string]cty.Type{"flag": cty.Bool}, []string{"flag"})
+	inner := &SchemaBlock{
+		Attributes: map[string]*Attr{
+			"settings": {Type: markedSettings, Computed: true},
+		},
+		Blocks: map[string]*NestedBlock{},
+	}
+	block := &SchemaBlock{
+		Attributes: map[string]*Attr{},
+		Blocks: map[string]*NestedBlock{
+			"entry": {Nesting: "list", Block: inner},
+		},
+	}
+	concreteSettings := markedSettings.WithoutOptionalAttributesDeep()
+	concrete := cty.ObjectVal(map[string]cty.Value{"flag": cty.True})
+	prior := cty.ObjectVal(map[string]cty.Value{
+		"entry": cty.ListVal([]cty.Value{
+			cty.ObjectVal(map[string]cty.Value{"settings": concrete}),
+		}),
+	})
+	configElem := cty.ObjectVal(map[string]cty.Value{"settings": cty.NullVal(concreteSettings)})
+	config := cty.ObjectVal(map[string]cty.Value{
+		"entry": cty.ListVal([]cty.Value{configElem, configElem}),
+	})
+
+	got := ProposedNew(block, prior, config).GetAttr("entry")
+	wantType := cty.List(cty.Object(map[string]cty.Type{"settings": concreteSettings}))
+	if !got.Type().Equals(wantType) {
+		t.Fatalf("ProposedNew list type = %#v, want %#v", got.Type(), wantType)
+	}
+	if got.Index(cty.NumberIntVal(0)).GetAttr("settings").IsNull() {
+		t.Error("first element did not carry its computed prior value")
+	}
+	if !got.Index(cty.NumberIntVal(1)).GetAttr("settings").IsNull() {
+		t.Error("second element without prior must remain null")
+	}
+}

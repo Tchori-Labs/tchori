@@ -103,7 +103,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		var priorPrivate []byte
 		rs, hasPrior := p.State.Resources[addr]
 		if hasPrior {
-			pv, err := ctyjson.Unmarshal(rs.Attributes, ty)
+			pv, err := provider.DecodeJSON(rs.Attributes, ty)
 			if err != nil {
 				ds = append(ds, diag.Errorf(addr, "invalid state attributes", err.Error()))
 				return nil, ds

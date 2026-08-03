@@ -43,7 +43,10 @@ func ProposedNew(block *SchemaBlock, prior, config cty.Value) cty.Value {
 
 	for name, attr := range block.Attributes {
 		configV := config.GetAttr(name)
-		priorV := cty.NullVal(attr.Type)
+		// Attr.Type can carry conversion-only optional markers. A marked null
+		// mixed with a concrete sibling makes cty collection construction panic
+		// (issue #50), so proposed values always use the marker-free type.
+		priorV := cty.NullVal(attr.Type.WithoutOptionalAttributesDeep())
 		if !prior.IsNull() {
 			priorV = prior.GetAttr(name)
 		}

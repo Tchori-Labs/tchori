@@ -154,6 +154,19 @@ func nestedThing(addrName, cfgName string, settings map[string]any) *config.Reso
 	}
 }
 
+func ingressThing(addrName, cfgName string, ingress []any) *config.Resource {
+	return &config.Resource{
+		Address:  "tchoritest_ingress_thing." + addrName,
+		Type:     "tchoritest_ingress_thing",
+		Name:     addrName,
+		Provider: "tchoritest",
+		Config: map[string]any{
+			"name":    cfgName,
+			"ingress": ingress,
+		},
+	}
+}
+
 // brokenThing returns a tchoritest_broken_thing resource: a resource type
 // whose schema tchori cannot convert (nested_type attribute using a nesting
 // mode blockFromProto does not recognize — see testprovider's
@@ -1303,6 +1316,39 @@ func TestApplyCreateNestedTypePopulated(t *testing.T) {
 	}
 	if got := settings["label"]; got != "hello" {
 		t.Errorf(`saved settings["label"] = %v, want "hello"`, got)
+	}
+}
+
+func TestApplyMixedOptionalNestedObjects(t *testing.T) {
+	ingress := []any{
+		map[string]any{"service": "http://one"},
+		map[string]any{"service": "http://two", "origin_request": map[string]any{}},
+	}
+	h := newHarness(t, map[string]*config.Resource{
+		"tchoritest_ingress_thing.demo": ingressThing("demo", "renamed", ingress),
+	})
+	const attrs = `{"id":"id-demo","name":"demo","ingress":[{"service":"http://one","origin_request":null},{"service":"http://two","origin_request":{"connect_timeout":null,"no_tls_verify":null}}]}`
+	st := &state.State{FormatVersion: "1.0", Serial: 1, Resources: map[string]*state.ResourceState{
+		"tchoritest_ingress_thing.demo": {
+			Type:       "tchoritest_ingress_thing",
+			Provider:   "tchoritest",
+			Attributes: json.RawMessage(attrs),
+		},
+	}}
+	pl := h.plan(t, st, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "update" || len(pl.Changes[0].PlannedRaw) == 0 {
+		t.Fatalf("plan = %+v, want one update with PlannedRaw", pl.Changes)
+	}
+	if ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("Apply: %+v", ds)
+	}
+	got := stateAttrs(t, h.statePath, "tchoritest_ingress_thing.demo")
+	if got["name"] != "renamed" {
+		t.Fatalf("saved name = %v, want renamed", got["name"])
+	}
+	items, ok := got["ingress"].([]any)
+	if !ok || len(items) != 2 {
+		t.Fatalf("saved ingress = %#v, want two elements", got["ingress"])
 	}
 }
 

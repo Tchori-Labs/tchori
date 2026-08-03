@@ -121,6 +121,62 @@ var nestedThingSchema = &tfprotov6.Schema{
 	},
 }
 
+// ingressThingType and ingressThingSchema reproduce issue #50 / TC-055: one
+// ingress list element may leave origin_request null while a sibling supplies
+// it. Plan and apply pass ingress through unchanged and mint only id.
+var ingressOriginRequestType = tftypes.Object{
+	AttributeTypes: map[string]tftypes.Type{
+		"connect_timeout": tftypes.String,
+		"no_tls_verify":   tftypes.Bool,
+	},
+}
+
+var ingressElementType = tftypes.Object{
+	AttributeTypes: map[string]tftypes.Type{
+		"service":        tftypes.String,
+		"origin_request": ingressOriginRequestType,
+	},
+}
+
+var ingressThingType = tftypes.Object{
+	AttributeTypes: map[string]tftypes.Type{
+		"id":      tftypes.String,
+		"name":    tftypes.String,
+		"ingress": tftypes.List{ElementType: ingressElementType},
+	},
+}
+
+var ingressThingSchema = &tfprotov6.Schema{
+	Version: 0,
+	Block: &tfprotov6.SchemaBlock{
+		Attributes: []*tfprotov6.SchemaAttribute{
+			{Name: "id", Type: tftypes.String, Computed: true},
+			{Name: "name", Type: tftypes.String, Required: true},
+			{
+				Name:     "ingress",
+				Optional: true,
+				NestedType: &tfprotov6.SchemaObject{
+					Nesting: tfprotov6.SchemaObjectNestingModeList,
+					Attributes: []*tfprotov6.SchemaAttribute{
+						{Name: "service", Type: tftypes.String, Optional: true},
+						{
+							Name:     "origin_request",
+							Optional: true,
+							NestedType: &tfprotov6.SchemaObject{
+								Nesting: tfprotov6.SchemaObjectNestingModeSingle,
+								Attributes: []*tfprotov6.SchemaAttribute{
+									{Name: "connect_timeout", Type: tftypes.String, Optional: true},
+									{Name: "no_tls_verify", Type: tftypes.Bool, Optional: true},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
 // serverAssignedType is the wire shape of tchoritest_server_assigned.
 var serverAssignedType = tftypes.Object{
 	AttributeTypes: map[string]tftypes.Type{
@@ -221,7 +277,7 @@ var _ tfprotov6.ProviderServer = (*server)(nil)
 
 func knownResourceType(typeName string) bool {
 	switch typeName {
-	case "tchoritest_thing", "tchoritest_lossy", "tchoritest_nested_thing", "tchoritest_server_assigned", "tchoritest_secretful", "tchoritest_broken_thing":
+	case "tchoritest_thing", "tchoritest_lossy", "tchoritest_nested_thing", "tchoritest_ingress_thing", "tchoritest_server_assigned", "tchoritest_secretful", "tchoritest_broken_thing":
 		return true
 	default:
 		return false
@@ -243,6 +299,7 @@ func (s *server) GetMetadata(ctx context.Context, req *tfprotov6.GetMetadataRequ
 			{TypeName: "tchoritest_thing"},
 			{TypeName: "tchoritest_lossy"},
 			{TypeName: "tchoritest_nested_thing"},
+			{TypeName: "tchoritest_ingress_thing"},
 			{TypeName: "tchoritest_server_assigned"},
 			{TypeName: "tchoritest_secretful"},
 			{TypeName: "tchoritest_broken_thing"},
@@ -257,6 +314,7 @@ func (s *server) GetProviderSchema(ctx context.Context, req *tfprotov6.GetProvid
 			"tchoritest_thing":           thingSchema,
 			"tchoritest_lossy":           lossySchema,
 			"tchoritest_nested_thing":    nestedThingSchema,
+			"tchoritest_ingress_thing":   ingressThingSchema,
 			"tchoritest_server_assigned": serverAssignedSchema,
 			"tchoritest_secretful":       secretfulSchema,
 			"tchoritest_broken_thing":    brokenThingSchema,
@@ -330,6 +388,12 @@ func (s *server) ValidateResourceConfig(ctx context.Context, req *tfprotov6.Vali
 		}
 		return &tfprotov6.ValidateResourceConfigResponse{}, nil
 	}
+	if req.TypeName == "tchoritest_ingress_thing" {
+		if _, err := req.Config.Unmarshal(ingressThingType); err != nil {
+			return nil, err
+		}
+		return &tfprotov6.ValidateResourceConfigResponse{}, nil
+	}
 	if req.TypeName == "tchoritest_server_assigned" {
 		if _, err := req.Config.Unmarshal(serverAssignedType); err != nil {
 			return nil, err
@@ -383,6 +447,8 @@ func (s *server) UpgradeResourceState(ctx context.Context, req *tfprotov6.Upgrad
 		ty = lossyType
 	case "tchoritest_nested_thing":
 		ty = nestedThingType
+	case "tchoritest_ingress_thing":
+		ty = ingressThingType
 	case "tchoritest_server_assigned":
 		ty = serverAssignedType
 	case "tchoritest_secretful":
@@ -455,6 +521,9 @@ func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanReso
 	}
 	if req.TypeName == "tchoritest_nested_thing" {
 		return s.planNestedThing(req)
+	}
+	if req.TypeName == "tchoritest_ingress_thing" {
+		return s.planIngressThing(req)
 	}
 	if req.TypeName == "tchoritest_server_assigned" {
 		return s.planServerAssigned(req)
@@ -658,6 +727,9 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 	if req.TypeName == "tchoritest_nested_thing" {
 		return s.applyNestedThing(req)
 	}
+	if req.TypeName == "tchoritest_ingress_thing" {
+		return s.applyIngressThing(req)
+	}
 	if req.TypeName == "tchoritest_server_assigned" {
 		return s.applyServerAssigned(req)
 	}
@@ -745,6 +817,39 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 		NewState: &newDV,
 		Private:  req.PlannedPrivate,
 	}, nil
+}
+
+// planIngressThing passes ingress through untouched and computes only id.
+func (s *server) planIngressThing(req *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
+	proposed, err := req.ProposedNewState.Unmarshal(ingressThingType)
+	if err != nil {
+		return nil, err
+	}
+	if proposed.IsNull() {
+		return &tfprotov6.PlanResourceChangeResponse{PlannedState: req.ProposedNewState, PlannedPrivate: req.PriorPrivate}, nil
+	}
+	prior, err := req.PriorState.Unmarshal(ingressThingType)
+	if err != nil {
+		return nil, err
+	}
+	var attrs map[string]tftypes.Value
+	if err := proposed.As(&attrs); err != nil {
+		return nil, err
+	}
+	if prior.IsNull() {
+		attrs["id"] = tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+	} else {
+		var priorAttrs map[string]tftypes.Value
+		if err := prior.As(&priorAttrs); err != nil {
+			return nil, err
+		}
+		attrs["id"] = priorAttrs["id"]
+	}
+	planned, err := tfprotov6.NewDynamicValue(ingressThingType, tftypes.NewValue(ingressThingType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.PlanResourceChangeResponse{PlannedState: &planned, PlannedPrivate: req.PriorPrivate}, nil
 }
 
 // planServerAssigned plans a tchoritest_server_assigned change the way an
@@ -861,6 +966,33 @@ func (s *server) applyNestedThing(req *tfprotov6.ApplyResourceChangeRequest) (*t
 		NewState: &newDV,
 		Private:  req.PlannedPrivate,
 	}, nil
+}
+
+// applyIngressThing passes ingress through untouched and mints only id.
+func (s *server) applyIngressThing(req *tfprotov6.ApplyResourceChangeRequest) (*tfprotov6.ApplyResourceChangeResponse, error) {
+	planned, err := req.PlannedState.Unmarshal(ingressThingType)
+	if err != nil {
+		return nil, err
+	}
+	if planned.IsNull() {
+		return &tfprotov6.ApplyResourceChangeResponse{NewState: req.PlannedState}, nil
+	}
+	var attrs map[string]tftypes.Value
+	if err := planned.As(&attrs); err != nil {
+		return nil, err
+	}
+	var name string
+	if err := attrs["name"].As(&name); err != nil {
+		return nil, err
+	}
+	if !attrs["id"].IsKnown() {
+		attrs["id"] = tftypes.NewValue(tftypes.String, s.prefix+"id-"+name)
+	}
+	newState, err := tfprotov6.NewDynamicValue(ingressThingType, tftypes.NewValue(ingressThingType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.ApplyResourceChangeResponse{NewState: &newState, Private: req.PlannedPrivate}, nil
 }
 
 // ImportResourceState adopts an existing tchoritest_thing by ID: it derives
