@@ -6,10 +6,18 @@ local protocol tests from the live public-registry smoke.
 ## Required PR suites
 
 The required `check` job runs the repository checks from `AGENTS.md`, including
-`go test ./...`. It also uses the pinned actionlint release to statically
-validate every `.yml` and `.yaml` file under `.github/workflows`; the shared
-verification script self-tests syntax and expression detection and a clean
-control before the required context can pass. The Go test run covers:
+`go test ./...`. It also cross-vets the entire workspace with
+`GOOS=windows go vet ./...`, catching POSIX-only syscalls in shared and test
+code before they reach Windows users. This class of regression has reached the
+tree twice: TC-028 in `internal/state` and TC-043 in `internal/provider`.
+
+The `internal/ci` workflow policy requires the Windows vet to remain an
+unconditional, executable command in the required `check` job; comments,
+`echo` output, command chaining, conditions, and ignored failures cannot
+satisfy the guard. The job also uses the pinned actionlint release to
+statically validate every `.yml` and `.yaml` file under `.github/workflows`;
+the shared verification script self-tests syntax and expression detection and
+a clean control before the required context can pass. The Go test run covers:
 
 - `tchori providers install` through an in-process registry fixture, including
   registry metadata, archive download, SHA256SUMS verification, cache layout,

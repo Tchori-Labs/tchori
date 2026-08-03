@@ -130,6 +130,110 @@ func TestCheckJobEnforcesRaceDetectorFixtures(t *testing.T) {
 	}
 }
 
+func TestCheckJobRunsWindowsVetLiveWorkflow(t *testing.T) {
+	if err := CheckJobRunsWindowsVet(readLiveWorkflow(t)); err != nil {
+		t.Fatalf("check live CI Windows vet enforcement: %v", err)
+	}
+}
+
+func TestCheckJobRunsWindowsVetFixtures(t *testing.T) {
+	tests := []struct {
+		name         string
+		workflowYAML string
+		wantError    string
+	}{
+		{
+			name: "Windows vet runs directly",
+			workflowYAML: `jobs:
+  check:
+    steps:
+      - run: GOOS=windows go vet ./...
+`,
+		},
+		{
+			name: "plain vet is insufficient",
+			workflowYAML: `jobs:
+  check:
+    steps:
+      - run: go vet ./...
+`,
+			wantError: "must directly run",
+		},
+		{
+			name: "Windows vet failure cannot be ignored",
+			workflowYAML: `jobs:
+  check:
+    steps:
+      - run: GOOS=windows go vet ./...
+        continue-on-error: true
+`,
+			wantError: "must not allow failures",
+		},
+		{
+			name: "conditional Windows vet is not proof",
+			workflowYAML: `jobs:
+  check:
+    steps:
+      - run: GOOS=windows go vet ./...
+        if: github.event_name == 'push'
+`,
+			wantError: "must not declare an if condition",
+		},
+		{
+			name: "check job missing",
+			workflowYAML: `jobs:
+  test:
+    steps:
+      - run: GOOS=windows go vet ./...
+`,
+			wantError: "no check job",
+		},
+		{
+			name: "commented command is not executed",
+			workflowYAML: `jobs:
+  check:
+    steps:
+      - run: |
+          # GOOS=windows go vet ./...
+`,
+			wantError: "must directly run",
+		},
+		{
+			name: "echoed command is not executed",
+			workflowYAML: `jobs:
+  check:
+    steps:
+      - run: echo GOOS=windows go vet ./...
+`,
+			wantError: "must directly run",
+		},
+		{
+			name: "suppressed failure is not proof",
+			workflowYAML: `jobs:
+  check:
+    steps:
+      - run: GOOS=windows go vet ./... || true
+`,
+			wantError: "must directly run",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := CheckJobRunsWindowsVet([]byte(tt.workflowYAML))
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("CheckJobRunsWindowsVet() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("CheckJobRunsWindowsVet() error = %v, want error containing %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
 func TestCheckJobRunsWorkflowLintLiveWorkflow(t *testing.T) {
 	if err := CheckJobRunsWorkflowLint(readLiveWorkflow(t)); err != nil {
 		t.Fatalf("check live CI workflow lint enforcement: %v", err)
