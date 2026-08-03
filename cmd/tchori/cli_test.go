@@ -307,6 +307,39 @@ func TestProvidersInstallRegistryOverride(t *testing.T) {
 	}
 }
 
+func TestCLIApplyReportsInconsistentProviderResult(t *testing.T) {
+	dir := t.TempDir()
+	cfg := `{
+  "providers": {"tchoritest": {"source":"tchori-labs/tchoritest","version":"0.0.1","config":{}}},
+  "resources": {"tchoritest_lossy.svc": {"config":{"name":"svc","flag":true,"secret":"do-not-print"}}}
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pd := "--plugin-dir=" + pluginDir
+	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "plan.json"); code != 2 {
+		t.Fatalf("plan: exit %d, stderr %s", code, stderr)
+	}
+	_, stderr, code := runCLI(t, dir, "apply", pd, "-json", "plan.json")
+	if code != 1 {
+		t.Fatalf("apply: exit %d, want 1; stderr %s", code, stderr)
+	}
+	var d struct{ Severity, Address, Detail string }
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stderr)), &d); err != nil {
+		t.Fatalf("stderr is not one JSON diagnostic: %v\n%s", err, stderr)
+	}
+	if d.Severity != "error" || d.Address != "tchoritest_lossy.svc" || !strings.Contains(d.Detail, "flag: planned true, applied false") || strings.Contains(d.Detail, "do-not-print") {
+		t.Fatalf("diagnostic = %#v", d)
+	}
+	stateBytes, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // dir is a test-owned t.TempDir
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(stateBytes, []byte(`"flag": false`)) {
+		t.Fatalf("state does not record provider's false: %s", stateBytes)
+	}
+}
+
 func TestCLILifecycle(t *testing.T) {
 	dir := t.TempDir()
 	writeConfig(t, dir, "demo")

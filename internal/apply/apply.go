@@ -5,6 +5,14 @@
 // last in reverse dependency order. The state file is re-saved after every
 // successful provider call so a mid-sequence failure never loses the
 // resources already applied (partial-state safety).
+//
+// After create, update, and the create leg of replace, apply also checks the
+// returned state against concretely-authored planned values. Shallow-known
+// object/map containers and positionally aligned lists/tuples are traversed
+// despite unknown computed descendants; an authored map owns its complete key
+// set. Null or unknown resource roots
+// fail before persistence, and other unknown/unencodable results fail without
+// writing that address. Destroy retains its separate null-result guard.
 package apply
 
 import (
@@ -248,9 +256,9 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 		if ds := ex.destroy(ctx, client, typeName, addr, ty, prior, priorPrivate); ds.HasErrors() {
 			return ds
 		}
-		return ex.createOrUpdate(ctx, client, typeName, providerName, addr, ty, cty.NullVal(ty), ch)
+		return ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, cty.NullVal(ty), ch)
 	default: // "create", "update"
-		return ex.createOrUpdate(ctx, client, typeName, providerName, addr, ty, prior, ch)
+		return ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, prior, ch)
 	}
 }
 
@@ -276,7 +284,7 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 // may contain unknowns) at the schema's implied type, composes the resource
 // config with references resolved against current state, applies, then
 // records the provider's returned state and saves.
-func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, addr string, ty cty.Type, prior cty.Value, ch *plan.Change) diag.Diagnostics {
+func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, addr string, block *provider.SchemaBlock, ty cty.Type, prior cty.Value, ch *plan.Change) diag.Diagnostics {
 	var res *config.Resource
 	if ex.cfg != nil {
 		res = ex.cfg.Resources[addr]
@@ -316,8 +324,17 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 		return ds
 	}
 
+	// Compute consistency diagnostics before encoding. Degenerate null or
+	// shallow-unknown resource roots return their named errors immediately;
+	// a partially unknown object is still walked for actionable leaf errors,
+	// then the encoding guard below prevents it from being persisted.
+	consistencyDs := checkResultConsistency(addr, block, planned, cfgVal, newState)
+	if newState.IsNull() || !newState.IsKnown() {
+		return append(ds, consistencyDs...)
+	}
 	attrs, err := ctyjson.Marshal(newState, ty)
 	if err != nil {
+		ds = append(ds, consistencyDs...)
 		return append(ds, diag.Errorf(addr, "encoding new state", err.Error()))
 	}
 	ex.st.Resources[addr] = &state.ResourceState{
@@ -329,7 +346,7 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	if err := ex.st.Save(ex.statePath); err != nil {
 		return append(ds, diag.Errorf(addr, "saving state", err.Error()))
 	}
-	return ds
+	return append(ds, consistencyDs...)
 }
 
 // resolvePlannedUnknowns walks planned and cfgVal together (both at the same
