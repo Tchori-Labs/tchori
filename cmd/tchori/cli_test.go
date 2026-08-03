@@ -19,6 +19,8 @@ import (
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
+
+	"github.com/tchori-labs/tchori/internal/diag"
 )
 
 // The CLI is tested end to end: TestMain builds the real tchori binary and
@@ -382,8 +384,8 @@ func TestCLIApplyReportsInconsistentProviderResult(t *testing.T) {
 		t.Fatalf("apply: exit %d, want 1; stderr %s", code, stderr)
 	}
 	ds := decodeDiagnosticLines(t, stderr)
-	if len(ds) != 2 {
-		t.Fatalf("diagnostics = %#v, want inconsistent-result error and incomplete-state warning", ds)
+	if len(ds) != 3 {
+		t.Fatalf("diagnostics = %#v, want inconsistent-result error, abort accounting, and incomplete-state warning", ds)
 	}
 	d := ds[0]
 	if d.Severity != "error" || d.Address != "tchoritest_lossy.svc" || !strings.Contains(d.Detail, "flag: planned true, applied false") || strings.Contains(d.Detail, "do-not-print") {
@@ -396,6 +398,83 @@ func TestCLIApplyReportsInconsistentProviderResult(t *testing.T) {
 	if !bytes.Contains(stateBytes, []byte(`"flag": false`)) {
 		t.Fatalf("state does not record provider's false: %s", stateBytes)
 	}
+}
+
+func assertAPIFailureDiagnostics(t *testing.T, stderr, address string) {
+	t.Helper()
+	diagnostics := decodeDiagnosticLines(t, stderr)
+	counts := map[string]int{}
+	for _, d := range diagnostics {
+		counts[d.Summary]++
+		switch d.Summary {
+		case "Error updating service":
+			if d.Severity != "error" || d.Detail != "api error (status 400): Invalid request" || d.Address != address {
+				t.Fatalf("provider diagnostic = %#v", d)
+			}
+		case "apply aborted", "attempted change":
+			if d.Severity != "warning" || d.Address != address || d.Detail == "" {
+				t.Fatalf("accounting diagnostic = %#v", d)
+			}
+			var pretty bytes.Buffer
+			diag.Emit(&pretty, diag.Diagnostics{{Severity: diag.Warning, Summary: d.Summary, Detail: d.Detail, Address: d.Address}}, true)
+			prettyText := pretty.String()
+			if !strings.HasPrefix(prettyText, "Warning: "+d.Summary+" ("+address+")\n") || strings.HasSuffix(prettyText, "\n\n") {
+				t.Fatalf("pretty diagnostic = %q", prettyText)
+			}
+			for _, line := range strings.Split(d.Detail, "\n") {
+				if !strings.Contains(prettyText, "  "+line+"\n") {
+					t.Fatalf("pretty detail did not indent source line %q: %q", line, prettyText)
+				}
+			}
+		}
+	}
+	for _, summary := range []string{"Error updating service", "apply aborted", "attempted change"} {
+		if counts[summary] != 1 {
+			t.Fatalf("%s count = %d, want 1; diagnostics = %#v", summary, counts[summary], diagnostics)
+		}
+	}
+}
+
+func TestCLIApplyReportsProvider400WithAbortAccounting(t *testing.T) {
+	dir := t.TempDir()
+	pd := "--plugin-dir=" + pluginDir
+	writeConfig(t, dir, "before")
+	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "seed.json"); code != 2 {
+		t.Fatalf("seed plan: exit %d, stderr %s", code, stderr)
+	}
+	if _, stderr, code := runCLI(t, dir, "apply", pd, "seed.json"); code != 0 {
+		t.Fatalf("seed apply: exit %d, stderr %s", code, stderr)
+	}
+	writeConfig(t, dir, "api_400")
+	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "failure.json"); code != 2 {
+		t.Fatalf("failure plan: exit %d, stderr %s", code, stderr)
+	}
+	_, stderr, code := runCLI(t, dir, "apply", pd, "-json", "failure.json")
+	if code != 1 {
+		t.Fatalf("apply: exit %d, want 1; stderr %s", code, stderr)
+	}
+	assertAPIFailureDiagnostics(t, stderr, "tchoritest_thing.demo")
+}
+
+func TestCLIProtocol5ApplyReportsProvider400WithAbortAccounting(t *testing.T) {
+	dir := t.TempDir()
+	pd := "--plugin-dir=" + pluginDir
+	writeConfig5(t, dir, "before")
+	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "seed.json"); code != 2 {
+		t.Fatalf("seed plan: exit %d, stderr %s", code, stderr)
+	}
+	if _, stderr, code := runCLI(t, dir, "apply", pd, "seed.json"); code != 0 {
+		t.Fatalf("seed apply: exit %d, stderr %s", code, stderr)
+	}
+	writeConfig5(t, dir, "api_400")
+	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "failure.json"); code != 2 {
+		t.Fatalf("failure plan: exit %d, stderr %s", code, stderr)
+	}
+	_, stderr, code := runCLI(t, dir, "apply", pd, "-json", "failure.json")
+	if code != 1 {
+		t.Fatalf("apply: exit %d, want 1; stderr %s", code, stderr)
+	}
+	assertAPIFailureDiagnostics(t, stderr, "tchoritest5_thing.demo")
 }
 
 func TestCLILifecycle(t *testing.T) {

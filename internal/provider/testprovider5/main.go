@@ -304,6 +304,18 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov5.ApplyRe
 	if err := attrs["name"].As(&name); err != nil {
 		return nil, err
 	}
+	// TC-052 / issue #53 reproduction hook: mirror Coolify's unpathed,
+	// bodyless API rejection byte-for-byte.
+	if name == "api_400" {
+		return &tfprotov5.ApplyResourceChangeResponse{
+			NewState: req.PriorState,
+			Diagnostics: []*tfprotov5.Diagnostic{{
+				Severity: tfprotov5.DiagnosticSeverityError,
+				Summary:  "Error updating service",
+				Detail:   "api error (status 400): Invalid request",
+			}},
+		}, nil
+	}
 	// Deliberate failure hook for apply-time error handling tests: a
 	// "thing" named "explode" always fails to apply.
 	if name == "explode" {

@@ -125,9 +125,12 @@ the reference is nested inside an ordered collection (Tchori-Labs/tchori#11).
 `summary` — `no-op`-only plans exit `0`.
 
 Diagnostics do not alter this exit-code contract. Every provider-RPC failure
-carries the resource or provider address that issued the RPC; see the
-[diagnostic contract](diagnostics.md) for the JSON shape, pretty rendering,
-address qualification, and advisory non-JSON-response hint.
+carries the resource or provider address that issued the RPC. Warning-severity
+`apply aborted` and `attempted change` diagnostics add
+[partial-apply accounting](#partial-apply-and-abort-accounting) without changing
+`HasErrors()` or the exit code. See the [diagnostic contract](diagnostics.md)
+for the JSON shape, pretty rendering, address qualification, and advisory
+non-JSON-response hint.
 
 ### format_version compatibility
 
@@ -489,6 +492,52 @@ update can therefore converge on a second plan and apply.
 
 Consistency diagnostic values follow the redaction rules below.
 
+## Partial apply and abort accounting
+
+Apply stops at the first erroring change, but every completed provider change
+has already been saved to `state.json`. The provider's error remains verbatim
+and in its original severity. Tchori then emits one warning-severity diagnostic
+with summary `apply aborted`, addressed to the failing resource. Its multi-line
+detail names the failing address and action, lists each completed change saved
+before the failure, lists every later change that was not attempted, and says
+to run `tchori plan` again. Empty lists are explicit: `nothing was applied ...`
+for a first-change failure and `no further changes were pending; nothing was
+left unattempted` for a last-change failure.
+
+Saved changes distinguish `recorded in state` from `removed from state`. The
+latter matters for a replace whose destroy leg succeeded and whose create leg
+failed: the resource is absent from durable state, rather than untouched or
+successfully replaced. Apply's durable incomplete marker also advances the
+state serial on a failed run, including a first-change failure. A saved plan
+therefore no longer matches `state.json`; run `tchori plan` before the next
+apply. The `apply aborted` warning is emitted once per failed execution loop;
+stale-plan, configuration-ordering, and configuration-drift refusals happen
+before that loop and do not emit it.
+
+When an update reaches `ApplyResourceChange` and the provider rejects it,
+tchori also emits one warning-severity diagnostic with summary `attempted
+change`, at the same resource address. Its detail lists the changed attribute
+paths as `path: before -> after`, using the prior state and the resolved planned
+value actually handed to the provider. Object and map paths are listed
+individually; ordered collections and sets are rendered at their container
+path. Unknowns and null transitions are explicit. Creates, replace create
+legs, and updates with no value difference have no before/after list and do
+not emit this warning.
+
+Both sides of every attempted-change entry use the same fail-closed schema
+redaction as the consistency diagnostic described above. A sensitive attribute
+renders `(sensitive value) -> (sensitive value)`. A nested block rendered as a
+whole is redacted when any descendant is sensitive, and an unresolvable schema
+path is redacted rather than exposed.
+
+An `api error (status <code>)` diagnostic is provider text describing a
+provider/API-side rejection. Tchori preserves that text, attributes it, and
+adds the surrounding abort and attempted-value accounting; it does not build,
+inspect, or repair the HTTP payload constructed inside a third-party provider.
+Because both additions are warnings, they never change `HasErrors()` or the
+[exit-code contract](#exit-code-contract): the original provider error still
+makes apply exit `1`.
+
 ## Sensitivity
 
 Tchori derives sensitive paths from provider schema `Sensitive` flags plus a
@@ -528,6 +577,8 @@ legacy plaintext remains on disk until a changed apply/import or manual purge.
 If plaintext was previously committed, rotate the credential and purge
 `state.json`, `state.json.backup`, and repository history.
 
-The consistency diagnostic follows the same schema sensitivity rules and never
-prints sensitive values. Provider `private` blobs remain opaque and are not
-inspected; providers must not rely on tchori to redact secrets stored there.
+The consistency diagnostic and the
+[`attempted change`](#partial-apply-and-abort-accounting) diagnostic follow the
+same schema sensitivity rules and never print sensitive values. Provider
+`private` blobs remain opaque and are not inspected; providers must not rely on
+tchori to redact secrets stored there.
