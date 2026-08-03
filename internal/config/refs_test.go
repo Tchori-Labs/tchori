@@ -119,6 +119,67 @@ func testConfig(resources map[string]map[string]any) *Config {
 	return c
 }
 
+func TestDependencies(t *testing.T) {
+	c := testConfig(map[string]map[string]any{
+		"null_resource.a": {},
+		"null_resource.b": {
+			"first":  "${null_resource.a.id}",
+			"second": "${null_resource.a.other}",
+		},
+		"null_resource.c": {
+			"z": "${null_resource.b.id}",
+			"a": "${null_resource.a.id}",
+		},
+	})
+	got, diags := c.Dependencies()
+	if diags.HasErrors() {
+		t.Fatalf("Dependencies diagnostics: %+v", diags)
+	}
+	want := map[string][]string{
+		"null_resource.a": {},
+		"null_resource.b": {"null_resource.a"},
+		"null_resource.c": {"null_resource.a", "null_resource.b"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Dependencies() = %#v, want %#v", got, want)
+	}
+}
+
+func TestDependenciesTransitiveChainReturnsDirectEdges(t *testing.T) {
+	c := testConfig(map[string]map[string]any{
+		"null_resource.a": {},
+		"null_resource.b": {"dep": "${null_resource.a.id}"},
+		"null_resource.c": {"dep": "${null_resource.b.id}"},
+	})
+	got, diags := c.Dependencies()
+	if diags.HasErrors() {
+		t.Fatalf("Dependencies diagnostics: %+v", diags)
+	}
+	if !reflect.DeepEqual(got["null_resource.c"], []string{"null_resource.b"}) {
+		t.Fatalf("c dependencies = %v, want direct dependency b only", got["null_resource.c"])
+	}
+}
+
+func TestDependenciesUndeclaredReference(t *testing.T) {
+	c := testConfig(map[string]map[string]any{
+		"null_resource.a": {"dep": "${null_resource.ghost.id}"},
+	})
+	got, diags := c.Dependencies()
+	if got != nil || !diags.HasErrors() {
+		t.Fatalf("Dependencies() = (%v, %+v), want nil and undeclared-reference error", got, diags)
+	}
+	if diags[0].Summary != "reference to undeclared resource" || diags[0].Address != "null_resource.a" {
+		t.Fatalf("diagnostic = %+v", diags[0])
+	}
+}
+
+func TestDependenciesEmptyConfig(t *testing.T) {
+	got, diags := testConfig(map[string]map[string]any{}).Dependencies()
+	if diags.HasErrors() || got == nil || len(got) != 0 {
+		t.Fatalf("Dependencies() = (%#v, %+v), want non-nil empty map and no errors", got, diags)
+	}
+}
+
 func TestOrderChain(t *testing.T) {
 	// b references a, c references b: expected order a, b, c.
 	c := testConfig(map[string]map[string]any{

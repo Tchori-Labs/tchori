@@ -93,24 +93,35 @@ func walkRefs(v any, refs *[]Ref) {
 	}
 }
 
-// Order returns resource addresses topologically sorted by reference
-// edges; a cycle yields an error diagnostic naming the cycle path.
-func (c *Config) Order() ([]string, diag.Diagnostics) {
-	var diags diag.Diagnostics
+type dependencyEdges struct {
+	addrs      []string
+	deps       map[string][]string
+	dependents map[string][]string
+	indegree   map[string]int
+}
 
+// buildDependencyEdges extracts direct config reference edges once for both
+// dependency introspection and topological ordering.
+func (c *Config) buildDependencyEdges() (dependencyEdges, diag.Diagnostics) {
 	addrs := make([]string, 0, len(c.Resources))
 	for addr := range c.Resources {
 		addrs = append(addrs, addr)
 	}
 	sort.Strings(addrs)
 
-	// Build the edge sets. deps[a] lists the addresses a references
-	// (sorted, because ExtractRefs returns refs sorted by Address);
-	// dependents is the reverse adjacency used by Kahn's algorithm.
-	deps := make(map[string][]string, len(addrs))
-	dependents := make(map[string][]string, len(addrs))
-	indegree := make(map[string]int, len(addrs))
-
+	edges := dependencyEdges{
+		addrs:      addrs,
+		deps:       make(map[string][]string, len(addrs)),
+		dependents: make(map[string][]string, len(addrs)),
+		indegree:   make(map[string]int, len(addrs)),
+	}
+	// Materialize every address even when it has no dependencies so callers
+	// can distinguish a declared independent resource from an unknown one.
+	for _, addr := range addrs {
+		edges.deps[addr] = []string{}
+		edges.dependents[addr] = []string{}
+	}
+	var diags diag.Diagnostics
 	for _, addr := range addrs {
 		seen := make(map[string]bool)
 		for _, ref := range ExtractRefs(c.Resources[addr].Config) {
@@ -125,14 +136,33 @@ func (c *Config) Order() ([]string, diag.Diagnostics) {
 				continue
 			}
 			seen[ref.Address] = true
-			deps[addr] = append(deps[addr], ref.Address)
-			dependents[ref.Address] = append(dependents[ref.Address], addr)
-			indegree[addr]++
+			edges.deps[addr] = append(edges.deps[addr], ref.Address)
+			edges.dependents[ref.Address] = append(edges.dependents[ref.Address], addr)
+			edges.indegree[addr]++
 		}
 	}
+	return edges, diags
+}
+
+// Dependencies returns each declared resource's direct reference dependencies.
+// Addresses and dependency lists are deterministic; duplicate references to
+// attributes on the same resource produce one edge.
+func (c *Config) Dependencies() (map[string][]string, diag.Diagnostics) {
+	edges, diags := c.buildDependencyEdges()
 	if diags.HasErrors() {
 		return nil, diags
 	}
+	return edges.deps, diags
+}
+
+// Order returns resource addresses topologically sorted by reference
+// edges; a cycle yields an error diagnostic naming the cycle path.
+func (c *Config) Order() ([]string, diag.Diagnostics) {
+	edges, diags := c.buildDependencyEdges()
+	if diags.HasErrors() {
+		return nil, diags
+	}
+	addrs, deps, dependents, indegree := edges.addrs, edges.deps, edges.dependents, edges.indegree
 
 	// Kahn's algorithm; the ready set is sorted before every pop so ties
 	// break deterministically (lexical address order).

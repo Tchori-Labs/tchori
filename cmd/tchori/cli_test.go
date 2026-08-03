@@ -158,6 +158,47 @@ func writeConfig(t *testing.T, dir, name string) {
 	}
 }
 
+func writeThingResources(t *testing.T, dir string, resources map[string]string) {
+	t.Helper()
+	writeProtocolThingResources(t, dir, "tchoritest", resources)
+}
+
+func writeThingResources5(t *testing.T, dir string, resources map[string]string) {
+	t.Helper()
+	writeProtocolThingResources(t, dir, "tchoritest5", resources)
+}
+
+func writeProtocolThingResources(t *testing.T, dir, providerName string, resources map[string]string) {
+	t.Helper()
+	var body strings.Builder
+	addresses := make([]string, 0, len(resources))
+	for address := range resources {
+		addresses = append(addresses, address)
+	}
+	slices.Sort(addresses)
+	for i, address := range addresses {
+		if i > 0 {
+			body.WriteString(",\n")
+		}
+		_, _ = fmt.Fprintf(&body, "    %q: {\"config\": {\"name\": %q}}", address, resources[address])
+	}
+	cfg := fmt.Sprintf(`{
+  "providers": {
+    %q: {
+      "source": "tchori-labs/%s",
+      "version": "0.0.1",
+      "config": {"prefix": "t-"}
+    }
+  },
+  "resources": {
+%s
+  }
+}`, providerName, providerName, body.String())
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
 // writeConfig5 writes a one-provider one-resource config against the
 // protocol-5 fake provider (tchoritest5_thing -> tchoritest5), proving the
 // tfplugin5 adapter composes with the full command surface.
@@ -381,13 +422,16 @@ func TestCLIApplyReportsInconsistentProviderResult(t *testing.T) {
 	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "plan.json"); code != 2 {
 		t.Fatalf("plan: exit %d, stderr %s", code, stderr)
 	}
-	_, stderr, code := runCLI(t, dir, "apply", pd, "-json", "plan.json")
+	stdout, stderr, code := runCLI(t, dir, "apply", pd, "-json", "plan.json")
 	if code != 1 {
 		t.Fatalf("apply: exit %d, want 1; stderr %s", code, stderr)
 	}
+	if !strings.Contains(stdout, "Apply incomplete: 1 created, 0 updated, 0 deleted, 0 replaced; 0 changes not executed.") {
+		t.Fatalf("apply stdout = %q, want executed create accounting", stdout)
+	}
 	ds := decodeDiagnosticLines(t, stderr)
-	if len(ds) != 3 {
-		t.Fatalf("diagnostics = %#v, want inconsistent-result error, abort accounting, and incomplete-state warning", ds)
+	if len(ds) != 2 {
+		t.Fatalf("diagnostics = %#v, want inconsistent-result error and incomplete-state warning", ds)
 	}
 	d := ds[0]
 	if d.Severity != "error" || d.Address != "tchoritest_lossy.svc" || !strings.Contains(d.Detail, "flag: planned true, applied false") || strings.Contains(d.Detail, "do-not-print") {
@@ -413,7 +457,7 @@ func assertAPIFailureDiagnostics(t *testing.T, stderr, address string) {
 			if d.Severity != "error" || d.Detail != "api error (status 400): Invalid request" || d.Address != address {
 				t.Fatalf("provider diagnostic = %#v", d)
 			}
-		case "apply aborted", "attempted change":
+		case "attempted change":
 			if d.Severity != "warning" || d.Address != address || d.Detail == "" {
 				t.Fatalf("accounting diagnostic = %#v", d)
 			}
@@ -430,7 +474,7 @@ func assertAPIFailureDiagnostics(t *testing.T, stderr, address string) {
 			}
 		}
 	}
-	for _, summary := range []string{"Error updating service", "apply aborted", "attempted change"} {
+	for _, summary := range []string{"Error updating service", "attempted change"} {
 		if counts[summary] != 1 {
 			t.Fatalf("%s count = %d, want 1; diagnostics = %#v", summary, counts[summary], diagnostics)
 		}
@@ -451,9 +495,12 @@ func TestCLIApplyReportsProvider400WithAbortAccounting(t *testing.T) {
 	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "failure.json"); code != 2 {
 		t.Fatalf("failure plan: exit %d, stderr %s", code, stderr)
 	}
-	_, stderr, code := runCLI(t, dir, "apply", pd, "-json", "failure.json")
+	stdout, stderr, code := runCLI(t, dir, "apply", pd, "-json", "failure.json")
 	if code != 1 {
 		t.Fatalf("apply: exit %d, want 1; stderr %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "Apply incomplete: 0 created, 0 updated, 0 deleted, 0 replaced; 0 changes not executed.") {
+		t.Fatalf("apply stdout = %q, want zero executed changes", stdout)
 	}
 	assertAPIFailureDiagnostics(t, stderr, "tchoritest_thing.demo")
 }
@@ -472,9 +519,12 @@ func TestCLIProtocol5ApplyReportsProvider400WithAbortAccounting(t *testing.T) {
 	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "failure.json"); code != 2 {
 		t.Fatalf("failure plan: exit %d, stderr %s", code, stderr)
 	}
-	_, stderr, code := runCLI(t, dir, "apply", pd, "-json", "failure.json")
+	stdout, stderr, code := runCLI(t, dir, "apply", pd, "-json", "failure.json")
 	if code != 1 {
 		t.Fatalf("apply: exit %d, want 1; stderr %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "Apply incomplete: 0 created, 0 updated, 0 deleted, 0 replaced; 0 changes not executed.") {
+		t.Fatalf("apply stdout = %q, want zero executed changes", stdout)
 	}
 	assertAPIFailureDiagnostics(t, stderr, "tchoritest5_thing.demo")
 }
@@ -575,6 +625,95 @@ func readJSONFile(t *testing.T, path string, target any) {
 	}
 }
 
+func TestCLIApplyFailureDoesNotStarveRemovedResourceDelete(t *testing.T) {
+	dir := t.TempDir()
+	pd := "--plugin-dir=" + pluginDir
+	const drop = "tchoritest_thing.drop"
+
+	writeThingResources(t, dir, map[string]string{drop: "drop"})
+	if stdout, stderr, code := runCLI(t, dir, "plan", pd, "-out", "seed.json"); code != 2 {
+		t.Fatalf("seed plan: exit %d, want 2\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if stdout, stderr, code := runCLI(t, dir, "apply", pd, "seed.json"); code != 0 {
+		t.Fatalf("seed apply: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+
+	writeThingResources(t, dir, map[string]string{"tchoritest_thing.boom": "explode"})
+	stdout, stderr, code := runCLI(t, dir, "plan", pd, "-out", "mixed.json")
+	if code != 2 || !strings.Contains(stdout, "+ tchoritest_thing.boom") || !strings.Contains(stdout, "- "+drop) {
+		t.Fatalf("mixed plan: exit %d, want create and delete\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI(t, dir, "apply", pd, "mixed.json")
+	if code != 1 {
+		t.Fatalf("mixed apply: exit %d, want 1\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Apply incomplete: 0 created, 0 updated, 1 deleted, 0 replaced; 0 changes not executed.") {
+		t.Fatalf("mixed apply stdout does not report the executed delete: %q", stdout)
+	}
+	diagnostics := decodeDiagnosticLines(t, stderr)
+	if !slices.ContainsFunc(diagnostics, func(d struct {
+		Severity string `json:"severity"`
+		Summary  string `json:"summary"`
+		Detail   string `json:"detail"`
+		Address  string `json:"address"`
+	}) bool {
+		return d.Severity == "error" && d.Address == "tchoritest_thing.boom" && d.Summary == "apply exploded"
+	}) {
+		t.Fatalf("stderr does not name the failing resource: %s", stderr)
+	}
+
+	stdout, stderr, code = runCLI(t, dir, "state", "list")
+	if code != 0 || strings.Contains(stdout, drop) {
+		t.Fatalf("state list after partial apply: exit %d, drop still present=%v\nstdout: %s\nstderr: %s", code, strings.Contains(stdout, drop), stdout, stderr)
+	}
+	stdout, stderr, code = runCLI(t, dir, "plan", pd)
+	if code != 2 || strings.Contains(stdout, "- "+drop) {
+		t.Fatalf("follow-up plan: exit %d, removed resource delete repeated\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+}
+
+func TestCLIProtocol5ApplyFailureDoesNotStarveRemovedResourceDelete(t *testing.T) {
+	dir := t.TempDir()
+	pd := "--plugin-dir=" + pluginDir
+	const drop = "tchoritest5_thing.drop"
+	const boom = "tchoritest5_thing.boom"
+
+	writeThingResources5(t, dir, map[string]string{drop: "drop"})
+	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "seed.json"); code != 2 {
+		t.Fatalf("seed plan: exit %d, stderr: %s", code, stderr)
+	}
+	if _, stderr, code := runCLI(t, dir, "apply", pd, "seed.json"); code != 0 {
+		t.Fatalf("seed apply: exit %d, stderr: %s", code, stderr)
+	}
+	writeThingResources5(t, dir, map[string]string{boom: "explode"})
+	stdout, stderr, code := runCLI(t, dir, "plan", pd, "-out", "mixed.json")
+	if code != 2 || !strings.Contains(stdout, "+ "+boom) || !strings.Contains(stdout, "- "+drop) {
+		t.Fatalf("mixed plan: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI(t, dir, "apply", pd, "mixed.json")
+	if code != 1 || !strings.Contains(stdout, "0 created, 0 updated, 1 deleted, 0 replaced; 0 changes not executed") {
+		t.Fatalf("mixed apply: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !slices.ContainsFunc(decodeDiagnosticLines(t, stderr), func(d struct {
+		Severity string `json:"severity"`
+		Summary  string `json:"summary"`
+		Detail   string `json:"detail"`
+		Address  string `json:"address"`
+	}) bool {
+		return d.Severity == "error" && d.Address == boom && d.Summary == "apply exploded"
+	}) {
+		t.Fatalf("stderr does not name protocol-5 failure: %s", stderr)
+	}
+	stdout, stderr, code = runCLI(t, dir, "state", "list")
+	if code != 0 || strings.Contains(stdout, drop) {
+		t.Fatalf("state list: exit %d, stdout: %s, stderr: %s", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI(t, dir, "plan", pd)
+	if code != 2 || strings.Contains(stdout, "- "+drop) {
+		t.Fatalf("follow-up plan repeats delete: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+}
+
 func TestCLILifecycle(t *testing.T) {
 	dir := t.TempDir()
 	writeConfig(t, dir, "demo")
@@ -618,9 +757,9 @@ func TestCLILifecycle(t *testing.T) {
 		t.Fatalf("plan.json not written: %v", err)
 	}
 
-	// apply the saved plan -> exit 0.
-	if stdout, stderr, code := runCLI(t, dir, "apply", pd, "plan.json"); code != 0 {
-		t.Fatalf("apply: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	// apply the saved plan -> exit 0 with counts from executed work.
+	if stdout, stderr, code := runCLI(t, dir, "apply", pd, "plan.json"); code != 0 || !strings.Contains(stdout, "Apply complete: 1 created, 0 updated, 0 deleted, 0 replaced.") {
+		t.Fatalf("apply: exit %d, want 0 with truthful counts\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
 
 	// state list -> exactly the one managed address.
@@ -660,8 +799,8 @@ func TestCLILifecycle(t *testing.T) {
 	if _, stderr, code := runCLI(t, dir, "destroy", pd, "-out", "destroy.json"); code != 2 {
 		t.Fatalf("destroy -out: exit %d, want 2\nstderr: %s", code, stderr)
 	}
-	if _, stderr, code := runCLI(t, dir, "apply", pd, "destroy.json"); code != 0 {
-		t.Fatalf("apply destroy.json: exit %d, want 0\nstderr: %s", code, stderr)
+	if stdout, stderr, code := runCLI(t, dir, "apply", pd, "destroy.json"); code != 0 || !strings.Contains(stdout, "Apply complete: 0 created, 0 updated, 1 deleted, 0 replaced.") {
+		t.Fatalf("apply destroy.json: exit %d, want 0 with one executed delete\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
 	stdout, _, code = runCLI(t, dir, "state", "list")
 	if code != 0 || stdout != "" {
@@ -698,9 +837,9 @@ func TestCLILifecycleProtocol5(t *testing.T) {
 		t.Fatalf("plan -out: exit %d, want 2\nstderr: %s", code, stderr)
 	}
 
-	// apply the saved plan -> exit 0.
-	if stdout, stderr, code := runCLI(t, dir, "apply", pd, "plan.json"); code != 0 {
-		t.Fatalf("apply: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	// apply the saved plan -> exit 0 with counts from executed work.
+	if stdout, stderr, code := runCLI(t, dir, "apply", pd, "plan.json"); code != 0 || !strings.Contains(stdout, "Apply complete: 1 created, 0 updated, 0 deleted, 0 replaced.") {
+		t.Fatalf("apply: exit %d, want 0 with truthful counts\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
 
 	// state show -> attributes include the apply-computed id ("t-" prefix
@@ -726,8 +865,8 @@ func TestCLILifecycleProtocol5(t *testing.T) {
 	if _, stderr, code := runCLI(t, dir, "destroy", pd, "-out", "destroy.json"); code != 2 {
 		t.Fatalf("destroy -out: exit %d, want 2\nstderr: %s", code, stderr)
 	}
-	if _, stderr, code := runCLI(t, dir, "apply", pd, "destroy.json"); code != 0 {
-		t.Fatalf("apply destroy.json: exit %d, want 0\nstderr: %s", code, stderr)
+	if stdout, stderr, code := runCLI(t, dir, "apply", pd, "destroy.json"); code != 0 || !strings.Contains(stdout, "Apply complete: 0 created, 0 updated, 1 deleted, 0 replaced.") {
+		t.Fatalf("apply destroy.json: exit %d, want 0 with one executed delete\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
 
 	// import the just-destroyed resource back by id -> exit 0. Proves

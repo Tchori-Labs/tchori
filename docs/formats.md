@@ -168,10 +168,11 @@ the reference is nested inside an ordered collection (Tchori-Labs/tchori#11).
 diagnostic: it does not change `HasErrors()` or any exit code.
 
 Diagnostics do not alter this exit-code contract. Every provider-RPC failure
-carries the resource or provider address that issued the RPC. Warning-severity
-`apply aborted` and `attempted change` diagnostics add
-[partial-apply accounting](#partial-apply-and-abort-accounting) without changing
-`HasErrors()` or the exit code. See the [diagnostic contract](diagnostics.md)
+carries the resource or provider address that issued the RPC. Error-severity
+`planned change not executed` diagnostics provide per-address
+[failure-isolation accounting](#failure-isolation-at-apply), while the
+warning-severity `attempted change` diagnostic records values sent in a failed
+update. See the [diagnostic contract](diagnostics.md)
 for the JSON shape, pretty rendering, address qualification, and advisory
 non-JSON-response hint.
 
@@ -285,8 +286,9 @@ might echo values, or timestamps.
 For every non-empty apply, tchori writes this marker to disk **before the first
 provider call**. If that pre-flight save fails, apply refuses to issue any
 provider request. Per-change saves preserve the marker while work proceeds. On
-the first failure, a final save records the exact failed address and
-applied/remaining split; on full success, a terminal save removes the marker.
+a failed run, a final save records the first failed address and the exact
+completed/unfinished split after independent work; on full success, a terminal
+save removes the marker.
 A process killed mid-run or a failed finalizing save therefore still leaves an
 artifact that admits it is non-converged. Stale-plan, configuration-order, and
 configuration-drift refusals write nothing. A zero-change apply writes no new
@@ -554,27 +556,45 @@ update can therefore converge on a second plan and apply.
 
 Consistency diagnostic values follow the redaction rules below.
 
-## Partial apply and abort accounting
+## Failure isolation at apply
 
-Apply stops at the first erroring change, but every completed provider change
-has already been saved to `state.json`. The provider's error remains verbatim
-and in its original severity. Tchori then emits one warning-severity diagnostic
-with summary `apply aborted`, addressed to the failing resource. Its multi-line
-detail names the failing address and action, lists each completed change saved
-before the failure, lists every later change that was not attempted, and says
-to run `tchori plan` again. Empty lists are explicit: `nothing was applied ...`
-for a first-change failure and `no further changes were pending; nothing was
-left unattempted` for a last-change failure.
+Apply does not stop the entire run when one change fails. Creates, updates, and
+replaces continue unless a failed or already-blocked resource appears anywhere
+in their transitive dependency closure. Config-known deletes use the reverse
+rule: a delete is blocked when a transitive dependent failed or was blocked,
+so dependencies are never destroyed while a failed dependent still needs them.
+Independent changes continue in the existing deterministic order, and every
+successful provider result is saved to `state.json` before execution advances.
 
-Saved changes distinguish `recorded in state` from `removed from state`. The
-latter matters for a replace whose destroy leg succeeded and whose create leg
-failed: the resource is absent from durable state, rather than untouched or
-successfully replaced. Apply's durable incomplete marker also advances the
-state serial on a failed run, including a first-change failure. A saved plan
-therefore no longer matches `state.json`; run `tchori plan` before the next
-apply. The `apply aborted` warning is emitted once per failed execution loop;
-stale-plan, configuration-ordering, and configuration-drift refusals happen
-before that loop and do not emit it.
+A delete for an address removed from configuration is always attempted. Such
+an address cannot have a configuration-side dependent: configuration ordering
+rejects any reference to an undeclared resource before apply begins. This is
+why an unrelated failing create or update cannot starve a planned state-only
+delete.
+
+Every blocked change produces its own error-severity `planned change not
+executed` diagnostic. The diagnostic is addressed to that resource and names
+its planned action and the failed or blocked address that prevented execution.
+The provider diagnostic for every attempted failure remains verbatim and at
+its original severity. Nothing is silently skipped.
+
+The stdout outcome line reports completed work, not the plan document's
+summary. A successful run prints `Apply complete` (or `Destroy complete`) with
+executed counts. A run containing errors still prints `Apply incomplete` (or
+`Destroy incomplete`) with executed create, update, delete, and replace counts
+plus the number of dependency-blocked changes, then exits `1`. A provider call
+that failed was attempted but is neither reported as completed work nor as
+"not executed". A consistency error after a provider result was durably
+recorded does count that executed mutation while still making the run fail.
+
+Apply's durable incomplete marker records the first failed address, all
+successfully completed addresses, and every failed or blocked address still
+unfinished after independent work runs. A replace whose destroy leg succeeded
+but whose create leg failed remains absent from durable state and is not counted
+as a completed replacement. Every failed run advances the state serial, so its
+saved plan no longer matches `state.json`; run `tchori plan` before retrying.
+Stale-plan, configuration-ordering, and configuration-drift refusals happen
+before the execution loop and therefore have no partial outcome.
 
 When an update reaches `ApplyResourceChange` and the provider rejects it,
 tchori also emits one warning-severity diagnostic with summary `attempted
@@ -594,11 +614,12 @@ path is redacted rather than exposed.
 
 An `api error (status <code>)` diagnostic is provider text describing a
 provider/API-side rejection. Tchori preserves that text, attributes it, and
-adds the surrounding abort and attempted-value accounting; it does not build,
-inspect, or repair the HTTP payload constructed inside a third-party provider.
-Because both additions are warnings, they never change `HasErrors()` or the
-[exit-code contract](#exit-code-contract): the original provider error still
-makes apply exit `1`.
+adds the surrounding failure-isolation and attempted-value accounting; it does
+not build, inspect, or repair the HTTP payload constructed inside a third-party
+provider. The attempted-change addition is a warning and does not change
+`HasErrors()`. A dependency-blocked change is an error in its own right; the
+original provider error already makes apply exit `1` under the
+[exit-code contract](#exit-code-contract).
 
 ## Sensitivity
 
@@ -640,7 +661,7 @@ If plaintext was previously committed, rotate the credential and purge
 `state.json`, `state.json.backup`, and repository history.
 
 The consistency diagnostic and the
-[`attempted change`](#partial-apply-and-abort-accounting) diagnostic follow the
+[`attempted change`](#failure-isolation-at-apply) diagnostic follow the
 same schema sensitivity rules and never print sensitive values. Provider
 `private` blobs remain opaque and are not inspected; providers must not rely on
 tchori to redact secrets stored there.

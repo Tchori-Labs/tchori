@@ -4,8 +4,9 @@
 // sorted alphabetically by address for plan.json determinism), deletes run
 // last in reverse dependency order. State is marked incomplete on disk before
 // the first provider call (or apply refuses to run), re-saved after every
-// successful provider call, finalized on failure, and cleared only after full
-// completion. A successful apply with N provider-change saves therefore
+// successful provider call, finalized after all dependency-eligible work on a
+// failed run, and cleared only after full completion. A successful apply with
+// N provider-change saves therefore
 // advances serial by N+2; a failed non-empty apply advances it by at least 2.
 // Pre-flight refusals do not mutate state. Unresolved reference-shaped values
 // are rejected before every config-bearing provider call, including before the
@@ -45,9 +46,11 @@ import (
 // replaces in dependency order, deletes last in reverse dependency order.
 // Before the first ApplyResource, Apply durably marks statePath incomplete and
 // refuses to execute if that save fails. After EVERY successful ApplyResource
-// the state is updated in memory AND saved (partial-state safety). The first
-// error aborts remaining changes, finalizes the marker, and keeps completed
-// work saved; full completion clears the marker. A non-empty successful run
+// the state is updated in memory AND saved (partial-state safety). A failed
+// change blocks only changes in its dependency closure; independent changes
+// continue, and each blocked change receives an address-specific diagnostic.
+// Failed runs finalize the marker and keep completed work saved; full
+// completion clears the marker. A non-empty successful run
 // with N provider-change saves advances serial by N+2. A failed run advances it
 // by at least 2, so callers must compute a new plan before retrying. Stale-plan,
 // ordering, and configuration-drift refusals happen before any save.
@@ -65,10 +68,30 @@ import (
 // MUST be (and is) validated before the first save — the plan's
 // state_serial is compared against the serial captured at plan time, which
 // only matches the pre-apply state.
-func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map[string]*provider.Client, schemas map[string]*provider.ProviderSchemas, st *state.State, statePath string) diag.Diagnostics {
+// Result accounts for plan changes that completed successfully and changes
+// that dependency failures prevented Apply from attempting.
+type Result struct {
+	Created     int
+	Updated     int
+	Deleted     int
+	Replaced    int
+	NotExecuted []NotExecutedChange
+}
+
+// NotExecutedChange describes a planned change skipped because another change
+// in the required dependency direction failed or was itself blocked.
+type NotExecutedChange struct {
+	Address string
+	Action  string
+	Reason  string
+}
+
+// Apply returns truthful execution accounting alongside all diagnostics.
+func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map[string]*provider.Client, schemas map[string]*provider.ProviderSchemas, st *state.State, statePath string) (Result, diag.Diagnostics) {
+	var result Result
 	hadMarker := st.Incomplete != nil
 	if pl.StateSerial != st.Serial {
-		return diag.Diagnostics{diag.Errorf("", "stale plan", fmt.Sprintf(
+		return result, diag.Diagnostics{diag.Errorf("", "stale plan", fmt.Sprintf(
 			"plan was created against state serial %d but the current state serial is %d; run plan again",
 			pl.StateSerial, st.Serial))}
 	}
@@ -111,9 +134,18 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 			// produced this plan necessarily passed Order() during planning
 			// too (see plan.Planner.Plan). Surfacing rather than assuming
 			// keeps this defensive.
-			return ods
+			return result, ods
 		}
 	}
+	dependencies := map[string][]string{}
+	if cfg != nil {
+		var dds diag.Diagnostics
+		dependencies, dds = cfg.Dependencies()
+		if dds.HasErrors() {
+			return result, dds
+		}
+	}
+	dependents := reverseEdges(dependencies)
 	inConfigOrder := make(map[string]bool, len(order))
 	for _, addr := range order {
 		inConfigOrder[addr] = true
@@ -183,7 +215,7 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 		}
 	}
 	if driftDiags.HasErrors() {
-		return driftDiags
+		return result, driftDiags
 	}
 
 	marked := len(ordered) > 0
@@ -196,43 +228,149 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 		st.Incomplete = &state.IncompleteApply{Applied: []string{}, Remaining: remaining}
 		if err := ex.save(); err != nil {
 			st.Incomplete, st.Serial = previousMarker, previousSerial
-			return diag.Diagnostics{diag.Errorf("", "marking state incomplete",
+			return result, diag.Diagnostics{diag.Errorf("", "marking state incomplete",
 				fmt.Sprintf("apply refused to run because non-convergence could not be recorded before the first provider call: %s", err))}
 		}
 	}
 
 	var ds diag.Diagnostics
-	for i, ch := range ordered {
+	outcomes := make(map[string]string, len(ordered))
+	var completed, unfinished []*plan.Change
+	failedAddress := ""
+	persistenceFailedAt := ""
+	for _, ch := range ordered {
+		blocker, relationship := "", ""
+		stateOnlyDelete := ch.Action == "delete" && !inConfigOrder[ch.Address]
+		if persistenceFailedAt != "" && !stateOnlyDelete {
+			blocker, relationship = persistenceFailedAt, "state persistence failure at"
+		} else if ch.Action != "delete" {
+			blocker = closureBlocker(ch.Address, dependencies, outcomes)
+			relationship = "dependency"
+		} else if inConfigOrder[ch.Address] {
+			blocker = closureBlocker(ch.Address, dependents, outcomes)
+			relationship = "dependent"
+		}
+		// A state-only delete cannot have a config-side dependent: Order rejects
+		// every reference to an undeclared address. It is therefore always safe
+		// to attempt, even when another config change failed.
+		if blocker != "" {
+			reason := fmt.Sprintf("action %q for %s was not executed because %s %s failed or was not executed", ch.Action, ch.Address, relationship, blocker)
+			if relationship == "state persistence failure at" {
+				reason = fmt.Sprintf("action %q for %s was not executed because state persistence failed while executing %s", ch.Action, ch.Address, blocker)
+			}
+			result.NotExecuted = append(result.NotExecuted, NotExecutedChange{Address: ch.Address, Action: ch.Action, Reason: reason})
+			ds = append(ds, diag.Errorf(ch.Address, "planned change not executed", reason))
+			outcomes[ch.Address] = "blocked"
+			unfinished = append(unfinished, ch)
+			continue
+		}
+
+		mutationCount := len(ex.mutations)
 		step := ex.applyChange(ctx, ch)
 		ds = append(ds, step...)
-		if step.HasErrors() {
-			ds = append(ds, abortSummary(ex.statePath, ex.mutations, ch, ordered[i+1:])...)
-			// The per-change save happens inside applyChange, before this loop can
-			// advance the split. This final save is therefore authoritative.
-			st.Incomplete.FailedAddress = ch.Address
-			st.Incomplete.Applied = addresses(ordered[:i])
-			st.Incomplete.Remaining = addresses(ordered[i:])
-			if err := ex.save(); err != nil {
-				ds = append(ds, diag.Errorf(ch.Address, "saving incomplete state", err.Error()))
-			}
-			ds = append(ds, diag.Warnf(ch.Address, "state left incomplete",
-				fmt.Sprintf("state is marked non-converged after failure at %s; run tchori state status for details", ch.Address)))
-			return ds
+		executed := len(ex.mutations)-mutationCount == 1
+		if ch.Action == "replace" {
+			executed = len(ex.mutations)-mutationCount == 2
 		}
-		// Intermediate saves contain progress as of the previous change because
-		// applyChange saves before returning. The failure finalizer above writes
-		// the exact split when it matters.
-		st.Incomplete.Applied = addresses(ordered[:i+1])
-		st.Incomplete.Remaining = addresses(ordered[i+1:])
+		if executed {
+			result.record(ch.Action)
+		}
+		if step.HasErrors() {
+			outcomes[ch.Address] = "failed"
+			unfinished = append(unfinished, ch)
+			if failedAddress == "" {
+				failedAddress = ch.Address
+			}
+			if diagnosticsContainSummary(step, "saving state") {
+				persistenceFailedAt = ch.Address
+			}
+			continue
+		}
+		outcomes[ch.Address] = "completed"
+		completed = append(completed, ch)
+		st.Incomplete.Applied = addresses(completed)
+	}
+
+	if ds.HasErrors() {
+		// Per-change saves happen inside applyChange. This final save records the
+		// authoritative successful/unfinished split after independent work ran.
+		st.Incomplete.FailedAddress = failedAddress
+		st.Incomplete.Applied = addresses(completed)
+		st.Incomplete.Remaining = addresses(unfinished)
+		if err := ex.save(); err != nil {
+			ds = append(ds, diag.Errorf(failedAddress, "saving incomplete state", err.Error()))
+		}
+		ds = append(ds, diag.Warnf(failedAddress, "state left incomplete",
+			fmt.Sprintf("state is marked non-converged after failure at %s; run tchori state status for details", failedAddress)))
+		return result, ds
 	}
 
 	st.Incomplete = nil
 	if marked || ex.saveCount > 0 || hadMarker {
 		if err := ex.save(); err != nil {
-			return append(ds, diag.Errorf("", "clearing incomplete state", err.Error()))
+			return result, append(ds, diag.Errorf("", "clearing incomplete state", err.Error()))
 		}
 	}
-	return ds
+	return result, ds
+}
+
+func (r *Result) record(action string) {
+	switch action {
+	case "create":
+		r.Created++
+	case "update":
+		r.Updated++
+	case "delete":
+		r.Deleted++
+	case "replace":
+		r.Replaced++
+	}
+}
+
+func reverseEdges(dependencies map[string][]string) map[string][]string {
+	dependents := make(map[string][]string, len(dependencies))
+	for addr := range dependencies {
+		dependents[addr] = []string{}
+	}
+	for addr, deps := range dependencies {
+		for _, dependency := range deps {
+			dependents[dependency] = append(dependents[dependency], addr)
+		}
+	}
+	for addr := range dependents {
+		sort.Strings(dependents[addr])
+	}
+	return dependents
+}
+
+func closureBlocker(addr string, edges map[string][]string, outcomes map[string]string) string {
+	seen := map[string]bool{}
+	var visit func(string) string
+	visit = func(current string) string {
+		for _, next := range edges[current] {
+			if seen[next] {
+				continue
+			}
+			seen[next] = true
+			if outcomes[next] == "failed" || outcomes[next] == "blocked" {
+				return next
+			}
+			if blocker := visit(next); blocker != "" {
+				return blocker
+			}
+		}
+		return ""
+	}
+	return visit(addr)
+}
+
+func diagnosticsContainSummary(ds diag.Diagnostics, summary string) bool {
+	for _, d := range ds {
+		if d.Summary == summary {
+			return true
+		}
+	}
+	return false
 }
 
 func addresses(changes []*plan.Change) []string {

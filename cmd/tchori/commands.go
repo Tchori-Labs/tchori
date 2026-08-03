@@ -271,15 +271,16 @@ func runApply(cmd *cobra.Command, args []string) (int, error) {
 	}
 	emitIncompleteStateWarning(st)
 
-	ads := apply.Apply(ctx, pl, rt.Config, rt.Providers, rt.Schemas, st, stateFileName)
+	result, ads := apply.Apply(ctx, pl, rt.Config, rt.Providers, rt.Schemas, st, stateFileName)
 	emitDiags(ads)
 	if ads.HasErrors() {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Apply incomplete: %d created, %d updated, %d deleted, %d replaced; %d changes not executed.\n",
+			result.Created, result.Updated, result.Deleted, result.Replaced, len(result.NotExecuted))
 		return 1, nil
 	}
 
-	s := pl.Summary
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Apply complete: %d created, %d updated, %d deleted, %d replaced.\n",
-		s.Create, s.Update, s.Delete, s.Replace)
+		result.Created, result.Updated, result.Deleted, result.Replaced)
 	return 0, nil
 }
 
@@ -364,12 +365,14 @@ func runDestroy(cmd *cobra.Command, out string) (int, error) {
 		return 1, errors.New(`destroy canceled: confirmation was not "yes"`)
 	}
 
-	ads := apply.Apply(ctx, pl, rt.Config, rt.Providers, rt.Schemas, st, stateFileName)
+	result, ads := apply.Apply(ctx, pl, rt.Config, rt.Providers, rt.Schemas, st, stateFileName)
 	emitDiags(ads)
 	if ads.HasErrors() {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Destroy incomplete: %d deleted; %d changes not executed.\n",
+			result.Deleted, len(result.NotExecuted))
 		return 1, nil
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Destroy complete: %d deleted.\n", pl.Summary.Delete)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Destroy complete: %d deleted.\n", result.Deleted)
 	return 0, nil
 }
 
