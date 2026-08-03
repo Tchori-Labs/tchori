@@ -29,7 +29,7 @@ func TestApplyGuardRunsBeforeReplaceDestroy(t *testing.T) {
 	ctx := context.Background()
 
 	initial := loadState(t, h.statePath)
-	if ds := apply.Apply(ctx, h.plan(t, initial, false), h.cfg, h.providers, h.schemas, initial, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, h.plan(t, initial, false), h.cfg, h.providers, h.schemas, initial, h.statePath); ds.HasErrors() {
 		t.Fatalf("initial Apply: %+v", ds)
 	}
 	before := loadState(t, h.statePath)
@@ -43,7 +43,7 @@ func TestApplyGuardRunsBeforeReplaceDestroy(t *testing.T) {
 	// Inject after planning: the planner itself now rejects this value.
 	h.cfg.Resources[addr].Config["tags"] = map[string]any{"content": "${tchoritest_thing.base.id}.suffix"}
 
-	ds := apply.Apply(ctx, replacePlan, h.cfg, h.providers, h.schemas, before, h.statePath)
+	_, ds := apply.Apply(ctx, replacePlan, h.cfg, h.providers, h.schemas, before, h.statePath)
 	requireUnresolvedAt(t, ds, addr)
 	saved := loadState(t, h.statePath)
 	if saved.Resources[addr] == nil {
@@ -85,7 +85,7 @@ func TestApplyGuardRejectsUnresolvedPlannedValue(t *testing.T) {
 		t.Fatalf("marshal planned: %v", err)
 	}
 
-	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	requireUnresolvedAt(t, ds, addr)
 	if saved := loadState(t, h.statePath); saved.Resources[addr] != nil {
 		t.Fatal("resource was persisted despite unresolved planned value")
@@ -97,7 +97,7 @@ func TestApplyGuardAllowsCleanCreate(t *testing.T) {
 	h := newHarness(t, map[string]*config.Resource{addr: thing("foo", "foo")})
 	ctx := context.Background()
 	st := loadState(t, h.statePath)
-	ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
 	if ds.HasErrors() {
 		t.Fatalf("Apply: %+v", ds)
 	}

@@ -247,7 +247,7 @@ func TestApplyCreate(t *testing.T) {
 		t.Fatalf("plan = %+v, want exactly one create change", pl.Changes)
 	}
 
-	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("Apply: %+v", ds)
 	}
 
@@ -287,7 +287,7 @@ func TestApplyLossyCreateUpdateReplaceAndDestroy(t *testing.T) {
 	if planned.IsWhollyKnown() || planned.GetAttr("id").IsKnown() {
 		t.Fatal("lossy planned create must retain unknown computed id")
 	}
-	createDs := apply.Apply(ctx, createPlan, h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, createDs := apply.Apply(ctx, createPlan, h.cfg, h.providers, h.schemas, st, h.statePath)
 	createConsistency := diagnosticWithSummary(createDs, "provider produced inconsistent result after apply")
 	if createConsistency == nil || !strings.Contains(createConsistency.Detail, "flag: planned true, applied false") {
 		t.Fatalf("create diagnostics = %#v", createDs)
@@ -303,7 +303,7 @@ func TestApplyLossyCreateUpdateReplaceAndDestroy(t *testing.T) {
 	if updatePlan.Changes[0].Action != "update" {
 		t.Fatalf("update action = %q", updatePlan.Changes[0].Action)
 	}
-	if ds := apply.Apply(ctx, updatePlan, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, updatePlan, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("update diagnostics = %#v", ds)
 	}
 	if got := stateAttrs(t, h.statePath, addr)["flag"]; got != true {
@@ -316,7 +316,7 @@ func TestApplyLossyCreateUpdateReplaceAndDestroy(t *testing.T) {
 	if replacePlan.Changes[0].Action != "replace" || len(replacePlan.Changes[0].RequiresReplace) != 1 || replacePlan.Changes[0].RequiresReplace[0] != "replace_me" {
 		t.Fatalf("replace plan = %#v", replacePlan.Changes[0])
 	}
-	replaceDs := apply.Apply(ctx, replacePlan, h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, replaceDs := apply.Apply(ctx, replacePlan, h.cfg, h.providers, h.schemas, st, h.statePath)
 	replaceConsistency := diagnosticWithSummary(replaceDs, "provider produced inconsistent result after apply")
 	if replaceConsistency == nil || !strings.Contains(replaceConsistency.Detail, "flag: planned true, applied false") {
 		t.Fatalf("replace diagnostics = %#v", replaceDs)
@@ -324,7 +324,7 @@ func TestApplyLossyCreateUpdateReplaceAndDestroy(t *testing.T) {
 
 	st = loadState(t, h.statePath)
 	destroyPlan := h.plan(t, st, true)
-	if ds := apply.Apply(ctx, destroyPlan, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, destroyPlan, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("destroy diagnostics = %#v", ds)
 	}
 }
@@ -343,7 +343,7 @@ func TestApplyLossyMapKeySet(t *testing.T) {
 			const addr = "tchoritest_lossy.svc"
 			h := newHarness(t, map[string]*config.Resource{addr: lossyThing("svc", map[string]any{"tags": tc.tags})})
 			st := loadState(t, h.statePath)
-			ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+			_, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
 			consistency := diagnosticWithSummary(ds, "provider produced inconsistent result after apply")
 			if consistency == nil || !strings.Contains(consistency.Detail, tc.want) {
 				t.Fatalf("diagnostics = %#v", ds)
@@ -361,7 +361,7 @@ func TestApplyLossyNestedRedactionAndNullContainers(t *testing.T) {
 			"probes":      []any{map[string]any{"path": "/health"}},
 		})})
 		st := loadState(t, h.statePath)
-		ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+		_, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
 		consistency := diagnosticWithSummary(ds, "provider produced inconsistent result after apply")
 		if consistency == nil {
 			t.Fatalf("diagnostics = %#v", ds)
@@ -386,7 +386,7 @@ func TestApplyLossyNestedRedactionAndNullContainers(t *testing.T) {
 			"credentials": map[string]any{"user": "nullify", "token": "hidden"},
 		})})
 		st := loadState(t, h.statePath)
-		ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+		_, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
 		consistency := diagnosticWithSummary(ds, "provider produced inconsistent result after apply")
 		if consistency == nil {
 			t.Fatalf("diagnostics = %#v", ds)
@@ -411,7 +411,7 @@ func TestApplyLossyResolvedReferencesRemainChecked(t *testing.T) {
 	})
 	h := newHarness(t, map[string]*config.Resource{source.Address: source, lossyAddr: lossy})
 	st := loadState(t, h.statePath)
-	ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
 	consistency := diagnosticWithSummary(ds, "provider produced inconsistent result after apply")
 	if len(ds) < 3 || ds[0].Severity != diag.Warning || consistency == nil || consistency.Address != lossyAddr || !strings.Contains(consistency.Detail, `tags["dropped"]: planned "id-source", applied absent`) || !strings.Contains(consistency.Detail, "secret: planned (sensitive value), applied (sensitive value)") || strings.Contains(consistency.Detail, "SOURCE") {
 		t.Fatalf("diagnostics = %#v", ds)
@@ -424,7 +424,7 @@ func TestApplyWithholdsSensitiveComputedAndReferencedValues(t *testing.T) {
 	c := secretful("c", map[string]any{"rules": []any{map[string]any{"token": "literal-token-ok"}, map[string]any{"token": "${tchoritest_secretful.a.client_secret}"}}}) //nolint:gosec // fake values exercise per-instance redaction
 	h := newHarness(t, map[string]*config.Resource{a.Address: a, b.Address: b, c.Address: c})
 	st := loadState(t, h.statePath)
-	ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
 	if ds.HasErrors() {
 		t.Fatalf("Apply: %#v", ds)
 	}
@@ -464,7 +464,7 @@ func TestApplyResourceEnvWrapperRoundTrip(t *testing.T) {
 	if len(pl.Changes) != 1 || pl.Changes[0].Action != "create" {
 		t.Fatalf("plan = %+v, want exactly one create", pl.Changes)
 	}
-	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("Apply: %+v", ds)
 	}
 	if got := stateAttrs(t, h.statePath, resource.Address)["name"]; got != "alpha" {
@@ -490,7 +490,7 @@ func TestApplyResourceEnvWrapperUnsetBeforeProviderRPC(t *testing.T) {
 		t.Fatalf("Unsetenv: %v", err)
 	}
 
-	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if !ds.HasErrors() {
 		t.Fatal("Apply succeeded; want unset environment diagnostic")
 	}
@@ -523,7 +523,7 @@ func TestApplyStalePlan(t *testing.T) {
 		Summary:       plan.Summary{Create: 1},
 	}
 
-	ds := apply.Apply(context.Background(), pl, &config.Config{}, nil, nil, st, statePath)
+	_, ds := apply.Apply(context.Background(), pl, &config.Config{}, nil, nil, st, statePath)
 	if !ds.HasErrors() {
 		t.Fatal("Apply accepted a stale plan")
 	}
@@ -577,7 +577,7 @@ func TestApplyConfigDriftRefused(t *testing.T) {
 	// the plan was created.
 	cfg := &config.Config{Resources: map[string]*config.Resource{}}
 
-	ds := apply.Apply(context.Background(), pl, cfg, nil, nil, st, statePath)
+	_, ds := apply.Apply(context.Background(), pl, cfg, nil, nil, st, statePath)
 	if !ds.HasErrors() {
 		t.Fatal("Apply accepted a plan whose resource is no longer in configuration")
 	}
@@ -614,7 +614,7 @@ func TestApplyOrderFailureLeavesStateUntouched(t *testing.T) {
 	self.Config["tags"] = map[string]any{"self": "${tchoritest_thing.self.id}"}
 	cfg := &config.Config{Resources: map[string]*config.Resource{addr: self}}
 	pl := &plan.Plan{FormatVersion: "1.0", StateSerial: st.Serial, Changes: []*plan.Change{{Address: addr, Action: "create"}}}
-	if ds := apply.Apply(context.Background(), pl, cfg, nil, nil, st, statePath); !ds.HasErrors() {
+	if _, ds := apply.Apply(context.Background(), pl, cfg, nil, nil, st, statePath); !ds.HasErrors() {
 		t.Fatal("Apply accepted cyclic configuration")
 	}
 	after, err := os.ReadFile(statePath) //nolint:gosec // test-controlled path
@@ -632,7 +632,7 @@ func TestApplySerialAdvancesByChangesPlusTwo(t *testing.T) {
 		"tchoritest_thing.beta":  thing("beta", "beta"),
 	})
 	st := loadState(t, h.statePath)
-	if ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("Apply: %+v", ds)
 	}
 	if got := loadState(t, h.statePath).Serial; got != 4 {
@@ -640,23 +640,86 @@ func TestApplySerialAdvancesByChangesPlusTwo(t *testing.T) {
 	}
 }
 
-func TestApplyPartialFailure(t *testing.T) {
-	// Changes apply in plan (address) order: ...alpha succeeds first, then
-	// ...boom (name "explode") errors inside the provider's apply. The first
-	// resource must survive in the saved state; the failed one must not.
+func TestApplyUnrelatedFailureDoesNotStarveStateOnlyDelete(t *testing.T) {
+	const drop = "tchoritest_thing.drop"
+	h := newHarness(t, map[string]*config.Resource{drop: thing("drop", "drop")})
+	ctx := context.Background()
+
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("seed Apply: %+v", ds)
+	}
+
+	h.cfg.Resources = map[string]*config.Resource{
+		"tchoritest_thing.boom": thing("boom", "explode"),
+	}
+	st = loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	if pl.Summary.Create != 1 || pl.Summary.Delete != 1 {
+		t.Fatalf("plan summary = %+v, want one create and one delete", pl.Summary)
+	}
+	result, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() {
+		t.Fatal("Apply succeeded despite provider failure")
+	}
+	if result.Deleted != 1 || result.Created != 0 || len(result.NotExecuted) != 0 {
+		t.Fatalf("result = %+v, want one executed delete and no skipped changes", result)
+	}
+	if saved := loadState(t, h.statePath); saved.Resources[drop] != nil {
+		t.Fatalf("%s remains in state after independent create failure", drop)
+	}
+}
+
+func TestApplyReportsEachNotExecutedChange(t *testing.T) {
+	const failed = "tchoritest_thing.boom"
+	const blocked = "tchoritest_thing.z_after"
+	dependent := thing("z_after", "z_after")
+	dependent.Config["tags"] = map[string]any{"dependency": "${tchoritest_thing.boom.id}"}
+	const transitive = "tchoritest_thing.zz_transitive"
+	transitiveResource := thing("zz_transitive", "zz_transitive")
+	transitiveResource.Config["tags"] = map[string]any{"dependency": "${tchoritest_thing.z_after.id}"}
 	h := newHarness(t, map[string]*config.Resource{
-		"tchoritest_thing.alpha": thing("alpha", "alpha"),
-		"tchoritest_thing.boom":  thing("boom", "explode"),
+		failed:     thing("boom", "explode"),
+		blocked:    dependent,
+		transitive: transitiveResource,
+	})
+	st := loadState(t, h.statePath)
+	result, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() {
+		t.Fatal("Apply succeeded despite provider failure")
+	}
+	if len(result.NotExecuted) != 2 || result.NotExecuted[0].Address != blocked || result.NotExecuted[0].Action != "create" || !strings.Contains(result.NotExecuted[0].Reason, failed) || result.NotExecuted[1].Address != transitive || !strings.Contains(result.NotExecuted[1].Reason, blocked) {
+		t.Fatalf("NotExecuted = %+v, want direct and transitive blocked creates", result.NotExecuted)
+	}
+	reported := map[string]bool{}
+	for _, d := range ds {
+		if d.Severity == diag.Error && d.Summary == "planned change not executed" && strings.Contains(d.Detail, `action "create"`) {
+			reported[d.Address] = true
+		}
+	}
+	if !reported[blocked] || !reported[transitive] {
+		t.Fatalf("diagnostics do not report each unexecuted create: %+v", ds)
+	}
+}
+
+func TestApplyPartialFailure(t *testing.T) {
+	// Independent changes continue in config order: alpha succeeds, boom
+	// fails, and z_after still succeeds. Successful resources must survive in
+	// saved state; the failed one must not.
+	h := newHarness(t, map[string]*config.Resource{
+		"tchoritest_thing.alpha":   thing("alpha", "alpha"),
+		"tchoritest_thing.boom":    thing("boom", "explode"),
+		"tchoritest_thing.z_after": thing("z_after", "z_after"),
 	})
 	ctx := context.Background()
 
 	st := loadState(t, h.statePath)
 	pl := h.plan(t, st, false)
-	if len(pl.Changes) != 2 {
-		t.Fatalf("plan has %d changes, want 2: %+v", len(pl.Changes), pl.Changes)
+	if len(pl.Changes) != 3 {
+		t.Fatalf("plan has %d changes, want 3: %+v", len(pl.Changes), pl.Changes)
 	}
 
-	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if !ds.HasErrors() {
 		t.Fatal("Apply reported success despite a provider apply error")
 	}
@@ -678,10 +741,13 @@ func TestApplyPartialFailure(t *testing.T) {
 	if got := attrs["id"]; got != "id-alpha" {
 		t.Errorf(`first resource id = %v, want "id-alpha" (must stay saved after mid-sequence failure)`, got)
 	}
-	if saved.Serial != 3 {
-		t.Errorf("state serial = %d, want 3 (1 pre-flight + 1 change + 1 failure-finalizer save)", saved.Serial)
+	if got := stateAttrs(t, h.statePath, "tchoritest_thing.z_after")["id"]; got != "id-z_after" {
+		t.Errorf(`later independent resource id = %v, want "id-z_after"`, got)
 	}
-	wantIncomplete(t, saved, "tchoritest_thing.boom", []string{"tchoritest_thing.alpha"}, []string{"tchoritest_thing.boom"})
+	if saved.Serial != 4 {
+		t.Errorf("state serial = %d, want 4 (pre-flight + 2 successful changes + failure finalizer)", saved.Serial)
+	}
+	wantIncomplete(t, saved, "tchoritest_thing.boom", []string{"tchoritest_thing.alpha", "tchoritest_thing.z_after"}, []string{"tchoritest_thing.boom"})
 	raw, err := os.ReadFile(h.statePath) //nolint:gosec // test-controlled path
 	if err != nil || !strings.Contains(string(raw), `"incomplete_apply"`) {
 		t.Fatalf("partial state lacks incomplete_apply marker: err=%v bytes=%s", err, raw)
@@ -692,7 +758,7 @@ func TestApplyZeroAppliedFailureWritesMarker(t *testing.T) {
 	const addr = "tchoritest_thing.boom"
 	h := newHarness(t, map[string]*config.Resource{addr: thing("boom", "explode")})
 	st := loadState(t, h.statePath)
-	ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
 	if !ds.HasErrors() {
 		t.Fatal("Apply succeeded despite provider failure")
 	}
@@ -709,7 +775,7 @@ func TestApplyMarkerSaveFailureRefusesProviderCall(t *testing.T) {
 	st := loadState(t, h.statePath)
 	pl := h.plan(t, st, false)
 	h.statePath = filepath.Join(t.TempDir(), "missing", "state.json")
-	ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if !ds.HasErrors() || !diagnosticsContain(ds, "marking state incomplete") {
 		t.Fatalf("diagnostics = %+v, want marking failure", ds)
 	}
@@ -728,7 +794,7 @@ func TestApplyTerminalSaveFailureKeepsPreflightMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := loadState(t, h.statePath)
-	ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
 	if !diagnosticsContain(ds, "apply exploded") || !diagnosticsContain(ds, "saving incomplete state") {
 		t.Fatalf("diagnostics = %+v, want original provider and final-save errors", ds)
 	}
@@ -751,7 +817,7 @@ func TestApplyReplaceCreateFailureLeavesMarker(t *testing.T) {
 	const addr = "tchoritest_thing.foo"
 	h := newHarness(t, map[string]*config.Resource{addr: thing("foo", "foo")})
 	st := loadState(t, h.statePath)
-	if ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("seed apply: %+v", ds)
 	}
 	before := loadState(t, h.statePath)
@@ -761,7 +827,7 @@ func TestApplyReplaceCreateFailureLeavesMarker(t *testing.T) {
 	if len(pl.Changes) != 1 || pl.Changes[0].Action != "replace" {
 		t.Fatalf("changes = %+v, want replace", pl.Changes)
 	}
-	ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, before, h.statePath)
+	_, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, before, h.statePath)
 	if !diagnosticsContain(ds, "apply exploded") {
 		t.Fatalf("diagnostics = %+v, want create-leg failure", ds)
 	}
@@ -784,7 +850,7 @@ func TestApplyStateOnlyDeleteFailureAfterSuccess(t *testing.T) {
 	pl.Summary.Delete++
 	st.Resources[orphan] = &state.ResourceState{Type: "tchoritest_thing", Provider: "missing", Attributes: json.RawMessage(`{}`)}
 
-	ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if !diagnosticsContain(ds, "provider not running") {
 		t.Fatalf("diagnostics = %+v, want provider-not-running delete failure", ds)
 	}
@@ -803,7 +869,7 @@ func TestApplyZeroChangeMarkerClearing(t *testing.T) {
 			t.Fatal(err)
 		}
 		pl := &plan.Plan{FormatVersion: "1.0", StateSerial: st.Serial}
-		if ds := apply.Apply(context.Background(), pl, &config.Config{}, nil, nil, st, path); ds.HasErrors() {
+		if _, ds := apply.Apply(context.Background(), pl, &config.Config{}, nil, nil, st, path); ds.HasErrors() {
 			t.Fatalf("Apply: %+v", ds)
 		}
 		got := loadState(t, path)
@@ -815,7 +881,7 @@ func TestApplyZeroChangeMarkerClearing(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "state.json")
 		st := loadState(t, path)
 		pl := &plan.Plan{FormatVersion: "1.0", StateSerial: 0}
-		if ds := apply.Apply(context.Background(), pl, &config.Config{}, nil, nil, st, path); ds.HasErrors() {
+		if _, ds := apply.Apply(context.Background(), pl, &config.Config{}, nil, nil, st, path); ds.HasErrors() {
 			t.Fatalf("Apply: %+v", ds)
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
@@ -836,12 +902,12 @@ func TestApplyDestroyProviderDiagnosticHasResourceAddress(t *testing.T) {
 	h := newHarness(t, map[string]*config.Resource{addr: thing("web", "explode_destroy")})
 	ctx := context.Background()
 	st := loadState(t, h.statePath)
-	if ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("create fixture: %#v", ds)
 	}
 
 	st = loadState(t, h.statePath)
-	ds := apply.Apply(ctx, h.plan(t, st, true), h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(ctx, h.plan(t, st, true), h.cfg, h.providers, h.schemas, st, h.statePath)
 	providerError := diagnosticWithSummary(ds, "destroy exploded")
 	if providerError == nil || providerError.Address != addr {
 		t.Fatalf("destroy diagnostics = %#v", ds)
@@ -857,7 +923,7 @@ func TestApplyReplaceDoesNotDoublePrefixProviderDiagnostic(t *testing.T) {
 	h := newHarness(t, map[string]*config.Resource{addr: resource})
 	ctx := context.Background()
 	st := loadState(t, h.statePath)
-	if ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("create fixture: %#v", ds)
 	}
 
@@ -868,7 +934,7 @@ func TestApplyReplaceDoesNotDoublePrefixProviderDiagnostic(t *testing.T) {
 	if len(pl.Changes) != 1 || pl.Changes[0].Action != "replace" {
 		t.Fatalf("replace plan = %#v", pl.Changes)
 	}
-	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	result, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	providerError := diagnosticWithSummary(ds, "apply exploded")
 	if providerError == nil || providerError.Address != addr {
 		t.Fatalf("replace diagnostics = %#v", ds)
@@ -876,9 +942,8 @@ func TestApplyReplaceDoesNotDoublePrefixProviderDiagnostic(t *testing.T) {
 	if strings.Contains(providerError.Address, addr+"."+addr) {
 		t.Fatalf("replace diagnostic was double-prefixed: %#v", providerError)
 	}
-	aborted := diagnosticWithSummary(ds, "apply aborted")
-	if aborted == nil || !strings.Contains(aborted.Detail, addr+" (replace): removed from state") {
-		t.Fatalf("replace abort accounting = %#v", ds)
+	if result.Replaced != 0 || len(result.NotExecuted) != 0 {
+		t.Fatalf("replace result = %+v, want attempted but incomplete replacement", result)
 	}
 	if loadState(t, h.statePath).Resources[addr] != nil {
 		t.Fatal("replace destroy leg did not remain committed before create failure")
@@ -906,7 +971,7 @@ func TestApplyRefOrderBeatsAddressOrder(t *testing.T) {
 		t.Fatalf("plan changes not in address order: %s, %s", pl.Changes[0].Address, pl.Changes[1].Address)
 	}
 
-	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("Apply: %+v", ds)
 	}
 
@@ -950,7 +1015,7 @@ func TestApplyRejectsIssue58EmbeddedReference(t *testing.T) {
 	h.cfg.Resources[whAddr].Config["tags"] = map[string]any{
 		"content": "${tchoritest_thing.tunnel.id}.cfargotunnel.com",
 	}
-	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	requireUnresolvedAt(t, ds, whAddr)
 
 	saved := loadState(t, h.statePath)
@@ -1016,7 +1081,7 @@ func TestApplyRejectsPoisonedStateReferencePropagation(t *testing.T) {
 		t.Fatalf("write poisoned state: %v", err)
 	}
 
-	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	requireUnresolvedAt(t, ds, bAddr)
 	saved := loadState(t, h.statePath)
 	if saved.Resources[bAddr] != nil {
@@ -1042,7 +1107,7 @@ func TestApplyDependencyFailureSkipsDependent(t *testing.T) {
 	st := loadState(t, h.statePath)
 	pl := h.plan(t, st, false)
 
-	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if !ds.HasErrors() {
 		t.Fatal("Apply succeeded despite dependency provider failure")
 	}
@@ -1080,7 +1145,7 @@ func TestApplyReplace(t *testing.T) {
 	ctx := context.Background()
 
 	st := loadState(t, h.statePath) // empty: serial 0
-	if ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("create Apply: %+v", ds)
 	}
 
@@ -1093,7 +1158,7 @@ func TestApplyReplace(t *testing.T) {
 		t.Fatalf("plan = %+v, want exactly one replace change", pl.Changes)
 	}
 
-	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st2, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st2, h.statePath); ds.HasErrors() {
 		t.Fatalf("replace Apply: %+v", ds)
 	}
 
@@ -1110,6 +1175,124 @@ func TestApplyReplace(t *testing.T) {
 	}
 }
 
+func TestApplyDestroyFailureBlocksDependencyDelete(t *testing.T) {
+	const base = "tchoritest_thing.base"
+	const dependentAddr = "tchoritest_thing.dependent"
+	dependent := thing("dependent", "explode_destroy")
+	dependent.Config["tags"] = map[string]any{"base": "${tchoritest_thing.base.id}"}
+	h := newHarness(t, map[string]*config.Resource{
+		base:          thing("base", "base"),
+		dependentAddr: dependent,
+	})
+	ctx := context.Background()
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("seed Apply: %+v", ds)
+	}
+
+	st = loadState(t, h.statePath)
+	result, ds := apply.Apply(ctx, h.plan(t, st, true), h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() || diagnosticWithSummary(ds, "destroy exploded") == nil {
+		t.Fatalf("destroy diagnostics = %+v", ds)
+	}
+	if result.Deleted != 0 || len(result.NotExecuted) != 1 || result.NotExecuted[0].Address != base || result.NotExecuted[0].Action != "delete" || !strings.Contains(result.NotExecuted[0].Reason, dependentAddr) {
+		t.Fatalf("destroy result = %+v, want base blocked by dependent", result)
+	}
+	blocked := diagnosticWithSummary(ds, "planned change not executed")
+	if blocked == nil || blocked.Address != base || blocked.Severity != diag.Error {
+		t.Fatalf("blocked diagnostic = %+v", blocked)
+	}
+	saved := loadState(t, h.statePath)
+	if saved.Resources[base] == nil || saved.Resources[dependentAddr] == nil {
+		t.Fatalf("destroy removed a blocked or failed resource: %+v", saved.Resources)
+	}
+}
+
+func TestApplyMultipleStateOnlyDeletesIncludeNullAndPrivateState(t *testing.T) {
+	const alpha = "tchoritest_thing.alpha"
+	const zeta = "tchoritest_thing.zeta"
+	h := newHarness(t, map[string]*config.Resource{})
+	st := &state.State{FormatVersion: "1.0", Resources: map[string]*state.ResourceState{
+		alpha: {
+			Type:       "tchoritest_thing",
+			Provider:   "tchoritest",
+			Attributes: json.RawMessage("null"),
+			Private:    []byte("alpha-private"),
+		},
+		zeta: {
+			Type:       "tchoritest_thing",
+			Provider:   "tchoritest",
+			Attributes: json.RawMessage(`{"echo":"zeta","id":"id-zeta","name":"zeta","replace_me":null,"tags":null}`),
+			Private:    []byte("zeta-private"),
+		},
+	}}
+	if err := st.Save(h.statePath); err != nil {
+		t.Fatal(err)
+	}
+	pl := &plan.Plan{StateSerial: st.Serial, Changes: []*plan.Change{
+		{Address: alpha, Action: "delete"},
+		{Address: zeta, Action: "delete"},
+	}}
+	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if ds.HasErrors() {
+		t.Fatalf("Apply: %+v", ds)
+	}
+	if result.Deleted != 2 || len(result.NotExecuted) != 0 {
+		t.Fatalf("result = %+v, want two executed deletes", result)
+	}
+	if saved := loadState(t, h.statePath); len(saved.Resources) != 0 {
+		t.Fatalf("state-only deletes remain: %+v", saved.Resources)
+	}
+}
+
+func TestApplyStateOnlyDeletesKeepReverseLexicalOrderAfterFailures(t *testing.T) {
+	const alpha = "tchoritest_thing.alpha"
+	const middle = "tchoritest_thing.middle"
+	const zeta = "tchoritest_thing.zeta"
+	exploding := func(private string) *state.ResourceState {
+		return &state.ResourceState{
+			Type:       "tchoritest_thing",
+			Provider:   "tchoritest",
+			Attributes: json.RawMessage(`{"echo":"explode_destroy","id":"id-explode_destroy","name":"explode_destroy","replace_me":null,"tags":null}`),
+			Private:    []byte(private),
+		}
+	}
+	h := newHarness(t, map[string]*config.Resource{})
+	st := &state.State{FormatVersion: "1.0", Resources: map[string]*state.ResourceState{
+		alpha:  {Type: "tchoritest_thing", Provider: "tchoritest", Attributes: json.RawMessage("null")},
+		middle: exploding("middle-private"),
+		zeta:   exploding("zeta-private"),
+	}}
+	if err := st.Save(h.statePath); err != nil {
+		t.Fatal(err)
+	}
+	pl := &plan.Plan{StateSerial: st.Serial, Changes: []*plan.Change{
+		{Address: alpha, Action: "delete"},
+		{Address: middle, Action: "delete"},
+		{Address: zeta, Action: "delete"},
+	}}
+	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() || result.Deleted != 1 || len(result.NotExecuted) != 0 {
+		t.Fatalf("Apply = (%+v, %+v), want one successful delete and two attempted failures", result, ds)
+	}
+	var failed []string
+	for _, d := range ds {
+		if d.Summary == "destroy exploded" {
+			failed = append(failed, d.Address)
+		}
+	}
+	if !slices.Equal(failed, []string{zeta, middle}) {
+		t.Fatalf("destroy failure order = %v, want reverse lexical %v", failed, []string{zeta, middle})
+	}
+	saved := loadState(t, h.statePath)
+	if saved.Resources[alpha] != nil || saved.Resources[middle] == nil || saved.Resources[zeta] == nil {
+		t.Fatalf("state resources = %+v", saved.Resources)
+	}
+	if !bytes.Equal(saved.Resources[zeta].Private, []byte("zeta-private")) {
+		t.Fatalf("failed delete lost private bytes: %q", saved.Resources[zeta].Private)
+	}
+}
+
 func TestApplyDestroy(t *testing.T) {
 	h := newHarness(t, map[string]*config.Resource{
 		"tchoritest_thing.foo": thing("foo", "foo"),
@@ -1118,7 +1301,7 @@ func TestApplyDestroy(t *testing.T) {
 
 	// Create first.
 	st := loadState(t, h.statePath)
-	if ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("create Apply: %+v", ds)
 	}
 
@@ -1129,7 +1312,7 @@ func TestApplyDestroy(t *testing.T) {
 		t.Fatalf("destroy plan = %+v, want exactly one delete change", dpl.Changes)
 	}
 
-	if ds := apply.Apply(ctx, dpl, h.cfg, h.providers, h.schemas, st2, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, dpl, h.cfg, h.providers, h.schemas, st2, h.statePath); ds.HasErrors() {
 		t.Fatalf("destroy Apply: %+v", ds)
 	}
 
@@ -1225,7 +1408,7 @@ func TestApplyCreateIgnoresStalePriorState(t *testing.T) {
 		},
 	}
 
-	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if ds.HasErrors() {
 		t.Fatalf("Apply: %+v", ds)
 	}
@@ -1261,7 +1444,7 @@ func TestApplyCreateNestedTypeOmitted(t *testing.T) {
 		t.Errorf("planned after = %s, want settings:null", pl.Changes[0].After)
 	}
 
-	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("Apply: %+v", ds)
 	}
 
@@ -1299,7 +1482,7 @@ func TestApplyCreateNestedTypePopulated(t *testing.T) {
 		t.Errorf("planned after = %s, want it to carry the populated settings", pl.Changes[0].After)
 	}
 
-	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("Apply: %+v", ds)
 	}
 
@@ -1339,7 +1522,7 @@ func TestApplyMixedOptionalNestedObjects(t *testing.T) {
 	if len(pl.Changes) != 1 || pl.Changes[0].Action != "update" || len(pl.Changes[0].PlannedRaw) == 0 {
 		t.Fatalf("plan = %+v, want one update with PlannedRaw", pl.Changes)
 	}
-	if ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("Apply: %+v", ds)
 	}
 	got := stateAttrs(t, h.statePath, "tchoritest_ingress_thing.demo")
@@ -1375,7 +1558,7 @@ func TestApplyUnsupportedResourceType(t *testing.T) {
 		Summary:       plan.Summary{Create: 1},
 	}
 
-	ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if !ds.HasErrors() {
 		t.Fatal("Apply accepted a resource type with an unsupported (nested_type) schema, want error")
 	}
@@ -1442,7 +1625,7 @@ func TestApplySingleApplyResolvesListNestedRefCreateUpdate(t *testing.T) {
 	if len(pl.Changes) != 1 || pl.Changes[0].Action != "create" {
 		t.Fatalf("seed plan = %+v, want exactly one create change", pl.Changes)
 	}
-	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("seed Apply: %+v", ds)
 	}
 	if saved := loadState(t, h.statePath); saved.Serial != 3 {
@@ -1471,7 +1654,7 @@ func TestApplySingleApplyResolvesListNestedRefCreateUpdate(t *testing.T) {
 	}
 
 	// One apply must suffice: zero error diagnostics.
-	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("single Apply (create a + update b with list-nested ref): %+v", ds)
 	}
 
@@ -1518,7 +1701,7 @@ func TestApplySingleApplyResolvesListNestedRefCreateCreate(t *testing.T) {
 		}
 	}
 
-	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("single Apply (create a_ref + create z_target with list-nested ref): %+v", ds)
 	}
 
@@ -1550,7 +1733,7 @@ func TestApplyReportsPartialProgressAndAttemptedUpdateAfterProvider400(t *testin
 	})
 	ctx := context.Background()
 	st := loadState(t, h.statePath)
-	if ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+	if _, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("seed apply: %#v", ds)
 	}
 
@@ -1561,7 +1744,7 @@ func TestApplyReportsPartialProgressAndAttemptedUpdateAfterProvider400(t *testin
 	if pl.Summary != (plan.Summary{Update: 2}) {
 		t.Fatalf("summary = %+v, want two updates", pl.Summary)
 	}
-	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	result, ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if !ds.HasErrors() {
 		t.Fatalf("Apply diagnostics = %#v, want provider error", ds)
 	}
@@ -1569,14 +1752,8 @@ func TestApplyReportsPartialProgressAndAttemptedUpdateAfterProvider400(t *testin
 	if providerError == nil || providerError.Detail != "api error (status 400): Invalid request" || providerError.Address != failed {
 		t.Fatalf("provider diagnostic changed = %#v", ds)
 	}
-	if diagnosticCount(ds, "apply aborted") != 1 {
-		t.Fatalf("apply-aborted count = %d; diagnostics = %#v", diagnosticCount(ds, "apply aborted"), ds)
-	}
-	aborted := diagnosticWithSummary(ds, "apply aborted")
-	for _, want := range []string{first + " (update): recorded in state", failed, "action update", "nothing was left unattempted", "run tchori plan again"} {
-		if aborted == nil || !strings.Contains(aborted.Detail, want) {
-			t.Fatalf("abort detail = %#v; want %q", aborted, want)
-		}
+	if result.Updated != 1 || len(result.NotExecuted) != 0 {
+		t.Fatalf("result = %+v, want one completed independent update", result)
 	}
 	if diagnosticCount(ds, "attempted change") != 1 {
 		t.Fatalf("attempted-change count = %d; diagnostics = %#v", diagnosticCount(ds, "attempted change"), ds)
@@ -1590,16 +1767,15 @@ func TestApplyReportsPartialProgressAndAttemptedUpdateAfterProvider400(t *testin
 	}
 }
 
-func TestApplyAbortAccountingFirstAndMiddleFailure(t *testing.T) {
+func TestApplyIndependentChangesContinueAfterFirstAndMiddleFailure(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		updates      []string
-		failed       string
-		wantRecorded string
-		wantPending  string
+		name        string
+		updates     []string
+		failed      string
+		wantUpdated int
 	}{
-		{name: "first", updates: []string{"api_400", "second"}, failed: "tchoritest_thing.a_first", wantPending: "tchoritest_thing.z_second (update)"},
-		{name: "middle", updates: []string{"first", "api_400", "third"}, failed: "tchoritest_thing.m_middle", wantRecorded: "tchoritest_thing.a_first (update): recorded in state", wantPending: "tchoritest_thing.z_last (update)"},
+		{name: "first", updates: []string{"api_400", "second"}, failed: "tchoritest_thing.a_first", wantUpdated: 1},
+		{name: "middle", updates: []string{"first", "api_400", "third"}, failed: "tchoritest_thing.m_middle", wantUpdated: 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resources := map[string]*config.Resource{
@@ -1613,7 +1789,7 @@ func TestApplyAbortAccountingFirstAndMiddleFailure(t *testing.T) {
 			}
 			h := newHarness(t, resources)
 			st := loadState(t, h.statePath)
-			if ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+			if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 				t.Fatalf("seed apply: %#v", ds)
 			}
 			addresses := []string{"tchoritest_thing.a_first", "tchoritest_thing.z_second"}
@@ -1624,20 +1800,20 @@ func TestApplyAbortAccountingFirstAndMiddleFailure(t *testing.T) {
 				h.cfg.Resources[addr].Config["name"] = tc.updates[i]
 			}
 			st = loadState(t, h.statePath)
-			ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
-			aborted := diagnosticWithSummary(ds, "apply aborted")
-			if aborted == nil || aborted.Address != tc.failed || diagnosticCount(ds, "apply aborted") != 1 {
+			result, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+			if !ds.HasErrors() || diagnosticWithSummary(ds, "Error updating service") == nil {
 				t.Fatalf("diagnostics = %#v", ds)
 			}
-			if tc.wantRecorded == "" {
-				if !strings.Contains(aborted.Detail, "nothing was applied") {
-					t.Fatalf("first-failure detail = %q", aborted.Detail)
-				}
-			} else if !strings.Contains(aborted.Detail, tc.wantRecorded) {
-				t.Fatalf("detail = %q; want %q", aborted.Detail, tc.wantRecorded)
+			if result.Updated != tc.wantUpdated || len(result.NotExecuted) != 0 {
+				t.Fatalf("result = %+v, want %d independent updates", result, tc.wantUpdated)
 			}
-			if !strings.Contains(aborted.Detail, tc.wantPending) {
-				t.Fatalf("detail = %q; want pending %q", aborted.Detail, tc.wantPending)
+			for i, addr := range addresses {
+				if addr == tc.failed {
+					continue
+				}
+				if got := stateAttrs(t, h.statePath, addr)["name"]; got != tc.updates[i] {
+					t.Fatalf("%s name = %v, want %s", addr, got, tc.updates[i])
+				}
 			}
 		})
 	}
@@ -1646,7 +1822,7 @@ func TestApplyAbortAccountingFirstAndMiddleFailure(t *testing.T) {
 func TestApplySuccessfulRunEmitsNoAbortDiagnostics(t *testing.T) {
 	h := newHarness(t, map[string]*config.Resource{"tchoritest_thing.ok": thing("ok", "ok")})
 	st := loadState(t, h.statePath)
-	ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	_, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
 	if len(ds) != 0 {
 		t.Fatalf("successful apply diagnostics = %#v", ds)
 	}
@@ -1655,7 +1831,7 @@ func TestApplySuccessfulRunEmitsNoAbortDiagnostics(t *testing.T) {
 func TestApplyPreLoopRefusalsDoNotReportAbort(t *testing.T) {
 	t.Run("stale plan", func(t *testing.T) {
 		st := &state.State{FormatVersion: "1.0", Serial: 2, Resources: map[string]*state.ResourceState{}}
-		ds := apply.Apply(context.Background(), &plan.Plan{StateSerial: 1}, &config.Config{}, nil, nil, st, filepath.Join(t.TempDir(), "state.json"))
+		_, ds := apply.Apply(context.Background(), &plan.Plan{StateSerial: 1}, &config.Config{}, nil, nil, st, filepath.Join(t.TempDir(), "state.json"))
 		if diagnosticWithSummary(ds, "apply aborted") != nil {
 			t.Fatalf("diagnostics = %#v", ds)
 		}
@@ -1663,7 +1839,7 @@ func TestApplyPreLoopRefusalsDoNotReportAbort(t *testing.T) {
 	t.Run("configuration drift", func(t *testing.T) {
 		st := &state.State{FormatVersion: "1.0", Resources: map[string]*state.ResourceState{}}
 		pl := &plan.Plan{Changes: []*plan.Change{{Address: "tchoritest_thing.gone", Action: "create"}}}
-		ds := apply.Apply(context.Background(), pl, &config.Config{Resources: map[string]*config.Resource{}}, nil, nil, st, filepath.Join(t.TempDir(), "state.json"))
+		_, ds := apply.Apply(context.Background(), pl, &config.Config{Resources: map[string]*config.Resource{}}, nil, nil, st, filepath.Join(t.TempDir(), "state.json"))
 		if diagnosticWithSummary(ds, "apply aborted") != nil {
 			t.Fatalf("diagnostics = %#v", ds)
 		}
@@ -1674,7 +1850,7 @@ func TestApplyPreLoopRefusalsDoNotReportAbort(t *testing.T) {
 		cfg := &config.Config{Resources: map[string]*config.Resource{a.Address: a, b.Address: b}}
 		st := &state.State{FormatVersion: "1.0", Resources: map[string]*state.ResourceState{}}
 		pl := &plan.Plan{Changes: []*plan.Change{{Address: a.Address, Action: "create"}, {Address: b.Address, Action: "create"}}}
-		ds := apply.Apply(context.Background(), pl, cfg, nil, nil, st, filepath.Join(t.TempDir(), "state.json"))
+		_, ds := apply.Apply(context.Background(), pl, cfg, nil, nil, st, filepath.Join(t.TempDir(), "state.json"))
 		if !ds.HasErrors() || diagnosticWithSummary(ds, "apply aborted") != nil {
 			t.Fatalf("diagnostics = %#v", ds)
 		}
