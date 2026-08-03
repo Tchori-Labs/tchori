@@ -247,7 +247,8 @@ func newCLIRegistryFixture(t *testing.T, namespace, name, version string) *httpt
 		_, _ = w.Write(signature.Bytes())
 	})
 
-	srv = httptest.NewServer(mux)
+	srv = httptest.NewUnstartedServer(mux)
+	srv.Start()
 	t.Cleanup(srv.Close)
 	return srv
 }

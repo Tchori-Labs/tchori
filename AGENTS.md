@@ -57,11 +57,12 @@ Run, from the repo root. Install the pinned actionlint version documented in
 ```bash
 gofmt -l .
 go vet ./...
+GOOS=windows go vet ./...
 golangci-lint run
 bash scripts/actionlint-verify.sh
 go test ./...
 ```
-CI's `check` job (`.github/workflows/ci.yml`) re-runs these checks, validates
+CI's `check` job (`.github/workflows/ci.yml`) re-runs all six checks, validates
 GitHub Actions workflows, and runs the bounded full-suite race detector. It is
 a required status check and must be green before merge.
 

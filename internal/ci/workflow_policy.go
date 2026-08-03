@@ -128,6 +128,32 @@ func CheckJobEnforcesRaceDetector(workflowYAML []byte) error {
 	return fmt.Errorf("check job must directly run go test with -race, an explicit -timeout, and all packages")
 }
 
+// CheckJobRunsWindowsVet verifies that the required check job directly and
+// unconditionally cross-vets every package for Windows.
+func CheckJobRunsWindowsVet(workflowYAML []byte) error {
+	doc, err := parseWorkflow(workflowYAML)
+	if err != nil {
+		return err
+	}
+
+	check, ok := doc.Jobs["check"]
+	if !ok {
+		return fmt.Errorf("workflow declares no check job")
+	}
+	for _, step := range check.Steps {
+		if runsWindowsVet(step.Run) {
+			if step.ContinueOnError {
+				return fmt.Errorf("windows vet step must not allow failures with continue-on-error")
+			}
+			if strings.TrimSpace(step.If) != "" {
+				return fmt.Errorf("windows vet step must not declare an if condition")
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("check job must directly run the windows cross-vet command")
+}
+
 // CheckJobRunsWorkflowLint verifies that the required check job installs an
 // immutable actionlint release and unconditionally runs the repository's
 // workflow-verification script without suppressing failures.
@@ -231,6 +257,21 @@ func parseWorkflow(workflowYAML []byte) (workflowDoc, error) {
 		return workflowDoc{}, fmt.Errorf("workflow declares no jobs")
 	}
 	return doc, nil
+}
+
+func runsWindowsVet(script string) bool {
+	scanner := bufio.NewScanner(strings.NewReader(script))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.ContainsAny(line, ";|&") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 4 && fields[0] == "GOOS=windows" && fields[1] == "go" && fields[2] == "vet" && fields[3] == "./..." {
+			return true
+		}
+	}
+	return false
 }
 
 func runsBoundedRaceDetector(script string) bool {

@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -461,12 +460,12 @@ func waitForProviderExit(t *testing.T, pid int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
-		err := syscall.Kill(pid, 0)
-		if errors.Is(err, syscall.ESRCH) {
-			return
-		}
-		if err != nil && !errors.Is(err, syscall.EPERM) {
+		alive, err := providerProcessAlive(pid)
+		if err != nil {
 			t.Fatalf("checking provider process %d: %v", pid, err)
+		}
+		if !alive {
+			return
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("provider process %d still exists %v after Launch returned", pid, timeout)
