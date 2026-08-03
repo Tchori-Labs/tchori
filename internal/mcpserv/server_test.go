@@ -3,14 +3,18 @@ package mcpserv
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // buildTchori compiles the tchori binary into dir and returns its path.
@@ -197,5 +201,32 @@ func TestServeStateListOverStdio(t *testing.T) {
 	wantAddrs := []string{"null_resource.alpha", "null_resource.beta"}
 	if !slices.Equal(payload.Addresses, wantAddrs) {
 		t.Fatalf("addresses = %v, want %v", payload.Addresses, wantAddrs)
+	}
+}
+
+func TestStateShowMasksRecordedSensitivityWithoutWriting(t *testing.T) {
+	workdir := t.TempDir()
+	const sentinel = "tchori-e2e-super-secret-value"
+	stateJSON := `{"format_version":"1.0","serial":1,"resources":{"secret.demo":{"type":"secret","provider":"test","attributes":{"client_secret":"` + sentinel + `"},"sensitive_paths":["client_secret"]}}}`
+	path := filepath.Join(workdir, "state.json")
+	if err := os.WriteFile(path, []byte(stateJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(path) //nolint:gosec // test-controlled state path under t.TempDir()
+	h := &handlers{workdir: workdir}
+	result, _, err := h.stateShow(context.Background(), nil, stateShowInput{Address: "secret.demo"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("content=%T", result.Content[0])
+	}
+	if strings.Contains(text.Text, sentinel) || !strings.Contains(text.Text, `"sensitive_paths":["client_secret"]`) {
+		t.Fatalf("result leaked or omitted metadata: %s", text.Text)
+	}
+	after, _ := os.ReadFile(path) //nolint:gosec // test-controlled state path under t.TempDir()
+	if !bytes.Equal(before, after) {
+		t.Fatal("MCP state_show modified state")
 	}
 }

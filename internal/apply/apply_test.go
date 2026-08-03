@@ -14,6 +14,7 @@ import (
 
 	"github.com/tchori-labs/tchori/internal/apply"
 	"github.com/tchori-labs/tchori/internal/config"
+	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/plan"
 	"github.com/tchori-labs/tchori/internal/provider"
 	"github.com/tchori-labs/tchori/internal/state"
@@ -108,6 +109,14 @@ func thing(addrName, cfgName string) *config.Resource {
 		Provider: "tchoritest",
 		Config:   map[string]any{"name": cfgName},
 	}
+}
+
+func secretful(addrName string, cfg map[string]any) *config.Resource {
+	values := map[string]any{"name": addrName}
+	for k, v := range cfg {
+		values[k] = v
+	}
+	return &config.Resource{Address: "tchoritest_secretful." + addrName, Type: "tchoritest_secretful", Name: addrName, Provider: "tchoritest", Config: values}
 }
 
 // nestedThing returns a tchoritest_nested_thing resource (issue #7's
@@ -351,8 +360,41 @@ func TestApplyLossyResolvedReferencesRemainChecked(t *testing.T) {
 	h := newHarness(t, map[string]*config.Resource{source.Address: source, lossyAddr: lossy})
 	st := loadState(t, h.statePath)
 	ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
-	if len(ds) != 1 || ds[0].Address != lossyAddr || !strings.Contains(ds[0].Detail, `tags["dropped"]: planned "id-source", applied absent`) || !strings.Contains(ds[0].Detail, "secret: planned (sensitive value), applied (sensitive value)") || strings.Contains(ds[0].Detail, "SOURCE") {
+	if len(ds) != 2 || ds[0].Severity != diag.Warning || ds[1].Address != lossyAddr || !strings.Contains(ds[1].Detail, `tags["dropped"]: planned "id-source", applied absent`) || !strings.Contains(ds[1].Detail, "secret: planned (sensitive value), applied (sensitive value)") || strings.Contains(ds[1].Detail, "SOURCE") {
 		t.Fatalf("diagnostics = %#v", ds)
+	}
+}
+
+func TestApplyWithholdsSensitiveComputedAndReferencedValues(t *testing.T) {
+	a := secretful("a", nil)
+	b := secretful("b", map[string]any{"token": "${tchoritest_secretful.a.client_secret}"})                                                                              //nolint:gosec // schema attribute name in redaction regression
+	c := secretful("c", map[string]any{"rules": []any{map[string]any{"token": "literal-token-ok"}, map[string]any{"token": "${tchoritest_secretful.a.client_secret}"}}}) //nolint:gosec // fake values exercise per-instance redaction
+	h := newHarness(t, map[string]*config.Resource{a.Address: a, b.Address: b, c.Address: c})
+	st := loadState(t, h.statePath)
+	ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	if ds.HasErrors() {
+		t.Fatalf("Apply: %#v", ds)
+	}
+	data, err := os.ReadFile(h.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "tchori-e2e-super-secret-value") {
+		t.Fatal("sensitive sentinel persisted")
+	}
+	if !strings.Contains(string(data), "literal-token-ok") {
+		t.Fatal("literal exemption was not preserved")
+	}
+	attrs := stateAttrs(t, h.statePath, a.Address)
+	if attrs["client_secret"] != nil {
+		t.Fatalf("client_secret = %#v, want null", attrs["client_secret"])
+	}
+	reloaded := loadState(t, h.statePath)
+	pl := h.plan(t, reloaded, false)
+	for _, ch := range pl.Changes {
+		if ch.Action != "no-op" {
+			t.Fatalf("post-apply action for %s = %s", ch.Address, ch.Action)
+		}
 	}
 }
 

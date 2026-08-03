@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/plan"
 	"github.com/tchori-labs/tchori/internal/provider"
 	"github.com/tchori-labs/tchori/internal/state"
+	ctymsgpack "github.com/zclconf/go-cty/cty/msgpack"
 )
 
 func TestHasChanges(t *testing.T) {
@@ -367,6 +369,54 @@ func newPlanner(t *testing.T, cfg *config.Config, st *state.State) *plan.Planner
 // (compact, attribute keys sorted).
 const demoApplied = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":null,"rules":null,"tags":null}`
 const demoAppliedOld = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"old","rules":null,"tags":null}`
+
+func TestPlanRedactsSensitiveArtifactsAndPlannedRaw(t *testing.T) {
+	const sentinel = "tchori-e2e-super-secret-value"
+	addr := "tchoritest_secretful.demo"
+	cfg := testConfig(t, map[string]map[string]any{addr: {"name": "demo"}})
+	attrs := `{"name":"demo","id":"secret-demo","client_secret":"` + sentinel + `","write_only_secret":null,"token":null,"note":null,"rules":null}`
+	st := stateWith(t, 1, map[string]string{addr: attrs})
+	p := newPlanner(t, cfg, st)
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan: %#v", ds)
+	}
+	if len(pl.Changes) != 1 {
+		t.Fatalf("changes=%d", len(pl.Changes))
+	}
+	ch := pl.Changes[0]
+	if bytes.Contains(ch.Before, []byte(sentinel)) || bytes.Contains(ch.After, []byte(sentinel)) || bytes.Contains(ch.PlannedRaw, []byte(sentinel)) {
+		t.Fatal("sentinel leaked into plan artifact")
+	}
+	sch, _, _ := p.Schemas["tchoritest"].LookupResourceType("tchoritest_secretful")
+	v, err := ctymsgpack.Unmarshal(ch.PlannedRaw, sch.Block.ImpliedType())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.GetAttr("client_secret").IsKnown() {
+		t.Fatal("planned_raw client_secret is not unknown")
+	}
+	if ch.Action != "no-op" {
+		t.Fatalf("action=%s, want no-op", ch.Action)
+	}
+	if !slices.Contains(ch.UnknownAfter, "client_secret") {
+		t.Fatalf("unknown_after=%v", ch.UnknownAfter)
+	}
+}
+
+func TestPlanStateOnlyDeleteUsesPersistedSensitivePaths(t *testing.T) {
+	addr := "tchoritest_secretful.gone"
+	st := stateWith(t, 1, map[string]string{addr: `{"name":"gone","id":"id","client_secret":null,"write_only_secret":null,"token":null,"note":"tchori-e2e-super-secret-value","rules":null}`})
+	st.Resources[addr].SensitivePaths = []string{"note"}
+	p := newPlanner(t, testConfig(t, nil), st)
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan: %#v", ds)
+	}
+	if bytes.Contains(pl.Changes[0].Before, []byte("tchori-e2e-super-secret-value")) {
+		t.Fatal("delete before leaked custom sensitive value")
+	}
+}
 
 func TestPlanCreateWithReference(t *testing.T) {
 	cfg := testConfig(t, map[string]map[string]any{

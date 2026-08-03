@@ -8,13 +8,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"time"
 
 	"github.com/gofrs/flock"
+
+	"github.com/tchori-labs/tchori/internal/sensitive"
 )
 
 // formatVersion is the only state file schema version the MVP understands.
@@ -41,18 +43,36 @@ var (
 
 // ResourceState is the persisted state of a single managed resource.
 type ResourceState struct {
-	Type       string          `json:"type"`
-	Provider   string          `json:"provider"`
-	Attributes json.RawMessage `json:"attributes"`        // ctyjson-encoded object
-	Private    []byte          `json:"private,omitempty"` // std base64 via encoding/json
+	Type             string          `json:"type"`
+	Provider         string          `json:"provider"`
+	Attributes       json.RawMessage `json:"attributes"`        // ctyjson-encoded object
+	Private          []byte          `json:"private,omitempty"` // std base64 via encoding/json
+	Redacted         []string        `json:"redacted,omitempty"`
+	SensitivePaths   []string        `json:"sensitive_paths,omitempty"`
+	SensitiveScanned bool            `json:"sensitive_scanned,omitempty"`
 }
+
+// Resolution is a live schema+config sensitivity lookup result. An empty Paths
+// slice is a valid, definitive non-sensitive result when the resolver's ok is
+// true; nil-vs-empty is never used to signal resolvability.
+type Resolution struct {
+	Paths           []string
+	ExemptInstances []string
+}
+
+// SensitiveResolver reports sensitivity for one entry. ok=false means the
+// address is unresolvable and callers must conservatively use persisted hints.
+type SensitiveResolver func(addr string, rs *ResourceState) (resolution Resolution, ok bool)
 
 // State is the top-level state document persisted to state.json.
 type State struct {
-	FormatVersion string                    `json:"format_version"` // "1.0"
-	Serial        uint64                    `json:"serial"`
-	Resources     map[string]*ResourceState `json:"resources"` // key = address
-	baseSerial    uint64                    `json:"-"`
+	FormatVersion  string                    `json:"format_version"` // "1.0"
+	Serial         uint64                    `json:"serial"`
+	Resources      map[string]*ResourceState `json:"resources"` // key = address
+	baseSerial     uint64                    `json:"-"`
+	resolver       SensitiveResolver         `json:"-"`
+	sensitiveHints map[string][]string       `json:"-"`
+	unresolved     []string                  `json:"-"`
 }
 
 // Load returns an empty state (FormatVersion "1.0", Serial 0, empty map)
@@ -85,6 +105,22 @@ func Load(path string) (*State, error) {
 	}
 	s.baseSerial = s.Serial
 	return &s, nil
+}
+
+// SetSensitiveResolver registers the live schema+raw-config resolver used by Save.
+func (s *State) SetSensitiveResolver(r SensitiveResolver) { s.resolver = r }
+
+// NoteSensitive records the full effective path set for backup sanitization.
+func (s *State) NoteSensitive(addr string, paths []string) {
+	if s.sensitiveHints == nil {
+		s.sensitiveHints = map[string][]string{}
+	}
+	s.sensitiveHints[addr] = unionStrings(s.sensitiveHints[addr], paths)
+}
+
+// UnresolvedSensitiveAddresses returns addresses the most recent Save could not inspect.
+func (s *State) UnresolvedSensitiveAddresses() []string {
+	return append([]string(nil), s.unresolved...)
 }
 
 // Save acquires path+".lock" via flock and compares the on-disk serial with
@@ -145,14 +181,19 @@ func (s *State) Save(path string) error {
 		return fmt.Errorf("%s: on-disk serial %d does not match loaded serial %d: %w", path, onDiskSerial, s.baseSerial, ErrConcurrentModification)
 	}
 
-	if err := backupExisting(path); err != nil {
+	if s.Resources == nil {
+		s.Resources = map[string]*ResourceState{}
+	}
+	// Sanitize the previous document first, while its persisted path contract
+	// is still available. Backups deliberately use no literal exemptions.
+	if err := s.backupExisting(path); err != nil {
+		return err
+	}
+	if err := s.sanitizeAll(); err != nil {
 		return err
 	}
 
 	s.FormatVersion = formatVersion
-	if s.Resources == nil {
-		s.Resources = map[string]*ResourceState{}
-	}
 	// Marshal a copy with the next serial so pre-rename failures do not mutate
 	// the caller's serial. Once rename succeeds, the replacement is visible and
 	// both Serial and baseSerial must advance even if the durability barrier
@@ -260,26 +301,61 @@ func verifyLockedSidecar(lock *flock.Flock, lockPath string) error {
 	return nil
 }
 
-// backupExisting copies the current file at path to path+".backup" before it
-// is overwritten. The source is opened first: when it does not exist, the
-// backup is a no-op without inspecting a hostile entry at the backup path.
-// Once a source exists, a directory at the backup path is rejected because it
-// cannot be renamed over. Every other entry is safely replaced via a fresh
-// same-directory temporary file and os.Rename. This replaces the name without
-// writing through it (an atomic replace on POSIX), so rejecting symlinks would
-// only enable denial of service. CreateTemp requests mode 0600; on POSIX umask
-// can only narrow that to owner-only bits, while Windows uses its own permission
-// semantics. No chmod is needed because the renamed file is always a new inode.
-func backupExisting(path string) error {
-	src, err := os.Open(path) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
+// backupExisting writes a sanitized recovery copy of the previous document.
+// If no entry has a known sensitive path it preserves the historical exact-byte
+// copy. Otherwise it parses and canonically rewrites the document; parse errors
+// fail closed instead of copying bytes that could not be inspected.
+func (s *State) backupExisting(path string) error {
+	data, err := os.ReadFile(path) //nolint:gosec // operator-selected state path
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return fmt.Errorf("open state for backup %s: %w", path, err)
 	}
-	defer func() { _ = src.Close() }()
+	var previous State
+	if err := json.Unmarshal(data, &previous); err != nil {
+		return fmt.Errorf("parse state for backup %s: %w", path, err)
+	}
+	if previous.Resources == nil {
+		previous.Resources = map[string]*ResourceState{}
+	}
+	changedDocument := false
+	for addr, prior := range previous.Resources {
+		paths := unionStrings(prior.SensitivePaths, prior.Redacted, s.sensitiveHints[addr])
+		if current := s.Resources[addr]; current != nil {
+			paths = unionStrings(paths, current.SensitivePaths)
+		}
+		if s.resolver != nil {
+			if resolution, ok := s.resolver(addr, prior); ok {
+				paths = unionStrings(paths, resolution.Paths)
+			}
+		}
+		if len(paths) == 0 {
+			continue
+		}
+		changedDocument = true
+		// Conservative by design: a backup is a recovery/reporting copy never
+		// read by the engine, so under-scrubbing is a leak and over-scrubbing a
+		// raw literal is safe.
+		attrs, changed, err := sensitive.RedactJSON(prior.Attributes, paths, nil)
+		if err != nil {
+			return fmt.Errorf("sanitize backup attributes for %s: %w", addr, err)
+		}
+		prior.Attributes = attrs
+		prior.Redacted = unionStrings(prior.Redacted, changed)
+	}
+	if changedDocument {
+		data, err = json.MarshalIndent(&previous, "", "  ")
+		if err != nil {
+			return fmt.Errorf("marshal sanitized backup: %w", err)
+		}
+		data = append(data, '\n')
+	}
+	return writeBackup(path, data)
+}
 
+func writeBackup(path string, data []byte) error {
 	backupPath := path + ".backup"
 	info, err := os.Lstat(backupPath)
 	if err == nil && info.IsDir() {
@@ -288,27 +364,104 @@ func backupExisting(path string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("inspect backup path %s: %w", backupPath, err)
 	}
-
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".state-backup-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temporary backup %s: %w", backupPath, err)
 	}
 	tmpPath := tmp.Name()
-	cleanupTemp := func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
+	cleanup := func() { _ = tmp.Close(); _ = os.Remove(tmpPath) }
+	if err := tmp.Chmod(0o600); err != nil {
+		cleanup()
+		return fmt.Errorf("chmod backup %s: %w", backupPath, err)
 	}
-	if _, err := io.Copy(tmp, src); err != nil {
-		cleanupTemp()
+	if _, err := tmp.Write(data); err != nil {
+		cleanup()
 		return fmt.Errorf("copy backup %s: %w", backupPath, err)
 	}
 	if err := tmp.Close(); err != nil {
-		cleanupTemp()
+		cleanup()
 		return fmt.Errorf("close backup %s: %w", backupPath, err)
 	}
 	if err := os.Rename(tmpPath, backupPath); err != nil {
-		cleanupTemp()
+		cleanup()
 		return fmt.Errorf("rename backup %s: %w", backupPath, err)
 	}
 	return nil
+}
+
+func (s *State) sanitizeAll() error {
+	s.unresolved = nil
+	for addr, rs := range s.Resources {
+		if rs == nil {
+			continue
+		}
+		paths := unionStrings(rs.SensitivePaths, s.sensitiveHints[addr])
+		var exemptions []string
+		resolved := false
+		if s.resolver != nil {
+			if resolution, ok := s.resolver(addr, rs); ok {
+				resolved = true
+				paths = sortedUnique(resolution.Paths) // current live resolution is authoritative
+				exemptions = resolution.ExemptInstances
+				rs.SensitivePaths = append([]string(nil), paths...)
+				rs.SensitiveScanned = true
+				rs.Redacted = intersectStrings(rs.Redacted, paths)
+			} else if len(paths) == 0 {
+				s.unresolved = append(s.unresolved, addr)
+			}
+		}
+		if len(paths) == 0 {
+			if resolved {
+				rs.SensitivePaths = nil
+				rs.Redacted = nil
+			}
+			continue
+		}
+		if !resolved {
+			exemptions = nil
+		} // orphan/config-unavailable: fail closed
+		attrs, changed, err := sensitive.RedactJSON(rs.Attributes, paths, exemptions)
+		if err != nil {
+			return fmt.Errorf("sanitize state attributes for %s: %w", addr, err)
+		}
+		rs.Attributes = attrs
+		rs.Redacted = unionStrings(rs.Redacted, changed)
+	}
+	sort.Strings(s.unresolved)
+	return nil
+}
+
+func sortedUnique(parts []string) []string {
+	set := map[string]bool{}
+	for _, p := range parts {
+		if p != "" {
+			set[p] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+func unionStrings(groups ...[]string) []string {
+	var all []string
+	for _, g := range groups {
+		all = append(all, g...)
+	}
+	return sortedUnique(all)
+}
+func intersectStrings(a, b []string) []string {
+	keep := map[string]bool{}
+	for _, p := range b {
+		keep[p] = true
+	}
+	var out []string
+	for _, p := range a {
+		if keep[p] {
+			out = append(out, p)
+		}
+	}
+	return sortedUnique(out)
 }

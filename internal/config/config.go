@@ -44,11 +44,12 @@ type ProviderConfig struct {
 
 // Resource is one entry under the top-level "resources" object.
 type Resource struct {
-	Address  string         // "null_resource.demo"
-	Type     string         // "null_resource"
-	Name     string         // "demo"
-	Provider string         // resolved provider local name
-	Config   map[string]any // raw JSON, refs and env-wrappers unresolved
+	Address             string         // "null_resource.demo"
+	Type                string         // "null_resource"
+	Name                string         // "demo"
+	Provider            string         // resolved provider local name
+	Config              map[string]any // raw JSON, refs and env-wrappers unresolved
+	SensitiveAttributes []string       // optional provider-schema sensitivity overrides
 }
 
 // fileDoc mirrors the JSON shape of a single *.tchori.json file.
@@ -64,8 +65,9 @@ type fileProvider struct {
 }
 
 type fileResource struct {
-	Provider string         `json:"provider"`
-	Config   map[string]any `json:"config"`
+	Provider            string         `json:"provider"`
+	Config              map[string]any `json:"config"`
+	SensitiveAttributes []string       `json:"sensitive_attributes"`
 }
 
 // Load reads and merges all *.tchori.json files in dir (lexical filename
@@ -169,11 +171,12 @@ func Load(dir string) (*Config, diag.Diagnostics) {
 			// The schema guarantees exactly one "." in the address.
 			typ, rname, _ := strings.Cut(addr, ".")
 			cfg.Resources[addr] = &Resource{
-				Address:  addr,
-				Type:     typ,
-				Name:     rname,
-				Provider: r.Provider, // resolved below, after all files merge
-				Config:   r.Config,
+				Address:             addr,
+				Type:                typ,
+				Name:                rname,
+				Provider:            r.Provider, // resolved below, after all files merge
+				Config:              r.Config,
+				SensitiveAttributes: append([]string(nil), r.SensitiveAttributes...),
 			}
 		}
 	}

@@ -726,3 +726,33 @@ func TestImportErrorPaths(t *testing.T) {
 		}
 	})
 }
+
+func TestStateShowMasksRecordedSensitivityAndNotesOnlyUnscanned(t *testing.T) {
+	dir := t.TempDir()
+	const sentinel = "tchori-e2e-super-secret-value"
+	stateDoc := `{"format_version":"1.0","serial":1,"resources":{` +
+		`"secret.masked":{"type":"secret","provider":"test","attributes":{"client_secret":"` + sentinel + `"},"sensitive_paths":["client_secret"]},` +
+		`"thing.scanned":{"type":"thing","provider":"test","attributes":{"value":"ok"},"sensitive_scanned":true},` +
+		`"thing.legacy":{"type":"thing","provider":"test","attributes":{"value":"legacy"}}}}`
+	path := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(path, []byte(stateDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(path) //nolint:gosec // test-controlled path under t.TempDir()
+	stdout, stderr, code := runCLI(t, dir, "state", "show", "secret.masked")
+	if code != 0 || strings.Contains(stdout+stderr, sentinel) || strings.Contains(stderr, "not checked") {
+		t.Fatalf("masked show: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI(t, dir, "state", "show", "thing.scanned")
+	if code != 0 || strings.Contains(stderr, "not checked") {
+		t.Fatalf("scanned show: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	_, stderr, code = runCLI(t, dir, "state", "show", "thing.legacy")
+	if code != 0 || !strings.Contains(stderr, "not checked") {
+		t.Fatalf("legacy note: code=%d stderr=%s", code, stderr)
+	}
+	after, _ := os.ReadFile(path) //nolint:gosec // test-controlled path under t.TempDir()
+	if !bytes.Equal(before, after) {
+		t.Fatal("state show modified state.json")
+	}
+}

@@ -159,6 +159,24 @@ var serverAssignedSchema = &tfprotov6.Schema{
 	},
 }
 
+const secretSentinel = "tchori-e2e-super-secret-value" //nolint:gosec // deliberate fake credential sentinel proving absence from artifacts
+
+var secretRuleType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{"token": tftypes.String}}
+var secretfulType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{
+	"name": tftypes.String, "id": tftypes.String, "client_secret": tftypes.String,
+	"write_only_secret": tftypes.String, "token": tftypes.String, "note": tftypes.String,
+	"rules": tftypes.List{ElementType: secretRuleType},
+}}
+var secretfulSchema = &tfprotov6.Schema{Version: 0, Block: &tfprotov6.SchemaBlock{
+	Attributes: []*tfprotov6.SchemaAttribute{
+		{Name: "name", Type: tftypes.String, Required: true}, {Name: "id", Type: tftypes.String, Computed: true},
+		{Name: "client_secret", Type: tftypes.String, Computed: true, Sensitive: true},
+		{Name: "write_only_secret", Type: tftypes.String, Computed: true, Sensitive: true},
+		{Name: "token", Type: tftypes.String, Optional: true, Sensitive: true}, {Name: "note", Type: tftypes.String, Optional: true},
+	},
+	BlockTypes: []*tfprotov6.SchemaNestedBlock{{TypeName: "rules", Nesting: tfprotov6.SchemaNestedBlockNestingModeList, Block: &tfprotov6.SchemaBlock{Attributes: []*tfprotov6.SchemaAttribute{{Name: "token", Type: tftypes.String, Optional: true, Sensitive: true}}}}},
+}}
+
 // brokenThingSchema declares tchoritest_broken_thing: a resource type whose
 // "settings" attribute is nested_type, but with a nesting mode
 // blockFromProto/nestedObjectType does not recognize (none of
@@ -203,7 +221,7 @@ var _ tfprotov6.ProviderServer = (*server)(nil)
 
 func knownResourceType(typeName string) bool {
 	switch typeName {
-	case "tchoritest_thing", "tchoritest_lossy", "tchoritest_nested_thing", "tchoritest_server_assigned", "tchoritest_broken_thing":
+	case "tchoritest_thing", "tchoritest_lossy", "tchoritest_nested_thing", "tchoritest_server_assigned", "tchoritest_secretful", "tchoritest_broken_thing":
 		return true
 	default:
 		return false
@@ -226,6 +244,7 @@ func (s *server) GetMetadata(ctx context.Context, req *tfprotov6.GetMetadataRequ
 			{TypeName: "tchoritest_lossy"},
 			{TypeName: "tchoritest_nested_thing"},
 			{TypeName: "tchoritest_server_assigned"},
+			{TypeName: "tchoritest_secretful"},
 			{TypeName: "tchoritest_broken_thing"},
 		},
 	}, nil
@@ -239,6 +258,7 @@ func (s *server) GetProviderSchema(ctx context.Context, req *tfprotov6.GetProvid
 			"tchoritest_lossy":           lossySchema,
 			"tchoritest_nested_thing":    nestedThingSchema,
 			"tchoritest_server_assigned": serverAssignedSchema,
+			"tchoritest_secretful":       secretfulSchema,
 			"tchoritest_broken_thing":    brokenThingSchema,
 		},
 		DataSourceSchemas: map[string]*tfprotov6.Schema{},
@@ -307,6 +327,12 @@ func (s *server) ValidateResourceConfig(ctx context.Context, req *tfprotov6.Vali
 		}
 		return &tfprotov6.ValidateResourceConfigResponse{}, nil
 	}
+	if req.TypeName == "tchoritest_secretful" {
+		if _, err := req.Config.Unmarshal(secretfulType); err != nil {
+			return nil, err
+		}
+		return &tfprotov6.ValidateResourceConfigResponse{}, nil
+	}
 	cfg, err := req.Config.Unmarshal(thingType)
 	if err != nil {
 		return nil, err
@@ -350,6 +376,8 @@ func (s *server) UpgradeResourceState(ctx context.Context, req *tfprotov6.Upgrad
 		ty = nestedThingType
 	case "tchoritest_server_assigned":
 		ty = serverAssignedType
+	case "tchoritest_secretful":
+		ty = secretfulType
 	}
 	val, err := req.RawState.Unmarshal(ty)
 	if err != nil {
@@ -385,6 +413,9 @@ func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanReso
 	}
 	if req.TypeName == "tchoritest_server_assigned" {
 		return s.planServerAssigned(req)
+	}
+	if req.TypeName == "tchoritest_secretful" {
+		return s.planSecretful(req)
 	}
 	proposed, err := req.ProposedNewState.Unmarshal(thingType)
 	if err != nil {
@@ -445,6 +476,66 @@ func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanReso
 		RequiresReplace: requiresReplace,
 		PlannedPrivate:  req.PriorPrivate,
 	}, nil
+}
+
+func (s *server) planSecretful(req *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
+	proposed, err := req.ProposedNewState.Unmarshal(secretfulType)
+	if err != nil {
+		return nil, err
+	}
+	if proposed.IsNull() {
+		return &tfprotov6.PlanResourceChangeResponse{PlannedState: req.ProposedNewState, PlannedPrivate: req.PriorPrivate}, nil
+	}
+	prior, err := req.PriorState.Unmarshal(secretfulType)
+	if err != nil {
+		return nil, err
+	}
+	var attrs map[string]tftypes.Value
+	if err := proposed.As(&attrs); err != nil {
+		return nil, err
+	}
+	if prior.IsNull() {
+		attrs["id"] = tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+	} else {
+		var p map[string]tftypes.Value
+		if err := prior.As(&p); err != nil {
+			return nil, err
+		}
+		attrs["id"] = p["id"]
+	}
+	attrs["client_secret"] = tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+	attrs["write_only_secret"] = tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+	dv, err := tfprotov6.NewDynamicValue(secretfulType, tftypes.NewValue(secretfulType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.PlanResourceChangeResponse{PlannedState: &dv, PlannedPrivate: req.PriorPrivate}, nil
+}
+
+func (s *server) applySecretful(req *tfprotov6.ApplyResourceChangeRequest) (*tfprotov6.ApplyResourceChangeResponse, error) {
+	planned, err := req.PlannedState.Unmarshal(secretfulType)
+	if err != nil {
+		return nil, err
+	}
+	if planned.IsNull() {
+		return &tfprotov6.ApplyResourceChangeResponse{NewState: req.PlannedState}, nil
+	}
+	var attrs map[string]tftypes.Value
+	if err := planned.As(&attrs); err != nil {
+		return nil, err
+	}
+	var name string
+	if err := attrs["name"].As(&name); err != nil {
+		return nil, err
+	}
+	attrs["id"] = tftypes.NewValue(tftypes.String, s.prefix+"secret-"+name)
+	attrs["client_secret"] = tftypes.NewValue(tftypes.String, secretSentinel)
+	attrs["write_only_secret"] = tftypes.NewValue(tftypes.String, nil)
+	dv, err := tfprotov6.NewDynamicValue(secretfulType, tftypes.NewValue(secretfulType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.ApplyResourceChangeResponse{NewState: &dv, Private: req.PlannedPrivate}, nil
 }
 
 // planNestedThing plans a tchoritest_nested_thing change. "settings" (the
@@ -509,6 +600,9 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 	}
 	if req.TypeName == "tchoritest_server_assigned" {
 		return s.applyServerAssigned(req)
+	}
+	if req.TypeName == "tchoritest_secretful" {
+		return s.applySecretful(req)
 	}
 	planned, err := req.PlannedState.Unmarshal(thingType)
 	if err != nil {

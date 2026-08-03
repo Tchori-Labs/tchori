@@ -72,10 +72,10 @@ value and:
 - records its dotted path in `unknown_after`.
 
 Paths use the same dotted/bracket notation for nested attributes and map
-keys, e.g. `echo`, `id`, or `tags["parent"]` for a map key. The exact,
-non-null planned value (unknowns included) is preserved separately in
-`planned_raw` for apply to use — `after` is the reviewable, JSON-native
-view; `planned_raw` is the executable one.
+keys, e.g. `echo`, `id`, or `tags["parent"]` for a map key. `planned_raw`
+preserves provider unknowns for apply, but sensitive non-exempt leaves are
+also encoded there as unknown rather than concrete values. `after` is the
+reviewable JSON projection; `planned_raw` is the executable one.
 
 At apply time, an unknown left over from planning that turns out to be a
 `${...}` reference to another resource created earlier in the same run is
@@ -184,8 +184,11 @@ creates.
 | --- | --- | --- |
 | `type` | string | Provider resource type, e.g. `tchoritest_thing`. |
 | `provider` | string | Provider local name from config, e.g. `tchoritest`. |
-| `attributes` | object | ctyjson-encoded object of the resource's real, applied attribute values. Unlike a plan's `after`, everything here is concrete — state never stores unknowns. |
-| `private` | base64 string, omitted if empty | Opaque per-resource provider private data, round-tripped through the provider's plan/apply RPCs untouched by tchori. |
+| `attributes` | object | ctyjson-encoded applied values. Every withheld sensitive leaf is JSON `null`; state never stores unknown values. |
+| `private` | base64 string, omitted if empty | Opaque provider data, round-tripped untouched. Tchori does not inspect or redact this blob. |
+| `redacted` | array of strings, omitted if empty | Sorted paths whose values are withheld, explaining why the corresponding `attributes` leaf is `null`. |
+| `sensitive_paths` | array of strings, omitted if empty | Sorted effective, index-insensitive sensitivity contract. It survives config removal and drives backups, delete plans, orphan handling, and provider-free read masking. |
+| `sensitive_scanned` | boolean, omitted when false | Provenance marker set after live schema/config resolution, including for a definitively non-sensitive resource. Read surfaces use it to distinguish checked entries from legacy entries with unknown provenance. |
 
 ### Serial semantics
 
@@ -218,17 +221,25 @@ creates.
    `Load` or the preceding successful `Save`. If another process committed in
    the meantime, `Save` returns `state.ErrConcurrentModification` with the
    state path and re-run guidance; neither the state nor its backup is touched.
-3. Copies the current file at `path` to a fresh same-directory temporary file
-   before renaming it to `path+".backup"`. The rename replaces that name
-   without writing through it: this is an atomic replace on POSIX, while
-   Windows uses `MoveFileEx` replacement semantics. A planted symlink is
-   replaced, never followed, and the result is a new regular file. On POSIX
-   its permissions are owner-only and never broader than `0600`, subject to
-   the process umask; Windows uses its own permission semantics. A directory
-   at the backup name is rejected when there is state to copy. The backup step
-   is a no-op before inspecting that name on the first save, so anything at
-   the backup name cannot prevent an initial state write.
-4. Increments `Serial`, marshals with `MarshalIndent`, writes a temp file
+3. Parses the prior document and sanitizes every entry using persisted paths,
+   live resolution, and effective-path hints before writing `path+".backup"`.
+   With no known sensitive path the copy stays byte-identical; otherwise it is
+   canonically re-serialized. Existing `redacted` markers are unioned with
+   newly changed paths. A parse failure aborts rather than copying uninspected
+   bytes. The backup deliberately applies no literal-instance exemptions and
+   retains previously persisted paths, so the prior document is scrubbed under
+   the rules that wrote it even when the current declaration was removed.
+   The fresh-temp-and-rename symlink, directory, and `0600` hardening remains
+   unchanged.
+4. Sanitizes every live state entry, including resources untouched by this
+   apply. A resolvable entry uses current schema/config paths as authoritative,
+   honors per-instance literal exemptions, intersects stale markers with the
+   current set, then unions newly redacted paths. An unresolvable entry falls
+   back to persisted paths and hints without exemptions and is reported. A
+   resolved empty path set means definitively non-sensitive and records
+   `sensitive_scanned`; no resolver means persisted-hints-only behavior with no
+   provenance writes or unresolved warnings.
+5. Increments `Serial`, marshals with `MarshalIndent`, writes a temp file
    (`.state-*.tmp`) in the same directory, and fsyncs the complete file before
    closing it. It atomically renames the temp file over `path`, then runs the
    platform's directory-durability barrier before reporting success. On POSIX
@@ -419,17 +430,43 @@ Consistency diagnostic values follow the redaction rules below.
 
 ## Sensitivity
 
-Provider responses are stored verbatim in `state.json` and `plan.json`, so
-values a provider *derives* from env-sourced secrets can end up recorded
-there too — treat both files as sensitive. General plan/state redaction remains
-a recorded post-MVP item.
+Tchori derives sensitive paths from provider schema `Sensitive` flags plus a
+resource's optional `sensitive_attributes` list. Provider-computed values at
+those paths are withheld from state and plan artifacts. State stores a typed
+JSON `null` plus the three metadata fields above; plans replace the value with
+an unknown in both `after` and decoded `planned_raw`, list it in
+`unknown_after`, and mask it during update/replacement classification so a
+withheld computed value does not cause a perpetual diff.
 
-The result-consistency diagnostic is redacted. An ordinary attribute's own
-schema `Sensitive` flag governs its entire subtree, including aggregate map,
-list, and set attributes and applied-only map keys. A traversed ordered nested
-block redacts each reported leaf according to that leaf's schema; a
-nested-block value that must be compared wholesale is redacted if any
-descendant attribute is sensitive. Schema paths that cannot be resolved fail
-closed. Sensitivity of a
-sibling never redacts a non-sensitive attribute. These rules affect diagnostic
-rendering only; `plan.json` and `state.json` remain unredacted.
+Sensitivity matching ignores collection indices, while the raw-literal
+exemption is a fully index-qualified instance. Thus one repeated-block element
+may retain an authored literal while a sibling containing a `${...}` reference
+is withheld. Literal authorship is determined from raw config syntax only;
+references, explicit nulls, absent values, and `{"env":"..."}` wrappers are
+never exempt. Set-nested blocks have no stable element identity and therefore
+fail closed with no exemptions. Per-attribute sensitivity inside a provider
+`nested_type` is not retained by current schema conversion; use
+`sensitive_attributes` for that path.
+
+Every save sanitizes the whole state document. Live, resolvable entries are
+instance-aware and use current schema/config as authoritative, so literals
+survive unrelated saves and removing a declaration takes effect on the next
+save-producing apply. Backups, delete `before` values, orphans, and read
+rendering are conservative path-level copies with no exemption. The backup is
+the one consumer that also retains prior paths, ensuring the preceding file is
+scrubbed even when a declaration was just removed. Backup markers are unioned;
+live markers are intersected with current paths before newly changed paths are
+unioned.
+
+`state show` and MCP `state_show` mask from persisted `sensitive_paths` in
+memory and never save. An entry with `sensitive_scanned: true` and no paths is
+known non-sensitive. A pre-change entry with neither field cannot be classified
+without launching a provider, so provider-free reads render it as stored with a
+note. Likewise, `plan` never writes state and a no-op apply saves nothing:
+legacy plaintext remains on disk until a changed apply/import or manual purge.
+If plaintext was previously committed, rotate the credential and purge
+`state.json`, `state.json.backup`, and repository history.
+
+The consistency diagnostic follows the same schema sensitivity rules and never
+prints sensitive values. Provider `private` blobs remain opaque and are not
+inspected; providers must not rely on tchori to redact secrets stored there.

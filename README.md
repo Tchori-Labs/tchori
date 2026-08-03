@@ -130,9 +130,10 @@ Exit codes follow the Terraform convention agents already know:
 
 State is a deterministic, git-diffable `state.json` in the working directory
 (flock-protected, with concurrent modifications rejected before sidecars or the
-state file are changed). `state.json.backup` is written before every mutation
-via a rename that never writes through a symlink and always lands as a fresh,
-owner-only regular file on POSIX. Commits fsync the complete temp file before
+state file are changed). `state.json.backup` is written before every mutation;
+it is byte-copied only when no sensitive path is known and otherwise parsed and
+sanitized before a rename that never writes through a symlink and always lands
+as a fresh, owner-only regular file on POSIX. Commits fsync the complete temp file before
 atomic replacement and fsync the directory before returning, so reported
 success is durable across abrupt host failure. On Windows the directory-fsync
 step is a documented no-op (directory fsync is not a supported primitive there;
@@ -140,10 +141,48 @@ NTFS journals rename metadata itself), so only the temp-file fsync provides the
 explicit barrier -- the effective durability outcome is unchanged.
 Format reference: [docs/formats.md](docs/formats.md).
 
-Provider responses are stored verbatim in `state.json` and `plan.json`, so
-values a provider *derives* from env-sourced secrets can end up recorded
-there too — treat both files as sensitive (redaction is a recorded post-MVP
-item, not yet implemented).
+### Sensitive attributes
+
+Tchori withholds provider-computed attributes marked `Sensitive` by the
+provider. State records JSON `null` plus `redacted`, `sensitive_paths`, and
+`sensitive_scanned` metadata; plans represent the value as unknown and ignore
+it for drift classification. Every save sanitizes every state entry, including
+the prior document written to `state.json.backup`.
+
+For a provider that omits its sensitivity flag, declare an override:
+
+```json
+{
+  "resources": {
+    "example_token.ci": {
+      "sensitive_attributes": ["client_secret", "settings.token"],
+      "config": {"name": "ci"}
+    }
+  }
+}
+```
+
+An operator-authored raw literal is already present in config, so its exact
+collection instance remains in live `state.json` and participates in drift.
+Exemptions are per instance: `rules[0].token` may stay literal while a sibling
+`rules[1].token` containing a `${...}` reference is withheld. References and
+`{"env":"VAR"}` wrappers are never literals, and set-nested blocks have no
+stable indices, so no exemption applies inside them. Backups, delete plans,
+orphan handling, and `state show`/MCP rendering are deliberately path-level
+and may mask a literal while config remains authoritative.
+
+Removing a `sensitive_attributes` entry makes the current live resolution
+authoritative on the next save-producing apply, restoring that value to
+`state.json`; the backup of the previous document is still scrubbed using its
+previously persisted paths. Provider `nested_type` conversion does not yet
+retain per-leaf sensitivity, so use the override for those leaves.
+
+Provider-free read commands mask recorded `sensitive_paths` without writing
+state. A legacy entry carrying neither `sensitive_paths` nor
+`sensitive_scanned` cannot be identified without launching a provider and is
+rendered with a warning. Plan and a no-op apply write nothing, so if an older
+state already leaked a credential, rotate it and purge `state.json`,
+`state.json.backup`, and git history manually.
 
 ### Importing existing infrastructure
 
@@ -198,7 +237,7 @@ claude mcp add tchori -- tchori mcp
 In: any tfplugin6 or tfplugin5 provider (the latter via the tfplugin5
 adapter) · `${type.name.attr}` references · plan/apply/destroy through plan
 documents · provider install from the OpenTofu registry (SHA256-verified) ·
-import · MCP read + plan.
+import · sensitive computed-value redaction · MCP read + plan.
 
 Out (recorded deferrals): modules, count/for_each, an expression language,
 HCL, remote state backends, workspaces, registry GPG verification,
