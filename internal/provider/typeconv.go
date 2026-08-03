@@ -68,7 +68,11 @@ type RefResolver func(ref config.Ref) (cty.Value, diag.Diagnostics)
 // variable is unset; error diag when allowEnv is false — the spec allows env
 // wrappers only in provider config, so callers pass true for provider config
 // and false for resource configs); unexpected attributes -> error diag
-// naming the attribute.
+// naming the attribute. Reference-shaped strings that survive either raw
+// conversion or post-composition resolution are hard errors under TC-048.
+// Those diagnostics identify the attribute path only because Compose has no
+// resource address in scope. Values returned by providers are not composed or
+// scanned here.
 func Compose(raw map[string]any, ty cty.Type, allowEnv bool, resolve RefResolver) (cty.Value, diag.Diagnostics) {
 	if !ty.IsObjectType() {
 		return cty.NilVal, diag.Diagnostics{diag.Errorf("", "internal error: Compose requires an object type", "got "+ty.FriendlyName())}
@@ -76,7 +80,17 @@ func Compose(raw map[string]any, ty cty.Type, allowEnv bool, resolve RefResolver
 	if raw == nil {
 		raw = map[string]any{}
 	}
-	return rawToCty("", raw, ty, allowEnv, resolve)
+	composed, ds := rawToCty("", raw, ty, allowEnv, resolve)
+	if ds.HasErrors() {
+		return composed, ds
+	}
+	for _, finding := range FindUnresolvedReferences(composed) {
+		ds = append(ds, UnresolvedReferenceDiagnostic("", finding))
+	}
+	if ds.HasErrors() {
+		return cty.NilVal, ds
+	}
+	return composed, ds
 }
 
 // rawToCty converts one raw JSON value into a cty.Value of exactly type ty,
@@ -95,6 +109,10 @@ func rawToCty(path string, raw any, ty cty.Type, allowEnv bool, resolve RefResol
 	if s, ok := raw.(string); ok {
 		if ref, isRef := config.ParseRef(s); isRef {
 			return resolveRefValue(path, s, ref, ty, resolve)
+		}
+		if match, found := config.FindUnresolvedReference(s); found {
+			finding := UnresolvedReferenceFinding{Path: path, Match: match}
+			return cty.NilVal, diag.Diagnostics{UnresolvedReferenceDiagnostic("", finding)}
 		}
 	}
 

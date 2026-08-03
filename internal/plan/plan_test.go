@@ -477,6 +477,33 @@ func TestPlanStateOnlyDeleteUsesPersistedSensitivePaths(t *testing.T) {
 	}
 }
 
+func TestPlanRejectsEmbeddedReference(t *testing.T) {
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_thing.tunnel": {"name": "tunnel"},
+		"tchoritest_thing.wh": {
+			"name": "wh",
+			"tags": map[string]any{
+				"content": "${tchoritest_thing.tunnel.id}.cfargotunnel.com",
+			},
+		},
+	})
+	p := newPlanner(t, cfg, stateWith(t, 0, nil))
+
+	pl, ds := p.Plan(context.Background())
+	if pl != nil {
+		t.Fatalf("Plan = %+v, want nil for unresolved reference", pl)
+	}
+	found := false
+	for _, d := range ds {
+		if d.Summary == "unresolved reference" && strings.Contains(d.Detail, "tags.content") && strings.Contains(d.Detail, "${tchoritest_thing.tunnel.id}") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("diagnostics = %+v, want unresolved reference at tags.content", ds)
+	}
+}
+
 func TestPlanCreateWithReference(t *testing.T) {
 	cfg := testConfig(t, map[string]map[string]any{
 		"tchoritest_thing.alpha": {"name": "alpha"},

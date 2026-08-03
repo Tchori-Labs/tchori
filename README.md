@@ -21,9 +21,12 @@ Status: **0.1.0-dev** — pre-MVP, under active development, built in public.
    There is no plan-less apply.
 2. **JSON-native config.** No HCL. Config is plain `*.tchori.json` files,
    validated against a JSON Schema. References are exact-form
-   `"${type.name.attr}"` string values and define the dependency graph.
-   Secrets come from the environment via `{"env": "VAR_NAME"}` wrappers —
-   they never live in config files.
+   `"${type.name.attr}"` values that occupy the **whole string** and define the
+   dependency graph. A reference-shaped `${...}` that survives in a value
+   tchori would send to a provider is a hard `unresolved reference` error at
+   validate, plan, and apply; shell-style literals such as `${HOME}` remain
+   legal. Secrets come from the environment via `{"env": "VAR_NAME"}`
+   wrappers — they never live in config files.
 3. **Machine-readable diagnostics.** Every error and warning is a structured
    JSON object on stderr (`{"severity","summary","detail","address"}`) — the
    agent retry loop, not a wall of prose. Pretty rendering only when stderr
@@ -236,9 +239,11 @@ claude mcp add tchori -- tchori mcp
 ## Scope (MVP)
 
 In: any tfplugin6 or tfplugin5 provider (the latter via the tfplugin5
-adapter) · `${type.name.attr}` references · plan/apply/destroy through plan
-documents · provider install from the OpenTofu registry (SHA256-verified) ·
-import · sensitive computed-value redaction · MCP read + plan.
+adapter) · whole-string-only `${type.name.attr}` references (with surviving
+reference-shaped fragments rejected as `unresolved reference` before provider
+calls) · plan/apply/destroy through plan documents · provider install from the
+OpenTofu registry (SHA256-verified) · import · sensitive computed-value
+redaction · MCP read + plan.
 
 Out (recorded deferrals): modules, count/for_each, an expression language,
 HCL, remote state backends, workspaces, registry GPG verification,

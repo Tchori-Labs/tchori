@@ -647,6 +647,44 @@ func TestImportAndPostImportReadDiagnosticsHaveResourceAddress(t *testing.T) {
 	})
 }
 
+func TestCLIRejectsEmbeddedReference(t *testing.T) {
+	dir := t.TempDir()
+	cfg := `{
+  "providers": {
+    "tchoritest": {
+      "source": "tchori-labs/tchoritest",
+      "version": "0.0.1",
+      "config": {}
+    }
+  },
+  "resources": {
+    "tchoritest_thing.tunnel": {
+      "config": {"name": "tunnel"}
+    },
+    "tchoritest_thing.wh": {
+      "config": {
+        "name": "wh",
+        "tags": {"content": "${tchoritest_thing.tunnel.id}.cfargotunnel.com"}
+      }
+    }
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	pd := "--plugin-dir=" + pluginDir
+
+	for _, command := range []string{"validate", "plan"} {
+		_, stderr, code := runCLI(t, dir, command, pd)
+		if code != 1 {
+			t.Errorf("%s: exit %d, want 1\nstderr: %s", command, code, stderr)
+		}
+		if !strings.Contains(stderr, `"summary":"unresolved reference"`) || !strings.Contains(stderr, "tags.content") {
+			t.Errorf("%s stderr missing unresolved-reference summary/path: %q", command, stderr)
+		}
+	}
+}
+
 func TestValidateInvalidName(t *testing.T) {
 	dir := t.TempDir()
 	writeConfig(t, dir, "invalid") // fake provider rejects name == "invalid"

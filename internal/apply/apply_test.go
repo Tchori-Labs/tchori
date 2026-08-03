@@ -616,6 +616,130 @@ func TestApplyRefOrderBeatsAddressOrder(t *testing.T) {
 	}
 }
 
+func TestApplyRejectsIssue58EmbeddedReference(t *testing.T) {
+	const (
+		tunnelAddr = "tchoritest_thing.tunnel"
+		whAddr     = "tchoritest_thing.wh"
+	)
+	wh := thing("wh", "wh")
+	wh.Config["tags"] = map[string]any{"content": "safe.example"}
+	h := newHarness(t, map[string]*config.Resource{
+		tunnelAddr: thing("tunnel", "tunnel"),
+		whAddr:     wh,
+	})
+	ctx := context.Background()
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+
+	// Apply-only fixture: planning the bad config is now forbidden, while
+	// Apply's drift check deliberately compares addresses rather than values.
+	h.cfg.Resources[whAddr].Config["tags"] = map[string]any{
+		"content": "${tchoritest_thing.tunnel.id}.cfargotunnel.com",
+	}
+	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	requireUnresolvedAt(t, ds, whAddr)
+
+	saved := loadState(t, h.statePath)
+	if saved.Resources[whAddr] != nil {
+		t.Fatal("dependent resource with embedded reference was persisted")
+	}
+	if saved.Resources[tunnelAddr] == nil {
+		t.Fatal("safe resource preceding the rejected value was not persisted")
+	}
+}
+
+func TestApplyRejectsPoisonedStateReferencePropagation(t *testing.T) {
+	const (
+		aAddr = "tchoritest_thing.a"
+		bAddr = "tchoritest_thing.b"
+	)
+	a := thing("a", "a")
+	a.Config["tags"] = map[string]any{"parent": "safe-parent"}
+	b := thing("b", "b")
+	b.Config["tags"] = map[string]any{"parent": "safe-parent"}
+	h := newHarness(t, map[string]*config.Resource{aAddr: a, bAddr: b})
+	ctx := context.Background()
+
+	st := &state.State{
+		FormatVersion: "1.0",
+		Serial:        7,
+		Resources: map[string]*state.ResourceState{
+			aAddr: {
+				Type:       "tchoritest_thing",
+				Provider:   "tchoritest",
+				Attributes: json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"tags":{"parent":"safe-parent"}}`),
+			},
+		},
+	}
+	pl := h.plan(t, st, false)
+
+	// Apply-only fixture: after obtaining a safe plan, make b read the map
+	// value through a valid whole-string reference. (The planner's MVP dotted
+	// path resolver cannot traverse maps, while apply's resolver can.)
+	h.cfg.Resources[bAddr].Config["tags"] = map[string]any{
+		"parent": "${tchoritest_thing.a.tags.parent}",
+	}
+
+	// Reproduce state left by an older engine after planning. Write directly
+	// to preserve the plan serial; the poisoned entry is intentionally not
+	// cleaned by TC-048, only refused when another outgoing value reads it.
+	st.Resources[aAddr].Attributes = json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"tags":{"parent":"${tchoritest_thing.ghost.id}"}}`)
+	stateBytes, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("marshal seeded state: %v", err)
+	}
+	if err := os.WriteFile(h.statePath, stateBytes, 0o600); err != nil {
+		t.Fatalf("write seeded state: %v", err)
+	}
+
+	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	requireUnresolvedAt(t, ds, bAddr)
+	saved := loadState(t, h.statePath)
+	if saved.Resources[bAddr] != nil {
+		t.Fatal("resource receiving poisoned state reference was persisted")
+	}
+	if !strings.Contains(string(saved.Resources[aAddr].Attributes), "${tchoritest_thing.ghost.id}") {
+		t.Fatal("pre-existing poisoned state was unexpectedly rewritten or cleaned")
+	}
+}
+
+func TestApplyDependencyFailureSkipsDependent(t *testing.T) {
+	const (
+		tunnelAddr = "tchoritest_thing.tunnel"
+		whAddr     = "tchoritest_thing.wh"
+	)
+	wh := thing("wh", "wh")
+	wh.Config["tags"] = map[string]any{"tunnel": "${tchoritest_thing.tunnel.id}"}
+	h := newHarness(t, map[string]*config.Resource{
+		tunnelAddr: thing("tunnel", "explode"),
+		whAddr:     wh,
+	})
+	ctx := context.Background()
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+
+	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() {
+		t.Fatal("Apply succeeded despite dependency provider failure")
+	}
+	foundFailure := false
+	for _, d := range ds {
+		if d.Summary == "apply exploded" {
+			foundFailure = true
+		}
+	}
+	if !foundFailure {
+		t.Fatalf("diagnostics = %+v, want provider apply failure", ds)
+	}
+	saved := loadState(t, h.statePath)
+	if saved.Resources[whAddr] != nil || saved.Resources[tunnelAddr] != nil {
+		t.Fatalf("state resources = %+v, want neither failed dependency nor skipped dependent", saved.Resources)
+	}
+	if saved.Serial != 0 {
+		t.Fatalf("state serial = %d, want 0 because no change was saved", saved.Serial)
+	}
+}
+
 // TestApplyReplace closes a coverage gap: no existing test drove the
 // destroy-then-create "replace" branch of applyChange. It seeds state via a
 // create apply, changes replace_me (which the fake provider's
