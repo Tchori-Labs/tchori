@@ -4,7 +4,10 @@
 // sorted alphabetically by address for plan.json determinism), deletes run
 // last in reverse dependency order. The state file is re-saved after every
 // successful provider call so a mid-sequence failure never loses the
-// resources already applied (partial-state safety).
+// resources already applied (partial-state safety). Unresolved
+// reference-shaped values are rejected before every config-bearing provider
+// call, including before the destroy leg of a replace; provider-returned
+// values remain outside that validation boundary.
 //
 // After create, update, and the create leg of replace, apply also checks the
 // returned state against concretely-authored planned values. Shallow-known
@@ -283,19 +286,32 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 		}
 	}
 
-	switch ch.Action {
-	case "delete":
+	if ch.Action == "delete" {
 		return ex.destroy(ctx, client, typeName, addr, ty, prior, priorPrivate)
+	}
+
+	// Compose before selecting create/update/replace so an unresolved value
+	// cannot let replace destroy a live object and only then fail. A resource's
+	// own state entry cannot be one of its reference targets: self-references
+	// are cycles rejected by Config.Order.
+	cfgVal, ds := ex.composeConfig(addr, ty)
+	if ds.HasErrors() {
+		return ds
+	}
+
+	switch ch.Action {
 	case "replace":
 		// Destroy-then-create: two explicit ApplyResource calls. The state
 		// entry is removed (and saved) after the destroy leg, then written
 		// back (and saved) after the create leg.
-		if ds := ex.destroy(ctx, client, typeName, addr, ty, prior, priorPrivate); ds.HasErrors() {
+		destroyDs := ex.destroy(ctx, client, typeName, addr, ty, prior, priorPrivate)
+		ds = append(ds, destroyDs...)
+		if destroyDs.HasErrors() {
 			return ds
 		}
-		return ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, cty.NullVal(ty), ch)
+		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, cty.NullVal(ty), cfgVal, ch)...)
 	default: // "create", "update"
-		return ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, prior, ch)
+		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, prior, cfgVal, ch)...)
 	}
 }
 
@@ -319,27 +335,14 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 }
 
 // createOrUpdate decodes the planned value captured at plan time (msgpack,
-// may contain unknowns) at the schema's implied type, composes the resource
-// config with references resolved against current state, applies, then
-// records the provider's returned state and saves.
-func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, addr string, block *provider.SchemaBlock, ty cty.Type, prior cty.Value, ch *plan.Change) diag.Diagnostics {
-	var res *config.Resource
-	if ex.cfg != nil {
-		res = ex.cfg.Resources[addr]
-	}
-	if res == nil {
-		return diag.Diagnostics{diag.Errorf(addr, "resource missing from configuration",
-			fmt.Sprintf("%s change for %q but the address is not in the loaded configuration", ch.Action, addr))}
-	}
-
+// may contain unknowns), overlays the already-composed config, rejects any
+// unresolved reference that survived in an older plan document, applies, then
+// records the provider's returned state and saves. cfgVal was composed by
+// applyChange before any replace destroy leg.
+func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, addr string, block *provider.SchemaBlock, ty cty.Type, prior, cfgVal cty.Value, ch *plan.Change) diag.Diagnostics {
 	planned, err := ctymsgpack.Unmarshal(ch.PlannedRaw, ty)
 	if err != nil {
 		return diag.Diagnostics{diag.Errorf(addr, "corrupt planned value", err.Error())}
-	}
-
-	cfgVal, ds := provider.Compose(res.Config, ty, false, ex.resolveRef)
-	if ds.HasErrors() {
-		return ds
 	}
 
 	// ch.PlannedRaw was captured at plan time: an attribute whose raw config
@@ -355,6 +358,13 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	// cfgVal, e.g. "id") unknown for the provider itself to resolve, same
 	// as before.
 	planned = resolvePlannedUnknowns(planned, cfgVal)
+	var ds diag.Diagnostics
+	for _, finding := range provider.FindUnresolvedReferences(planned) {
+		ds = append(ds, provider.UnresolvedReferenceDiagnostic(addr, finding))
+	}
+	if ds.HasErrors() {
+		return ds
+	}
 
 	newState, newPrivate, applyDs := client.ApplyResource(ctx, typeName, prior, planned, cfgVal, ch.Private)
 	applyDs = provider.Context(addr, applyDs)
@@ -371,6 +381,7 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	if newState.IsNull() || !newState.IsKnown() {
 		return append(ds, consistencyDs...)
 	}
+	res := ex.cfg.Resources[addr] // composeConfig above verified this resource exists.
 	spec, specDs := sensitive.Resolve(block, res.SensitiveAttributes, res.Config)
 	ds = append(ds, specDs...)
 	if specDs.HasErrors() {

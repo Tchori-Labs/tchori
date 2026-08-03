@@ -17,6 +17,32 @@ Source of truth: `internal/plan/plan.go`, `internal/plan/planner.go`,
 | `plan.json` | `tchori plan -out FILE`, `tchori destroy -out FILE` | `tchori apply FILE` | The reviewable, PR-able artifact: exactly the set of changes an apply will execute. There is no plan-less apply. |
 | `state.json` | `tchori apply`, `tchori destroy` (via `Save`) | `tchori plan`, `tchori apply`, `tchori state list/show`, `tchori mcp` | The record of what tchori believes is really deployed: one entry per managed resource, keyed by address. |
 
+## Unresolved-reference safety
+
+References use the exact whole-string form `${type.name.attr}`. If a
+reference-shaped `${...}` fragment survives in a resolved resource config,
+provider config, or planned value that tchori is about to send to a provider
+RPC, tchori refuses the call with an `unresolved reference` error. This guard
+applies to validate, plan, apply (including replace before its destroy leg),
+and provider configuration. As a result, tchori never persists a matching
+value that it composed and sent itself.
+
+Composition happens without a resource address in scope, so validate and plan
+diagnostics identify the offending attribute path and matched `${...}`
+substring but leave `address` empty. Apply performs an address-aware guard and
+also attaches the resource address. Diagnostics never print the complete
+attribute value, which may have come from state or an environment variable.
+
+The guarantee has three deliberate boundaries:
+
+- Non-reference template strings such as `${HOME}` are valid literals and may
+  legitimately appear in config or state.
+- Values returned by a provider are not scanned; provider responses remain
+  authoritative and may contain text that resembles a reference.
+- A matching value already present in a pre-existing `state.json` is not
+  rewritten or cleaned. It becomes a hard error when it next feeds an
+  outgoing value.
+
 ## plan.json
 
 ### Top-level fields (`Plan`)

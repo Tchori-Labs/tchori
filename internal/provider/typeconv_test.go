@@ -209,6 +209,91 @@ func TestComposeRefs(t *testing.T) {
 	}
 }
 
+func TestComposeRejectsRawUnresolvedReferences(t *testing.T) {
+	tests := []struct {
+		name string
+		ty   cty.Type
+		raw  map[string]any
+		path string
+	}{
+		{
+			name: "root attribute",
+			ty:   cty.Object(map[string]cty.Type{"name": cty.String}),
+			raw:  map[string]any{"name": "${tchoritest_thing.base.id}.suffix"},
+			path: "name",
+		},
+		{
+			name: "nested object",
+			ty: cty.Object(map[string]cty.Type{"nested": cty.Object(map[string]cty.Type{
+				"name": cty.String,
+			})}),
+			raw:  map[string]any{"nested": map[string]any{"name": "prefix-${a.b.c}"}},
+			path: "nested.name",
+		},
+		{
+			name: "map",
+			ty:   cty.Object(map[string]cty.Type{"tags": cty.Map(cty.String)}),
+			raw:  map[string]any{"tags": map[string]any{"content": "${a.b.c}.suffix"}},
+			path: "tags.content",
+		},
+		{
+			name: "list",
+			ty:   cty.Object(map[string]cty.Type{"items": cty.List(cty.String)}),
+			raw:  map[string]any{"items": []any{"${a.b.c}.suffix"}},
+			path: "items[0]",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, ds := Compose(tt.raw, tt.ty, false, nil)
+			if !ds.HasErrors() || len(ds) != 1 {
+				t.Fatalf("Compose diagnostics = %+v, want one error", ds)
+			}
+			d := ds[0]
+			if d.Summary != "unresolved reference" || d.Address != "" || !strings.Contains(d.Detail, tt.path) || !strings.Contains(d.Detail, "${") {
+				t.Errorf("diagnostic = %+v, want unresolved reference at %q with empty address", d, tt.path)
+			}
+		})
+	}
+}
+
+func TestComposeAllowsShellStyleLiteral(t *testing.T) {
+	ty := cty.Object(map[string]cty.Type{"name": cty.String})
+	got, ds := Compose(map[string]any{"name": "${HOME}"}, ty, false, nil)
+	if ds.HasErrors() {
+		t.Fatalf("Compose diagnostics = %+v", ds)
+	}
+	if !got.GetAttr("name").RawEquals(cty.StringVal("${HOME}")) {
+		t.Fatalf("name = %#v, want literal ${HOME}", got.GetAttr("name"))
+	}
+}
+
+func TestComposeRejectsUnresolvedReferenceFromResolver(t *testing.T) {
+	ty := cty.Object(map[string]cty.Type{"name": cty.String})
+	resolve := func(config.Ref) (cty.Value, diag.Diagnostics) {
+		return cty.StringVal("secret-prefix-${tchoritest_thing.ghost.id}-secret-suffix"), nil
+	}
+	_, ds := Compose(map[string]any{"name": "${tchoritest_thing.base.id}"}, ty, false, resolve)
+	if !ds.HasErrors() || ds[0].Summary != "unresolved reference" || ds[0].Address != "" || !strings.Contains(ds[0].Detail, "name") || !strings.Contains(ds[0].Detail, "${tchoritest_thing.ghost.id}") {
+		t.Fatalf("Compose diagnostics = %+v, want state-derived unresolved reference", ds)
+	}
+	if strings.Contains(ds[0].Detail, "secret-prefix") || strings.Contains(ds[0].Detail, "secret-suffix") {
+		t.Fatalf("diagnostic leaked full resolved value: %q", ds[0].Detail)
+	}
+}
+
+func TestComposeRejectsUnresolvedReferenceFromEnvironment(t *testing.T) {
+	t.Setenv("TCHORI_TEST_UNRESOLVED", "secret-${a.b.c}-suffix")
+	ty := cty.Object(map[string]cty.Type{"prefix": cty.String})
+	_, ds := Compose(map[string]any{"prefix": map[string]any{"env": "TCHORI_TEST_UNRESOLVED"}}, ty, true, nil)
+	if !ds.HasErrors() || ds[0].Summary != "unresolved reference" || ds[0].Address != "" || !strings.Contains(ds[0].Detail, "prefix") || !strings.Contains(ds[0].Detail, "${a.b.c}") {
+		t.Fatalf("Compose diagnostics = %+v, want env-derived unresolved reference", ds)
+	}
+	if strings.Contains(ds[0].Detail, "secret-") || strings.Contains(ds[0].Detail, "-suffix") {
+		t.Fatalf("diagnostic leaked full environment value: %q", ds[0].Detail)
+	}
+}
+
 func TestComposeUnexpectedAttribute(t *testing.T) {
 	ty := cty.Object(map[string]cty.Type{"name": cty.String})
 	raw := map[string]any{"name": "web", "nope": true}

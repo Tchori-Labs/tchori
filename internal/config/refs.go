@@ -21,6 +21,24 @@ type Ref struct {
 // ("type.name"), group 2 the (possibly dotted) attribute path.
 var refPattern = regexp.MustCompile(`^\$\{([a-z][a-z0-9_]*\.[a-z][a-z0-9_-]*)\.([a-zA-Z0-9_.-]+)\}$`)
 
+// unresolvedRefPattern deliberately recognizes a wider language than
+// refPattern: any ${...} dotted path with at least two segments and an ASCII
+// letter or underscore starting the first segment. This catches dangerous
+// reference-shaped near-misses that ParseRef intentionally treats as literals,
+// including uppercase resource types and references missing an attribute. It
+// remains narrower than any ${...} expression so shell-style literals such as
+// ${HOME} and ${VAR:-default} remain valid.
+var unresolvedRefPattern = regexp.MustCompile(`\$\{[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)+\}`)
+
+// FindUnresolvedReference returns the first reference-shaped ${...} substring
+// in s. It also reports valid whole-string references; composition callers
+// must call ParseRef first so those references resolve normally. TC-048 uses
+// this detector only for strings that otherwise would be sent verbatim.
+func FindUnresolvedReference(s string) (string, bool) {
+	match := unresolvedRefPattern.FindString(s)
+	return match, match != ""
+}
+
 // ParseRef reports whether s is a whole-string ${type.name.attr} reference
 // and, if so, parses it. It is the engine's single reference grammar:
 // ExtractRefs and Task 7's Compose both detect references through it, so a
