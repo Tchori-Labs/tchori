@@ -93,6 +93,37 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if reloaded2.Serial != 2 {
 		t.Fatalf("Load after second Save: Serial = %d, want 2", reloaded2.Serial)
 	}
+	data, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte("incomplete_apply")) {
+		t.Fatalf("converged state contains incomplete_apply: %s", data)
+	}
+}
+
+func TestIncompleteApplyRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{
+		Resources: map[string]*ResourceState{},
+		Incomplete: &IncompleteApply{
+			FailedAddress: "thing.boom",
+			Applied:       []string{"thing.alpha"},
+			Remaining:     []string{"thing.boom"},
+		},
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Incomplete == nil || got.Incomplete.FailedAddress != "thing.boom" ||
+		len(got.Incomplete.Applied) != 1 || got.Incomplete.Applied[0] != "thing.alpha" ||
+		len(got.Incomplete.Remaining) != 1 || got.Incomplete.Remaining[0] != "thing.boom" {
+		t.Fatalf("Incomplete after round trip = %+v", got.Incomplete)
+	}
 }
 
 // TestSaveDeterministicAcrossInsertionOrder is the determinism golden test:

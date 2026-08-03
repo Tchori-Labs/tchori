@@ -193,7 +193,9 @@ func TestServeStateListOverStdio(t *testing.T) {
 		t.Fatalf("content = %+v, want exactly one text block", callResult.Content)
 	}
 	var payload struct {
-		Addresses []string `json:"addresses"`
+		Addresses       []string        `json:"addresses"`
+		Converged       bool            `json:"converged"`
+		IncompleteApply json.RawMessage `json:"incomplete_apply"`
 	}
 	if err := json.Unmarshal([]byte(callResult.Content[0].Text), &payload); err != nil {
 		t.Fatalf("state_list text is not JSON: %q (%v)", callResult.Content[0].Text, err)
@@ -201,6 +203,49 @@ func TestServeStateListOverStdio(t *testing.T) {
 	wantAddrs := []string{"null_resource.alpha", "null_resource.beta"}
 	if !slices.Equal(payload.Addresses, wantAddrs) {
 		t.Fatalf("addresses = %v, want %v", payload.Addresses, wantAddrs)
+	}
+	if !payload.Converged || len(payload.IncompleteApply) != 0 {
+		t.Fatalf("convergence = %v marker=%s, want true with omitted marker", payload.Converged, payload.IncompleteApply)
+	}
+}
+
+func TestStateListReportsIncompleteApply(t *testing.T) {
+	workdir := t.TempDir()
+	stateJSON := `{
+  "format_version": "1.0",
+  "serial": 2,
+  "resources": {},
+  "incomplete_apply": {
+    "failed_address": "tchoritest_thing.boom",
+    "applied": [],
+    "remaining": ["tchoritest_thing.boom"]
+  }
+}`
+	if err := os.WriteFile(filepath.Join(workdir, "state.json"), []byte(stateJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, _, err := (&handlers{workdir: workdir}).stateList(context.Background(), nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("content = %+v", result.Content)
+	}
+	text, ok := result.Content[0].(*mcp.TextContent)
+	if !ok {
+		t.Fatalf("content type = %T, want TextContent", result.Content[0])
+	}
+	var payload struct {
+		Converged       bool `json:"converged"`
+		IncompleteApply struct {
+			FailedAddress string `json:"failed_address"`
+		} `json:"incomplete_apply"`
+	}
+	if err := json.Unmarshal([]byte(text.Text), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Converged || payload.IncompleteApply.FailedAddress != "tchoritest_thing.boom" {
+		t.Fatalf("payload = %+v, want non-converged failed address", payload)
 	}
 }
 

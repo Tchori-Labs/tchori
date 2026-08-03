@@ -122,6 +122,7 @@ tchori validate $PD                  # exit 0: config is valid
 tchori plan $PD -out plan.json       # exit 2: changes present
 tchori apply $PD plan.json           # exit 0: applied; state.json written
 tchori state list                    # both resources
+tchori state status                  # exit 0: last apply completed
 tchori plan $PD                      # exit 0: no changes — idempotent
 
 tchori destroy $PD -out destroy.json # exit 2: destroy plan written
@@ -144,6 +145,31 @@ NTFS journals rename metadata itself), so only the temp-file fsync provides the
 explicit barrier -- the effective durability outcome is unchanged.
 References: [plan and state formats](docs/formats.md) and the
 [diagnostic contract](docs/diagnostics.md).
+
+It also records whether the apply that last wrote it completed: `tchori state status`
+exits 0 for converged state and 1 for an incomplete apply.
+
+In CI, preserve `tchori apply`'s exit code but commit `state.json` even when
+apply fails. The durable `incomplete_apply` record makes that commit an honest
+partial snapshot rather than a false convergence claim. Fail the apply job on
+the captured apply exit code, and gate any downstream job that requires
+converged infrastructure with `tchori state status`:
+
+```sh
+set +e
+tchori apply plan.json
+apply_status=$?
+set -e
+git add state.json
+# Commit/publish state according to the repository's normal workflow.
+exit "$apply_status"                 # preserve apply success/failure
+```
+
+Then make downstream jobs that require converged infrastructure run:
+
+```sh
+tchori state status
+```
 
 ### Sensitive attributes
 
@@ -221,7 +247,7 @@ state. Exactly four tools:
 
 | Tool | Returns |
 | --- | --- |
-| `state_list` | all managed resource addresses |
+| `state_list` | all managed resource addresses plus convergence status |
 | `state_show(address)` | one resource's state JSON |
 | `plan()` | a freshly computed plan document |
 | `provider_schema(name)` | a provider's resource-type schemas |

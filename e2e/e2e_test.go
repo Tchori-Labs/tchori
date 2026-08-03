@@ -107,7 +107,12 @@ const protocol5Config = `{
 type stateDoc struct {
 	FormatVersion string `json:"format_version"`
 	Serial        uint64 `json:"serial"`
-	Resources     map[string]struct {
+	Incomplete    *struct {
+		FailedAddress string   `json:"failed_address"`
+		Applied       []string `json:"applied"`
+		Remaining     []string `json:"remaining"`
+	} `json:"incomplete_apply,omitempty"`
+	Resources map[string]struct {
 		Type       string          `json:"type"`
 		Provider   string          `json:"provider"`
 		Attributes json.RawMessage `json:"attributes"`
@@ -215,6 +220,9 @@ func TestEndToEnd(t *testing.T) {
 		readJSON(t, filepath.Join(work, "state.json"), &st)
 		if st.FormatVersion != "1.0" {
 			t.Fatalf("state format_version = %q, want %q", st.FormatVersion, "1.0")
+		}
+		if st.Incomplete != nil {
+			t.Fatalf("successful end-to-end apply left incomplete marker: %+v", st.Incomplete)
 		}
 		if len(st.Resources) != 2 {
 			t.Fatalf("state has %d resources after apply, want 2: %v", len(st.Resources), addresses(st))

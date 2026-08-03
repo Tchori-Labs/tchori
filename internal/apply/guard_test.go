@@ -49,8 +49,11 @@ func TestApplyGuardRunsBeforeReplaceDestroy(t *testing.T) {
 	if saved.Resources[addr] == nil {
 		t.Fatal("replace guard destroyed the existing resource before rejecting config")
 	}
-	if saved.Serial != beforeSerial {
-		t.Fatalf("state serial = %d, want unchanged %d (destroy leg must not save)", saved.Serial, beforeSerial)
+	if saved.Serial != beforeSerial+2 {
+		t.Fatalf("state serial = %d, want %d (pre-flight marker + failure finalizer; destroy leg must not save)", saved.Serial, beforeSerial+2)
+	}
+	if saved.Incomplete == nil || saved.Incomplete.FailedAddress != addr {
+		t.Fatalf("incomplete_apply = %+v, want failed address %s", saved.Incomplete, addr)
 	}
 }
 
