@@ -376,9 +376,60 @@ state save, in two situations:
 Both refusals are exit code `1`, with a structured diagnostic on stderr
 naming the problem; the fix in both cases is to run `plan` again.
 
+## Result consistency at apply
+
+After create, update, and the create leg of replace, tchori checks the
+provider's returned state against the plan for values the configuration
+concretely authored. Deletes are excluded; their existing `provider did not
+destroy resource` guard checks for a null result. A configured node must be
+non-null and wholly known, and a planned wholesale value must be wholly known,
+to make a value promise. A wholly-known planned null is compared wholesale.
+Computed and unauthored attributes, null or unknown configured containers,
+and unknown values at nodes that must be compared wholesale are not checked.
+Sets have no stable element correspondence and remain wholesale values.
+
+Object and map containers are traversed whenever they are shallow-known and
+non-null, even when they contain unknown computed descendants such as an
+`id` or `uuid`. Lists and tuples are likewise traversed by index when config,
+plan, and result lengths agree, so an unknown element does not suppress checks
+of concrete siblings. If those lengths differ, positional correspondence is
+not sound and the collection is compared wholesale instead. Thus one unknown
+computed descendant never suppresses checks of concrete siblings where safe
+correspondence exists. A returned null or shallow-unknown container is instead
+reported once at its own named path and is not traversed.
+
+A configured map container authors its complete key set. Tchori walks the
+union of planned and applied keys, reporting dropped keys as `applied absent`,
+provider-invented keys as `planned absent`, and an authored empty map that
+comes back populated. Individual shared-key values are compared only when the
+configuration concretely authored that key. A key invented by the provider at
+plan time (present in plan but absent from config) remains out of scope.
+
+A null resource object fails before the attribute walk with `provider returned
+no state after apply`; a shallow-unknown resource object similarly fails with
+`provider returned unknown state after apply`. Every attribute divergence path
+is named. Apply exits `1` with a structured diagnostic. State records exactly
+the provider result when that result is non-null and JSON-encodable, even when
+a consistency diagnostic is raised; null, root-unknown, and other
+not-wholly-known/unencodable results write nothing for that address. Tchori
+never substitutes the planned value. A provider that honours an attribute on
+update can therefore converge on a second plan and apply.
+
+Consistency diagnostic values follow the redaction rules below.
+
 ## Sensitivity
 
 Provider responses are stored verbatim in `state.json` and `plan.json`, so
 values a provider *derives* from env-sourced secrets can end up recorded
-there too — treat both files as sensitive (redaction is a recorded post-MVP
-item, not yet implemented).
+there too — treat both files as sensitive. General plan/state redaction remains
+a recorded post-MVP item.
+
+The result-consistency diagnostic is redacted. An ordinary attribute's own
+schema `Sensitive` flag governs its entire subtree, including aggregate map,
+list, and set attributes and applied-only map keys. A traversed ordered nested
+block redacts each reported leaf according to that leaf's schema; a
+nested-block value that must be compared wholesale is redacted if any
+descendant attribute is sensitive. Schema paths that cannot be resolved fail
+closed. Sensitivity of a
+sibling never redacts a non-sensitive attribute. These rules affect diagnostic
+rendering only; `plan.json` and `state.json` remain unredacted.

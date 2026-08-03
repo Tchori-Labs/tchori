@@ -201,6 +201,19 @@ type server struct {
 
 var _ tfprotov6.ProviderServer = (*server)(nil)
 
+func knownResourceType(typeName string) bool {
+	switch typeName {
+	case "tchoritest_thing", "tchoritest_lossy", "tchoritest_nested_thing", "tchoritest_server_assigned", "tchoritest_broken_thing":
+		return true
+	default:
+		return false
+	}
+}
+
+func unknownResourceTypeDiagnostic(typeName string) *tfprotov6.Diagnostic {
+	return &tfprotov6.Diagnostic{Severity: tfprotov6.DiagnosticSeverityError, Summary: "unknown resource type", Detail: "resource type " + typeName + " is not registered"}
+}
+
 // --- Provider-level RPCs ----------------------------------------------------
 
 func (s *server) GetMetadata(ctx context.Context, req *tfprotov6.GetMetadataRequest) (*tfprotov6.GetMetadataResponse, error) {
@@ -210,6 +223,7 @@ func (s *server) GetMetadata(ctx context.Context, req *tfprotov6.GetMetadataRequ
 		},
 		Resources: []tfprotov6.ResourceMetadata{
 			{TypeName: "tchoritest_thing"},
+			{TypeName: "tchoritest_lossy"},
 			{TypeName: "tchoritest_nested_thing"},
 			{TypeName: "tchoritest_server_assigned"},
 			{TypeName: "tchoritest_broken_thing"},
@@ -222,6 +236,7 @@ func (s *server) GetProviderSchema(ctx context.Context, req *tfprotov6.GetProvid
 		Provider: providerSchema,
 		ResourceSchemas: map[string]*tfprotov6.Schema{
 			"tchoritest_thing":           thingSchema,
+			"tchoritest_lossy":           lossySchema,
 			"tchoritest_nested_thing":    nestedThingSchema,
 			"tchoritest_server_assigned": serverAssignedSchema,
 			"tchoritest_broken_thing":    brokenThingSchema,
@@ -271,6 +286,15 @@ func (s *server) StopProvider(ctx context.Context, req *tfprotov6.StopProviderRe
 // --- ResourceServer ----------------------------------------------------------
 
 func (s *server) ValidateResourceConfig(ctx context.Context, req *tfprotov6.ValidateResourceConfigRequest) (*tfprotov6.ValidateResourceConfigResponse, error) {
+	if !knownResourceType(req.TypeName) {
+		return &tfprotov6.ValidateResourceConfigResponse{Diagnostics: []*tfprotov6.Diagnostic{unknownResourceTypeDiagnostic(req.TypeName)}}, nil
+	}
+	if req.TypeName == "tchoritest_lossy" {
+		if _, err := req.Config.Unmarshal(lossyType); err != nil {
+			return nil, err
+		}
+		return &tfprotov6.ValidateResourceConfigResponse{}, nil
+	}
 	if req.TypeName == "tchoritest_nested_thing" {
 		if _, err := req.Config.Unmarshal(nestedThingType); err != nil {
 			return nil, err
@@ -313,10 +337,15 @@ func (s *server) ValidateResourceConfig(ctx context.Context, req *tfprotov6.Vali
 }
 
 func (s *server) UpgradeResourceState(ctx context.Context, req *tfprotov6.UpgradeResourceStateRequest) (*tfprotov6.UpgradeResourceStateResponse, error) {
+	if !knownResourceType(req.TypeName) {
+		return &tfprotov6.UpgradeResourceStateResponse{Diagnostics: []*tfprotov6.Diagnostic{unknownResourceTypeDiagnostic(req.TypeName)}}, nil
+	}
 	// Schema version is 0 and never bumped for any resource type: reinterpret
 	// the raw state as-is, just against the requested type's own wire shape.
 	ty := thingType
 	switch req.TypeName {
+	case "tchoritest_lossy":
+		ty = lossyType
 	case "tchoritest_nested_thing":
 		ty = nestedThingType
 	case "tchoritest_server_assigned":
@@ -334,6 +363,9 @@ func (s *server) UpgradeResourceState(ctx context.Context, req *tfprotov6.Upgrad
 }
 
 func (s *server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRequest) (*tfprotov6.ReadResourceResponse, error) {
+	if !knownResourceType(req.TypeName) {
+		return &tfprotov6.ReadResourceResponse{Diagnostics: []*tfprotov6.Diagnostic{unknownResourceTypeDiagnostic(req.TypeName)}}, nil
+	}
 	// No backing store: echo current state (and private) unchanged.
 	return &tfprotov6.ReadResourceResponse{
 		NewState: req.CurrentState,
@@ -342,6 +374,12 @@ func (s *server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 }
 
 func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
+	if !knownResourceType(req.TypeName) {
+		return &tfprotov6.PlanResourceChangeResponse{Diagnostics: []*tfprotov6.Diagnostic{unknownResourceTypeDiagnostic(req.TypeName)}}, nil
+	}
+	if req.TypeName == "tchoritest_lossy" {
+		return s.planLossy(req)
+	}
 	if req.TypeName == "tchoritest_nested_thing" {
 		return s.planNestedThing(req)
 	}
@@ -460,6 +498,12 @@ func (s *server) planNestedThing(req *tfprotov6.PlanResourceChangeRequest) (*tfp
 }
 
 func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyResourceChangeRequest) (*tfprotov6.ApplyResourceChangeResponse, error) {
+	if !knownResourceType(req.TypeName) {
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: []*tfprotov6.Diagnostic{unknownResourceTypeDiagnostic(req.TypeName)}}, nil
+	}
+	if req.TypeName == "tchoritest_lossy" {
+		return s.applyLossy(req)
+	}
 	if req.TypeName == "tchoritest_nested_thing" {
 		return s.applyNestedThing(req)
 	}

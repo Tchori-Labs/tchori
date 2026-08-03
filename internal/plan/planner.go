@@ -339,7 +339,7 @@ func nullOutUnknowns(v cty.Value) (cty.Value, []string, error) {
 	var paths []string
 	out, err := cty.Transform(v, func(p cty.Path, val cty.Value) (cty.Value, error) {
 		if !val.IsKnown() {
-			paths = append(paths, pathString(p))
+			paths = append(paths, PathString(p))
 			return cty.NullVal(val.Type()), nil
 		}
 		return val, nil
@@ -351,12 +351,12 @@ func nullOutUnknowns(v cty.Value) (cty.Value, []string, error) {
 	return out, paths, nil
 }
 
-// pathString renders a cty.Path as a dotted attribute path: "id",
+// PathString renders a cty.Path as a dotted attribute path: "id",
 // "triggers.foo", `tags["env"]`, "items[0]". Adapted from the algorithm of
 // Terraform's internal tfdiags.FormatCtyPath (internal/tfdiags, BUSL-1.1,
 // not importable — reimplemented per research-cty.md §6), without the
-// leading dot.
-func pathString(path cty.Path) string {
+// leading dot. An empty path renders as an empty string.
+func PathString(path cty.Path) string {
 	var buf strings.Builder
 	for i, step := range path {
 		switch ts := step.(type) {

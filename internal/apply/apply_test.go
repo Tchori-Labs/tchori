@@ -115,6 +115,20 @@ func thing(addrName, cfgName string) *config.Resource {
 // a nested_type (SINGLE) attribute with two optional leaf attributes. A nil
 // settings omits the "settings" key from Config entirely, matching the real
 // acceptance shape (a config that leaves the nested attribute unset).
+func lossyThing(addrName string, values map[string]any) *config.Resource {
+	cfg := map[string]any{"name": addrName}
+	for key, value := range values {
+		cfg[key] = value
+	}
+	return &config.Resource{
+		Address:  "tchoritest_lossy." + addrName,
+		Type:     "tchoritest_lossy",
+		Name:     addrName,
+		Provider: "tchoritest",
+		Config:   cfg,
+	}
+}
+
 func nestedThing(addrName, cfgName string, settings map[string]any) *config.Resource {
 	cfg := map[string]any{"name": cfgName}
 	if settings != nil {
@@ -195,6 +209,150 @@ func TestApplyCreate(t *testing.T) {
 	saved := loadState(t, h.statePath)
 	if saved.Serial != 1 {
 		t.Errorf("state serial = %d, want 1 (exactly one save for one change)", saved.Serial)
+	}
+}
+
+func TestApplyLossyCreateUpdateReplaceAndDestroy(t *testing.T) {
+	const addr = "tchoritest_lossy.svc"
+	resource := lossyThing("svc", map[string]any{"flag": true, "replace_me": "a"})
+	h := newHarness(t, map[string]*config.Resource{addr: resource})
+	ctx := context.Background()
+	st := loadState(t, h.statePath)
+
+	createPlan := h.plan(t, st, false)
+	if len(createPlan.Changes) != 1 || createPlan.Changes[0].Action != "create" {
+		t.Fatalf("create plan = %#v", createPlan.Changes)
+	}
+	ty := h.schemas["tchoritest"].ResourceTypes["tchoritest_lossy"].Block.ImpliedType()
+	planned, err := ctymsgpack.Unmarshal(createPlan.Changes[0].PlannedRaw, ty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if planned.IsWhollyKnown() || planned.GetAttr("id").IsKnown() {
+		t.Fatal("lossy planned create must retain unknown computed id")
+	}
+	createDs := apply.Apply(ctx, createPlan, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if len(createDs) != 1 || createDs[0].Summary != "provider produced inconsistent result after apply" || !strings.Contains(createDs[0].Detail, "flag: planned true, applied false") {
+		t.Fatalf("create diagnostics = %#v", createDs)
+	}
+	if got := stateAttrs(t, h.statePath, addr)["flag"]; got != false {
+		t.Fatalf("saved create flag = %#v, want provider's false", got)
+	}
+
+	// The fake provider's update path honours the flag, matching the reported
+	// provider's PATCH workaround, so an identical second plan converges.
+	st = loadState(t, h.statePath)
+	updatePlan := h.plan(t, st, false)
+	if updatePlan.Changes[0].Action != "update" {
+		t.Fatalf("update action = %q", updatePlan.Changes[0].Action)
+	}
+	if ds := apply.Apply(ctx, updatePlan, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("update diagnostics = %#v", ds)
+	}
+	if got := stateAttrs(t, h.statePath, addr)["flag"]; got != true {
+		t.Fatalf("saved update flag = %#v", got)
+	}
+
+	resource.Config["replace_me"] = "b"
+	st = loadState(t, h.statePath)
+	replacePlan := h.plan(t, st, false)
+	if replacePlan.Changes[0].Action != "replace" || len(replacePlan.Changes[0].RequiresReplace) != 1 || replacePlan.Changes[0].RequiresReplace[0] != "replace_me" {
+		t.Fatalf("replace plan = %#v", replacePlan.Changes[0])
+	}
+	replaceDs := apply.Apply(ctx, replacePlan, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if len(replaceDs) != 1 || !strings.Contains(replaceDs[0].Detail, "flag: planned true, applied false") {
+		t.Fatalf("replace diagnostics = %#v", replaceDs)
+	}
+
+	st = loadState(t, h.statePath)
+	destroyPlan := h.plan(t, st, true)
+	if ds := apply.Apply(ctx, destroyPlan, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("destroy diagnostics = %#v", ds)
+	}
+}
+
+func TestApplyLossyMapKeySet(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tags map[string]any
+		want string
+	}{
+		{"injected", map[string]any{"inject": "x"}, `tags["injected"]: planned absent, applied "by-provider"`},
+		{"authored empty", map[string]any{}, `tags["injected"]: planned absent, applied "by-provider"`},
+		{"dropped", map[string]any{"dropped": "x"}, `tags["dropped"]: planned "x", applied absent`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const addr = "tchoritest_lossy.svc"
+			h := newHarness(t, map[string]*config.Resource{addr: lossyThing("svc", map[string]any{"tags": tc.tags})})
+			st := loadState(t, h.statePath)
+			ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+			if len(ds) != 1 || !strings.Contains(ds[0].Detail, tc.want) {
+				t.Fatalf("diagnostics = %#v", ds)
+			}
+		})
+	}
+}
+
+func TestApplyLossyNestedRedactionAndNullContainers(t *testing.T) {
+	const addr = "tchoritest_lossy.svc"
+	t.Run("nested redaction", func(t *testing.T) {
+		h := newHarness(t, map[string]*config.Resource{addr: lossyThing("svc", map[string]any{
+			"credentials": map[string]any{"user": "alice", "token": "token-secret"},
+			"endpoints":   []any{map[string]any{"host": "api", "api_key": "api-secret"}},
+			"probes":      []any{map[string]any{"path": "/health"}},
+		})})
+		st := loadState(t, h.statePath)
+		ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+		if len(ds) != 1 {
+			t.Fatalf("diagnostics = %#v", ds)
+		}
+		detail := ds[0].Detail
+		for _, secret := range []string{"token-secret", "TOKEN-SECRET", "api-secret"} {
+			if strings.Contains(detail, secret) {
+				t.Fatalf("detail leaked %q: %s", secret, detail)
+			}
+		}
+		if !strings.Contains(detail, "credentials.token: planned (sensitive value), applied (sensitive value)") ||
+			!strings.Contains(detail, `credentials.user: planned "alice", applied ""`) ||
+			!strings.Contains(detail, "endpoints: planned (sensitive value), applied (sensitive value)") ||
+			!strings.Contains(detail, `probes: planned [{"path":"/health"}], applied []`) {
+			t.Fatalf("detail = %s", detail)
+		}
+	})
+
+	t.Run("returned null aggregates", func(t *testing.T) {
+		h := newHarness(t, map[string]*config.Resource{addr: lossyThing("svc", map[string]any{
+			"tags":        map[string]any{"nullify": "visible"},
+			"credentials": map[string]any{"user": "nullify", "token": "hidden"},
+		})})
+		st := loadState(t, h.statePath)
+		ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+		if len(ds) != 1 {
+			t.Fatalf("diagnostics = %#v", ds)
+		}
+		if !strings.Contains(ds[0].Detail, `tags: planned {"nullify":"visible"}, applied null`) || strings.Contains(ds[0].Detail, "tags.nullify") ||
+			!strings.Contains(ds[0].Detail, "credentials: planned (sensitive value), applied (sensitive value)") || strings.Contains(ds[0].Detail, "hidden") {
+			t.Fatalf("detail = %s", ds[0].Detail)
+		}
+		attrs := stateAttrs(t, h.statePath, addr)
+		if attrs["tags"] != nil || attrs["credentials"] != nil {
+			t.Fatalf("state did not retain returned nulls: %#v", attrs)
+		}
+	})
+}
+
+func TestApplyLossyResolvedReferencesRemainChecked(t *testing.T) {
+	const lossyAddr = "tchoritest_lossy.svc"
+	source := thing("source", "source")
+	lossy := lossyThing("svc", map[string]any{ //nolint:gosec // schema attribute name, not a credential literal
+		"secret": "${tchoritest_thing.source.echo}",
+		"tags":   map[string]any{"dropped": "${tchoritest_thing.source.id}"},
+	})
+	h := newHarness(t, map[string]*config.Resource{source.Address: source, lossyAddr: lossy})
+	st := loadState(t, h.statePath)
+	ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	if len(ds) != 1 || ds[0].Address != lossyAddr || !strings.Contains(ds[0].Detail, `tags["dropped"]: planned "id-source", applied absent`) || !strings.Contains(ds[0].Detail, "secret: planned (sensitive value), applied (sensitive value)") || strings.Contains(ds[0].Detail, "SOURCE") {
+		t.Fatalf("diagnostics = %#v", ds)
 	}
 }
 
