@@ -29,7 +29,7 @@ func TestProtocol5GatewayHTMLDiagnosticContext(t *testing.T) {
 		t.Fatalf("Schemas: %#v", ds)
 	}
 	schema := schemas.ResourceTypes["tchoritest5_thing"]
-	current, ds := Compose(map[string]any{"name": "gateway_html"}, schema.Block.ImpliedType(), false, nil)
+	current, ds := Compose(map[string]any{"name": "gateway_html"}, schema.Block.ImpliedType(), EnvResolve, nil)
 	if ds.HasErrors() {
 		t.Fatalf("Compose: %#v", ds)
 	}

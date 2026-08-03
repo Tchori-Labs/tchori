@@ -813,6 +813,100 @@ func TestCLIRejectsEmbeddedReference(t *testing.T) {
 	}
 }
 
+func TestCLIResourceConfigEnvWrapperLifecycle(t *testing.T) {
+	const envName = "TCHORI_TEST_NAME"
+	t.Setenv(envName, "alpha")
+	dir := t.TempDir()
+	cfg := `{
+  "providers": {
+    "tchoritest": {
+      "source": "tchori-labs/tchoritest",
+      "version": "0.0.1",
+      "config": {"prefix": "t-"}
+    }
+  },
+  "resources": {
+    "tchoritest_thing.demo": {
+      "config": {"name": {"env": "TCHORI_TEST_NAME"}}
+    }
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	pd := "--plugin-dir=" + pluginDir
+	assertNoProviderOnlyError := func(command, stderr string) {
+		t.Helper()
+		if strings.Contains(stderr, "only allowed"+" in provider config") {
+			t.Errorf("%s stderr retains resource env-wrapper rejection: %q", command, stderr)
+		}
+	}
+
+	_, stderr, code := runCLI(t, dir, "validate", pd)
+	assertNoProviderOnlyError("validate", stderr)
+	if code != 0 {
+		t.Fatalf("validate: exit %d, want 0\nstderr: %s", code, stderr)
+	}
+
+	_, stderr, code = runCLI(t, dir, "plan", pd, "-out", "plan.json")
+	assertNoProviderOnlyError("plan", stderr)
+	if code != 2 {
+		t.Fatalf("plan -out: exit %d, want 2\nstderr: %s", code, stderr)
+	}
+
+	_, stderr, code = runCLI(t, dir, "apply", pd, "plan.json")
+	assertNoProviderOnlyError("apply", stderr)
+	if code != 0 {
+		t.Fatalf("apply: exit %d, want 0\nstderr: %s", code, stderr)
+	}
+
+	stateBytes, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // test temp directory
+	if err != nil {
+		t.Fatalf("read state.json: %v", err)
+	}
+	var stateDoc struct {
+		Resources map[string]struct {
+			Attributes map[string]any `json:"attributes"`
+		} `json:"resources"`
+	}
+	if err := json.Unmarshal(stateBytes, &stateDoc); err != nil {
+		t.Fatalf("decode state.json: %v", err)
+	}
+	if got := stateDoc.Resources["tchoritest_thing.demo"].Attributes["name"]; got != "alpha" {
+		t.Errorf("state name = %#v, want environment value %q", got, "alpha")
+	}
+
+	stdout, stderr, code := runCLI(t, dir, "plan", pd)
+	assertNoProviderOnlyError("follow-up plan", stderr)
+	if code != 0 || !strings.Contains(stdout, "No changes") {
+		t.Fatalf("follow-up plan: exit %d, want 0 and No changes\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+
+	if err := os.Unsetenv(envName); err != nil {
+		t.Fatalf("Unsetenv: %v", err)
+	}
+	_, stderr, code = runCLI(t, dir, "validate", pd)
+	assertNoProviderOnlyError("validate with unset variable", stderr)
+	if code != 0 {
+		t.Fatalf("validate with unset variable: exit %d, want 0\nstderr: %s", code, stderr)
+	}
+
+	_, stderr, code = runCLI(t, dir, "destroy", pd, "-out", "destroy.json")
+	assertNoProviderOnlyError("destroy", stderr)
+	if code != 2 {
+		t.Fatalf("destroy -out with unset variable: exit %d, want 2\nstderr: %s", code, stderr)
+	}
+	_, stderr, code = runCLI(t, dir, "apply", pd, "destroy.json")
+	assertNoProviderOnlyError("apply destroy", stderr)
+	if code != 0 {
+		t.Fatalf("apply destroy with unset variable: exit %d, want 0\nstderr: %s", code, stderr)
+	}
+	stdout, stderr, code = runCLI(t, dir, "state", "list")
+	if code != 0 || stdout != "" {
+		t.Fatalf("state list after destroy: exit %d, stdout %q, stderr %q; want empty", code, stdout, stderr)
+	}
+}
+
 func TestValidateInvalidName(t *testing.T) {
 	dir := t.TempDir()
 	writeConfig(t, dir, "invalid") // fake provider rejects name == "invalid"

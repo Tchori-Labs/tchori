@@ -348,7 +348,7 @@ func newPlanner(t *testing.T, cfg *config.Config, st *state.State) *plan.Planner
 	if ds.HasErrors() {
 		t.Fatalf("Schemas: %+v", ds)
 	}
-	provCfg, ds := provider.Compose(map[string]any{}, schemas.Provider.Block.ImpliedType(), true, nil)
+	provCfg, ds := provider.Compose(map[string]any{}, schemas.Provider.Block.ImpliedType(), provider.EnvResolve, nil)
 	if ds.HasErrors() {
 		t.Fatalf("compose provider config: %+v", ds)
 	}
@@ -501,6 +501,101 @@ func TestPlanRejectsEmbeddedReference(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("diagnostics = %+v, want unresolved reference at tags.content", ds)
+	}
+}
+
+func TestPlanCreateWithResourceEnvWrapper(t *testing.T) {
+	t.Setenv("TCHORI_TEST_NAME", "alpha")
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_thing.demo": {"name": map[string]any{"env": "TCHORI_TEST_NAME"}},
+	})
+	p := newPlanner(t, cfg, stateWith(t, 0, nil))
+
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+	if pl == nil || len(pl.Changes) != 1 {
+		t.Fatalf("plan changes = %+v, want exactly one change", pl)
+	}
+	var after map[string]any
+	if err := json.Unmarshal(pl.Changes[0].After, &after); err != nil {
+		t.Fatalf("decode planned after: %v", err)
+	}
+	if got := after["name"]; got != "alpha" {
+		t.Errorf("planned name = %#v, want environment value %q", got, "alpha")
+	}
+	for _, path := range pl.Changes[0].UnknownAfter {
+		if path == "name" {
+			t.Errorf("unknown_after = %v, environment value must be concrete", pl.Changes[0].UnknownAfter)
+		}
+	}
+}
+
+func TestPlanResourceEnvWrappersNestedAndReferenced(t *testing.T) {
+	t.Setenv("TCHORI_TEST_NAME", "alpha")
+	t.Setenv("TCHORI_TEST_TAG", "secret-tag")
+	t.Setenv("TCHORI_TEST_LABEL", "secret-label")
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_thing.alpha": {
+			"name": map[string]any{"env": "TCHORI_TEST_NAME"},
+			"tags": map[string]any{"token": map[string]any{"env": "TCHORI_TEST_TAG"}},
+		},
+		"tchoritest_thing.beta": {
+			"name": "${tchoritest_thing.alpha.name}",
+		},
+		"tchoritest_nested_thing.nested": {
+			"name":     "nested",
+			"settings": map[string]any{"label": map[string]any{"env": "TCHORI_TEST_LABEL"}},
+		},
+	})
+	p := newPlanner(t, cfg, stateWith(t, 0, nil))
+
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+	changes := make(map[string]map[string]any, len(pl.Changes))
+	for _, change := range pl.Changes {
+		var after map[string]any
+		if err := json.Unmarshal(change.After, &after); err != nil {
+			t.Fatalf("decode %s after: %v", change.Address, err)
+		}
+		changes[change.Address] = after
+	}
+	alpha := changes["tchoritest_thing.alpha"]
+	if got := alpha["tags"].(map[string]any)["token"]; got != "secret-tag" {
+		t.Errorf("planned map env value = %#v, want secret-tag", got)
+	}
+	if got := changes["tchoritest_thing.beta"]["name"]; got != "alpha" {
+		t.Errorf("onward reference to env value = %#v, want alpha", got)
+	}
+	nested := changes["tchoritest_nested_thing.nested"]["settings"].(map[string]any)
+	if got := nested["label"]; got != "secret-label" {
+		t.Errorf("planned nested env value = %#v, want secret-label", got)
+	}
+}
+
+func TestPlanResourceEnvWrapperUnset(t *testing.T) {
+	const envName = "TCHORI_TEST_PLAN_UNSET"
+	t.Setenv(envName, "placeholder")
+	if err := os.Unsetenv(envName); err != nil {
+		t.Fatalf("Unsetenv: %v", err)
+	}
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_thing.demo": {"name": map[string]any{"env": envName}},
+	})
+	p := newPlanner(t, cfg, stateWith(t, 0, nil))
+
+	pl, ds := p.Plan(context.Background())
+	if pl != nil {
+		t.Errorf("plan = %+v, want no partial plan", pl)
+	}
+	if !ds.HasErrors() {
+		t.Fatal("Plan succeeded; want unset environment diagnostic")
+	}
+	if ds[0].Summary != "environment variable not set" || !strings.Contains(ds[0].Detail, envName) {
+		t.Errorf("diagnostics = %+v, want unset variable %q", ds, envName)
 	}
 }
 

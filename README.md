@@ -25,10 +25,11 @@ Status: **0.1.0-dev** — pre-MVP, under active development, built in public.
    dependency graph. A reference-shaped `${...}` that survives in a value
    tchori would send to a provider is a hard `unresolved reference` error at
    validate, plan, and apply; shell-style literals such as `${HOME}` remain
-   legal. Provider values come from the environment via
+   legal. Provider and resource config values come from the environment via
    `{"env": "VAR_NAME"}` or ordered fallback
    `{"env": ["PRIMARY", "ALTERNATE"]}` wrappers, so secrets never need to
-   live in config files. See [configuration and environment values](docs/configuration.md).
+   live in config files. `validate` treats unset environment values as unknown;
+   `plan` and `apply` require a candidate to be set. See [configuration and environment values](docs/configuration.md).
 3. **Machine-readable diagnostics.** Every error and warning is a structured
    JSON object on stderr (`{"severity","summary","detail","address"}`) — the
    agent retry loop, not a wall of prose. Pretty rendering only when stderr

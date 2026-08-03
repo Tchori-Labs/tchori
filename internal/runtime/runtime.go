@@ -115,7 +115,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, diag.Diagnostics) {
 			return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address, "reference in provider config",
 				fmt.Sprintf("provider %q configuration cannot reference resources (found ${%s.%s})", name, ref.Address, ref.Attr))}
 		}
-		composed, cds := provider.Compose(p.Config, ps.Provider.Block.ImpliedType(), true, refsForbidden)
+		composed, cds := provider.Compose(p.Config, ps.Provider.Block.ImpliedType(), provider.EnvResolve, refsForbidden)
 		ds = append(ds, cds...)
 		if cds.HasErrors() {
 			rt.Close()

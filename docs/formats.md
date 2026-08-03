@@ -72,6 +72,13 @@ The guarantee has three deliberate boundaries:
 `[]byte` in Go; `encoding/json`'s default handling renders `[]byte` as
 standard base64 in the JSON document.
 
+> **Environment-sourced resource values:** An `{"env": "VAR"}` value in resource
+> config is resolved to a concrete string at plan time. It is persisted in
+> `plan.json` (visibly in `after` and inside `planned_raw`; base64 is encoding,
+> not encryption) and returned by the MCP `plan` tool. Values at paths marked
+> sensitive by the provider or `sensitive_attributes` follow the normal
+> redaction rules; treat unmarked plan values and plan results as sensitive.
+
 ### Action semantics (`plan.classify`)
 
 | Action | When |
@@ -247,6 +254,11 @@ marker, although it does clear a stale marker from an earlier run.
 Use `tchori state status` as the convergence gate: exit 0 means converged and
 exit 1 means incomplete. `plan`, `apply`, and `destroy` warn when loading a
 marked file, while planning remains available for recovery.
+
+An environment-sourced resource config value is written into the applied
+resource's `attributes` in `state.json`, just like any other concrete configured
+value. Values at sensitive paths follow the normal state redaction rules; treat
+unmarked state values as sensitive.
 
 ### Serial semantics
 

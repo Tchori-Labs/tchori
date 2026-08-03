@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -86,7 +87,7 @@ func TestComposeEnvWrapper(t *testing.T) {
 	}
 
 	// allowEnv=true: this is how provider config is composed.
-	got, diags := Compose(raw, ty, true, nil)
+	got, diags := Compose(raw, ty, EnvResolve, nil)
 	if diags.HasErrors() {
 		t.Fatalf("unexpected diagnostics: %+v", diags)
 	}
@@ -108,7 +109,7 @@ func TestComposeEnvUnset(t *testing.T) {
 	ty := cty.Object(map[string]cty.Type{"token": cty.String})
 	raw := map[string]any{"token": map[string]any{"env": name}}
 
-	_, diags := Compose(raw, ty, true, nil)
+	_, diags := Compose(raw, ty, EnvResolve, nil)
 	if !diags.HasErrors() {
 		t.Fatal("Compose succeeded; want error diagnostic for unset environment variable")
 	}
@@ -120,6 +121,150 @@ func TestComposeEnvUnset(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("diagnostics %+v do not name the unset variable %q", diags, name)
+	}
+}
+
+func TestComposeEnvWrapperNestingPolicies(t *testing.T) {
+	const envName = "TCHORI_TEST_NESTED_VALUE"
+	for _, tc := range []struct {
+		name string
+		ty   cty.Type
+		raw  map[string]any
+		want cty.Value
+	}{
+		{
+			name: "top-level string",
+			ty:   cty.Object(map[string]cty.Type{"value": cty.String}),
+			raw:  map[string]any{"value": map[string]any{"env": envName}},
+			want: cty.ObjectVal(map[string]cty.Value{"value": cty.StringVal("secret")}),
+		},
+		{
+			name: "map element",
+			ty:   cty.Object(map[string]cty.Type{"value": cty.Map(cty.String)}),
+			raw:  map[string]any{"value": map[string]any{"key": map[string]any{"env": envName}}},
+			want: cty.ObjectVal(map[string]cty.Value{"value": cty.MapVal(map[string]cty.Value{"key": cty.StringVal("secret")})}),
+		},
+		{
+			name: "list element",
+			ty:   cty.Object(map[string]cty.Type{"value": cty.List(cty.String)}),
+			raw:  map[string]any{"value": []any{map[string]any{"env": envName}}},
+			want: cty.ObjectVal(map[string]cty.Value{"value": cty.ListVal([]cty.Value{cty.StringVal("secret")})}),
+		},
+		{
+			name: "set element",
+			ty:   cty.Object(map[string]cty.Type{"value": cty.Set(cty.String)}),
+			raw:  map[string]any{"value": []any{map[string]any{"env": envName}}},
+			want: cty.ObjectVal(map[string]cty.Value{"value": cty.SetVal([]cty.Value{cty.StringVal("secret")})}),
+		},
+		{
+			name: "nested object leaf and two wrappers",
+			ty: cty.Object(map[string]cty.Type{
+				"value": cty.Object(map[string]cty.Type{"first": cty.String, "second": cty.String}),
+			}),
+			raw: map[string]any{"value": map[string]any{
+				"first":  map[string]any{"env": envName},
+				"second": map[string]any{"env": envName},
+			}},
+			want: cty.ObjectVal(map[string]cty.Value{"value": cty.ObjectVal(map[string]cty.Value{
+				"first": cty.StringVal("secret"), "second": cty.StringVal("secret"),
+			})}),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(envName, "secret")
+			for _, policy := range []EnvPolicy{EnvResolve, EnvUnknownIfUnset} {
+				got, diags := Compose(tc.raw, tc.ty, policy, nil)
+				if diags.HasErrors() {
+					t.Fatalf("policy %d: unexpected diagnostics: %+v", policy, diags)
+				}
+				if !got.RawEquals(tc.want) {
+					t.Errorf("policy %d: Compose = %#v, want %#v", policy, got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestComposeEnvWrapperEmptyStringPolicies(t *testing.T) {
+	const envName = "TCHORI_TEST_EMPTY_VALUE"
+	t.Setenv(envName, "")
+	ty := cty.Object(map[string]cty.Type{"value": cty.String})
+	raw := map[string]any{"value": map[string]any{"env": envName}}
+	for _, policy := range []EnvPolicy{EnvResolve, EnvUnknownIfUnset} {
+		got, diags := Compose(raw, ty, policy, nil)
+		if diags.HasErrors() {
+			t.Fatalf("policy %d: unexpected diagnostics: %+v", policy, diags)
+		}
+		if g := got.GetAttr("value"); !g.RawEquals(cty.StringVal("")) {
+			t.Errorf("policy %d: value = %#v, want known empty string", policy, g)
+		}
+	}
+}
+
+func TestComposeEnvUnknownIfUnset(t *testing.T) {
+	const envName = "TCHORI_TEST_UNKNOWN_IF_UNSET"
+	t.Setenv(envName, "placeholder")
+	if err := os.Unsetenv(envName); err != nil {
+		t.Fatalf("Unsetenv: %v", err)
+	}
+	ty := cty.Object(map[string]cty.Type{"value": cty.String})
+	raw := map[string]any{"value": map[string]any{"env": envName}}
+
+	got, diags := Compose(raw, ty, EnvUnknownIfUnset, nil)
+	if diags.HasErrors() || len(diags) != 0 {
+		t.Fatalf("diagnostics = %+v, want none", diags)
+	}
+	value := got.GetAttr("value")
+	if value.IsKnown() || value.Type() != cty.String {
+		t.Errorf("value = %#v, want unknown with known string type", value)
+	}
+}
+
+func TestComposeEnvWrapperNonString(t *testing.T) {
+	for name, primitive := range map[string]cty.Type{"number": cty.Number, "bool": cty.Bool} {
+		t.Run(name, func(t *testing.T) {
+			for _, policy := range []EnvPolicy{EnvResolve, EnvUnknownIfUnset} {
+				ty := cty.Object(map[string]cty.Type{"value": primitive})
+				raw := map[string]any{"value": map[string]any{"env": "SOME_VAR"}}
+				_, diags := Compose(raw, ty, policy, nil)
+				if !diags.HasErrors() {
+					t.Fatalf("policy %d: Compose succeeded; want invalid env wrapper", policy)
+				}
+				if diags[0].Summary != "invalid env wrapper" {
+					t.Errorf("policy %d: summary = %q, want %q", policy, diags[0].Summary, "invalid env wrapper")
+				}
+			}
+		})
+	}
+}
+
+func TestComposeEnvWrapperPlainDataAtCollectionTypes(t *testing.T) {
+	for _, policy := range []EnvPolicy{EnvResolve, EnvUnknownIfUnset} {
+		t.Run(fmt.Sprintf("policy-%d", policy), func(t *testing.T) {
+			mapTy := cty.Object(map[string]cty.Type{"value": cty.Map(cty.String)})
+			got, diags := Compose(map[string]any{"value": map[string]any{"env": "prod"}}, mapTy, policy, nil)
+			if diags.HasErrors() {
+				t.Fatalf("map: unexpected diagnostics: %+v", diags)
+			}
+			if g := got.GetAttr("value"); !g.RawEquals(cty.MapVal(map[string]cty.Value{"env": cty.StringVal("prod")})) {
+				t.Errorf("map value = %#v, want env key as plain data", g)
+			}
+
+			objectTy := cty.Object(map[string]cty.Type{"value": cty.Object(map[string]cty.Type{"env": cty.String})})
+			got, diags = Compose(map[string]any{"value": map[string]any{"env": "prod"}}, objectTy, policy, nil)
+			if diags.HasErrors() {
+				t.Fatalf("object: unexpected diagnostics: %+v", diags)
+			}
+			if g := got.GetAttr("value").GetAttr("env"); !g.RawEquals(cty.StringVal("prod")) {
+				t.Errorf("object env = %#v, want plain string data", g)
+			}
+
+			listTy := cty.Object(map[string]cty.Type{"value": cty.List(cty.String)})
+			_, diags = Compose(map[string]any{"value": map[string]any{"env": "prod"}}, listTy, policy, nil)
+			if !diags.HasErrors() || diags[0].Summary != "type mismatch" {
+				t.Errorf("list diagnostics = %+v, want type mismatch rather than env-wrapper handling", diags)
+			}
+		})
 	}
 }
 
@@ -177,7 +322,7 @@ func TestComposeEnvCandidateResolution(t *testing.T) {
 
 			ty := cty.Object(map[string]cty.Type{"token": cty.String})
 			raw := map[string]any{"token": map[string]any{"env": tt.candidates}}
-			got, diags := Compose(raw, ty, true, nil)
+			got, diags := Compose(raw, ty, EnvResolve, nil)
 			if diags.HasErrors() {
 				t.Fatalf("unexpected diagnostics: %+v", diags)
 			}
@@ -198,7 +343,7 @@ func TestComposeEnvCandidatesUnset(t *testing.T) {
 
 	ty := cty.Object(map[string]cty.Type{"token": cty.String})
 	raw := map[string]any{"token": map[string]any{"env": []any{first, second, first}}}
-	_, diags := Compose(raw, ty, true, nil)
+	_, diags := Compose(raw, ty, EnvResolve, nil)
 	if !diags.HasErrors() {
 		t.Fatal("Compose succeeded; want error diagnostic when all candidates are unset")
 	}
@@ -233,7 +378,7 @@ func TestComposeMalformedEnvCandidateLists(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ty := cty.Object(map[string]cty.Type{"token": cty.String})
 			raw := map[string]any{"token": map[string]any{"env": tt.payload}}
-			_, diags := Compose(raw, ty, true, nil)
+			_, diags := Compose(raw, ty, EnvResolve, nil)
 			if !diags.HasErrors() {
 				t.Fatal("Compose succeeded; want invalid env wrapper diagnostic")
 			}
@@ -248,7 +393,7 @@ func TestComposeEnvNonWrapperPayloads(t *testing.T) {
 	for _, payload := range []any{nil, map[string]any{"a": "b"}} {
 		ty := cty.Object(map[string]cty.Type{"token": cty.String})
 		raw := map[string]any{"token": map[string]any{"env": payload}}
-		_, diags := Compose(raw, ty, true, nil)
+		_, diags := Compose(raw, ty, EnvResolve, nil)
 		if !diags.HasErrors() || diags[0].Summary != "type mismatch" {
 			t.Errorf("payload %#v diagnostics = %+v, want type mismatch", payload, diags)
 		}
@@ -259,7 +404,7 @@ func TestComposeEnvCandidateListTypeSurfaces(t *testing.T) {
 	for _, primitive := range []cty.Type{cty.Bool, cty.Number} {
 		ty := cty.Object(map[string]cty.Type{"value": primitive})
 		raw := map[string]any{"value": map[string]any{"env": []any{"A", "B"}}}
-		_, diags := Compose(raw, ty, true, nil)
+		_, diags := Compose(raw, ty, EnvResolve, nil)
 		if !diags.HasErrors() || diags[0].Summary != "invalid env wrapper" {
 			t.Errorf("type %s diagnostics = %+v, want invalid env wrapper", primitive.FriendlyName(), diags)
 		}
@@ -269,7 +414,7 @@ func TestComposeEnvCandidateListTypeSurfaces(t *testing.T) {
 	mapTy := cty.Object(map[string]cty.Type{"labels": cty.Map(cty.List(cty.String))})
 	got, diags := Compose(map[string]any{
 		"labels": map[string]any{"env": []any{"a", "b"}},
-	}, mapTy, true, nil)
+	}, mapTy, EnvResolve, nil)
 	if diags.HasErrors() {
 		t.Fatalf("plain map data produced diagnostics: %+v", diags)
 	}
@@ -284,18 +429,9 @@ func TestComposeEnvCandidateListTypeSurfaces(t *testing.T) {
 	stringTy := cty.Object(map[string]cty.Type{"token": cty.String})
 	_, diags = Compose(map[string]any{
 		"token": map[string]any{"env": "A", "other": 1},
-	}, stringTy, true, nil)
+	}, stringTy, EnvResolve, nil)
 	if !diags.HasErrors() || diags[0].Summary != "type mismatch" {
 		t.Errorf("multi-key object diagnostics = %+v, want type mismatch", diags)
-	}
-}
-
-func TestComposeEnvCandidateListDisallowed(t *testing.T) {
-	ty := cty.Object(map[string]cty.Type{"token": cty.String})
-	raw := map[string]any{"token": map[string]any{"env": []any{"A", "B"}}}
-	_, diags := Compose(raw, ty, false, nil)
-	if !diags.HasErrors() || diags[0].Summary != "env wrappers are only allowed in provider config" {
-		t.Errorf("diagnostics = %+v, want provider-config-only rejection", diags)
 	}
 }
 
@@ -308,46 +444,6 @@ func unsetEnv(t *testing.T, name string) {
 	t.Setenv(name, "restore-for-cleanup")
 	if err := os.Unsetenv(name); err != nil {
 		t.Fatalf("Unsetenv(%q): %v", name, err)
-	}
-}
-
-func TestComposeEnvWrapperNonString(t *testing.T) {
-	ty := cty.Object(map[string]cty.Type{"count": cty.Number})
-	raw := map[string]any{"count": map[string]any{"env": "SOME_VAR"}}
-
-	_, diags := Compose(raw, ty, true, nil)
-	if !diags.HasErrors() {
-		t.Fatal("Compose succeeded; want error: env wrapper only valid for string attributes")
-	}
-	if diags[0].Summary != "invalid env wrapper" {
-		t.Errorf("summary = %q, want %q", diags[0].Summary, "invalid env wrapper")
-	}
-}
-
-func TestComposeEnvWrapperDisallowed(t *testing.T) {
-	// allowEnv=false is how RESOURCE configs are composed: the spec permits
-	// {"env": ...} wrappers only inside provider config.
-	t.Setenv("TCHORI_TEST_TOKEN", "s3cr3t")
-	ty := cty.Object(map[string]cty.Type{"token": cty.String})
-	raw := map[string]any{"token": map[string]any{"env": "TCHORI_TEST_TOKEN"}}
-
-	_, diags := Compose(raw, ty, false, nil)
-	if !diags.HasErrors() {
-		t.Fatal("Compose succeeded; want error: env wrappers are only allowed in provider config")
-	}
-	if want := "env wrappers are only allowed in provider config"; diags[0].Summary != want {
-		t.Errorf("summary = %q, want %q", diags[0].Summary, want)
-	}
-
-	// A single-key "env" object where a MAP is expected stays plain data even
-	// with allowEnv=false — the wrapper check applies only at primitives.
-	mapTy := cty.Object(map[string]cty.Type{"tags": cty.Map(cty.String)})
-	got, mdiags := Compose(map[string]any{"tags": map[string]any{"env": "prod"}}, mapTy, false, nil)
-	if mdiags.HasErrors() {
-		t.Fatalf("unexpected diagnostics: %+v", mdiags)
-	}
-	if g := got.GetAttr("tags"); !g.RawEquals(cty.MapVal(map[string]cty.Value{"env": cty.StringVal("prod")})) {
-		t.Errorf("tags = %#v, want the map to carry the env key as plain data", g)
 	}
 }
 
@@ -376,7 +472,7 @@ func TestComposeRefs(t *testing.T) {
 	}
 
 	// allowEnv=false: references appear in resource configs.
-	got, diags := Compose(raw, ty, false, resolve)
+	got, diags := Compose(raw, ty, EnvResolve, resolve)
 	if diags.HasErrors() {
 		t.Fatalf("unexpected diagnostics: %+v", diags)
 	}
@@ -433,7 +529,7 @@ func TestComposeRejectsRawUnresolvedReferences(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, ds := Compose(tt.raw, tt.ty, false, nil)
+			_, ds := Compose(tt.raw, tt.ty, EnvResolve, nil)
 			if !ds.HasErrors() || len(ds) != 1 {
 				t.Fatalf("Compose diagnostics = %+v, want one error", ds)
 			}
@@ -447,7 +543,7 @@ func TestComposeRejectsRawUnresolvedReferences(t *testing.T) {
 
 func TestComposeAllowsShellStyleLiteral(t *testing.T) {
 	ty := cty.Object(map[string]cty.Type{"name": cty.String})
-	got, ds := Compose(map[string]any{"name": "${HOME}"}, ty, false, nil)
+	got, ds := Compose(map[string]any{"name": "${HOME}"}, ty, EnvResolve, nil)
 	if ds.HasErrors() {
 		t.Fatalf("Compose diagnostics = %+v", ds)
 	}
@@ -461,7 +557,7 @@ func TestComposeRejectsUnresolvedReferenceFromResolver(t *testing.T) {
 	resolve := func(config.Ref) (cty.Value, diag.Diagnostics) {
 		return cty.StringVal("secret-prefix-${tchoritest_thing.ghost.id}-secret-suffix"), nil
 	}
-	_, ds := Compose(map[string]any{"name": "${tchoritest_thing.base.id}"}, ty, false, resolve)
+	_, ds := Compose(map[string]any{"name": "${tchoritest_thing.base.id}"}, ty, EnvResolve, resolve)
 	if !ds.HasErrors() || ds[0].Summary != "unresolved reference" || ds[0].Address != "" || !strings.Contains(ds[0].Detail, "name") || !strings.Contains(ds[0].Detail, "${tchoritest_thing.ghost.id}") {
 		t.Fatalf("Compose diagnostics = %+v, want state-derived unresolved reference", ds)
 	}
@@ -473,7 +569,7 @@ func TestComposeRejectsUnresolvedReferenceFromResolver(t *testing.T) {
 func TestComposeRejectsUnresolvedReferenceFromEnvironment(t *testing.T) {
 	t.Setenv("TCHORI_TEST_UNRESOLVED", "secret-${a.b.c}-suffix")
 	ty := cty.Object(map[string]cty.Type{"prefix": cty.String})
-	_, ds := Compose(map[string]any{"prefix": map[string]any{"env": "TCHORI_TEST_UNRESOLVED"}}, ty, true, nil)
+	_, ds := Compose(map[string]any{"prefix": map[string]any{"env": "TCHORI_TEST_UNRESOLVED"}}, ty, EnvResolve, nil)
 	if !ds.HasErrors() || ds[0].Summary != "unresolved reference" || ds[0].Address != "" || !strings.Contains(ds[0].Detail, "prefix") || !strings.Contains(ds[0].Detail, "${a.b.c}") {
 		t.Fatalf("Compose diagnostics = %+v, want env-derived unresolved reference", ds)
 	}
@@ -486,7 +582,7 @@ func TestComposeUnexpectedAttribute(t *testing.T) {
 	ty := cty.Object(map[string]cty.Type{"name": cty.String})
 	raw := map[string]any{"name": "web", "nope": true}
 
-	_, diags := Compose(raw, ty, false, nil)
+	_, diags := Compose(raw, ty, EnvResolve, nil)
 	if !diags.HasErrors() {
 		t.Fatal("Compose succeeded; want error for unexpected attribute")
 	}
@@ -521,7 +617,7 @@ func TestComposeNested(t *testing.T) {
 		"owner": map[string]any{"team": map[string]any{"env": "TCHORI_TEST_TEAM"}},
 	}
 
-	got, diags := Compose(raw, ty, true, nil)
+	got, diags := Compose(raw, ty, EnvResolve, nil)
 	if diags.HasErrors() {
 		t.Fatalf("unexpected diagnostics: %+v", diags)
 	}
@@ -538,5 +634,30 @@ func TestComposeNested(t *testing.T) {
 	})
 	if !got.RawEquals(want) {
 		t.Fatalf("Compose =\n%#v\nwant\n%#v", got, want)
+	}
+}
+
+func TestComposeEnvWrapperInResourceConfig(t *testing.T) {
+	t.Setenv("TCHORI_TEST_TOKEN", "s3cr3t")
+	ty := cty.Object(map[string]cty.Type{"token": cty.String})
+	raw := map[string]any{"token": map[string]any{"env": "TCHORI_TEST_TOKEN"}}
+
+	got, diags := Compose(raw, ty, EnvResolve, nil)
+	if diags.HasErrors() {
+		t.Fatalf("unexpected diagnostics: %+v", diags)
+	}
+	if g := got.GetAttr("token"); !g.RawEquals(cty.StringVal("s3cr3t")) {
+		t.Errorf("token = %#v, want resource environment value", g)
+	}
+
+	// A single-key "env" object where a MAP is expected stays plain data —
+	// the wrapper check applies only at primitives.
+	mapTy := cty.Object(map[string]cty.Type{"tags": cty.Map(cty.String)})
+	got, mdiags := Compose(map[string]any{"tags": map[string]any{"env": "prod"}}, mapTy, EnvResolve, nil)
+	if mdiags.HasErrors() {
+		t.Fatalf("unexpected diagnostics: %+v", mdiags)
+	}
+	if g := got.GetAttr("tags"); !g.RawEquals(cty.MapVal(map[string]cty.Value{"env": cty.StringVal("prod")})) {
+		t.Errorf("tags = %#v, want the map to carry the env key as plain data", g)
 	}
 }

@@ -156,7 +156,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		// Config value from raw config; refs resolve to planned values. An
 		// attribute absent from config is null here, which is what "the
 		// author did not write this" means to a provider.
-		configVal, cds := provider.Compose(res.Config, ty, false, resolve)
+		configVal, cds := provider.Compose(res.Config, ty, provider.EnvResolve, resolve)
 		ds = append(ds, cds...)
 		if cds.HasErrors() {
 			return nil, ds

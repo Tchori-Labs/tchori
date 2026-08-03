@@ -438,6 +438,57 @@ func TestApplyWithholdsSensitiveComputedAndReferencedValues(t *testing.T) {
 	}
 }
 
+func TestApplyResourceEnvWrapperRoundTrip(t *testing.T) {
+	const envName = "TCHORI_TEST_APPLY_NAME"
+	t.Setenv(envName, "alpha")
+	resource := thing("demo", "unused")
+	resource.Config["name"] = map[string]any{"env": envName}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	ctx := context.Background()
+
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "create" {
+		t.Fatalf("plan = %+v, want exactly one create", pl.Changes)
+	}
+	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("Apply: %+v", ds)
+	}
+	if got := stateAttrs(t, h.statePath, resource.Address)["name"]; got != "alpha" {
+		t.Errorf("saved name = %#v, want environment value alpha", got)
+	}
+
+	followUp := h.plan(t, loadState(t, h.statePath), false)
+	if len(followUp.Changes) != 1 || followUp.Changes[0].Action != "no-op" || followUp.HasChanges() {
+		t.Errorf("follow-up plan = %+v, want one no-op and no changes", followUp)
+	}
+}
+
+func TestApplyResourceEnvWrapperUnsetBeforeProviderRPC(t *testing.T) {
+	const envName = "TCHORI_TEST_APPLY_UNSET"
+	t.Setenv(envName, "alpha")
+	resource := thing("demo", "unused")
+	resource.Config["name"] = map[string]any{"env": envName}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	ctx := context.Background()
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	if err := os.Unsetenv(envName); err != nil {
+		t.Fatalf("Unsetenv: %v", err)
+	}
+
+	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() {
+		t.Fatal("Apply succeeded; want unset environment diagnostic")
+	}
+	if ds[0].Summary != "environment variable not set" || !strings.Contains(ds[0].Detail, envName) {
+		t.Errorf("diagnostics = %+v, want unset variable %q", ds, envName)
+	}
+	if got := len(loadState(t, h.statePath).Resources); got != 0 {
+		t.Errorf("state contains %d resources, want none after pre-RPC composition failure", got)
+	}
+}
+
 func TestApplyStalePlan(t *testing.T) {
 	// No provider is launched at all: a stale plan must be refused before
 	// Apply touches providers or the state file.
@@ -1113,7 +1164,7 @@ func TestApplyCreateIgnoresStalePriorState(t *testing.T) {
 
 	// A create-shaped planned value: the same RPC call the planner itself
 	// would make for a resource whose prior is null.
-	proposed, cds := provider.Compose(h.cfg.Resources[addr].Config, ty, false, nil)
+	proposed, cds := provider.Compose(h.cfg.Resources[addr].Config, ty, provider.EnvResolve, nil)
 	if cds.HasErrors() {
 		t.Fatalf("Compose: %+v", cds)
 	}

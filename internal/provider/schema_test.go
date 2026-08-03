@@ -169,7 +169,7 @@ func TestBlockFromProtoNestedTypeOmittedComposesToNull(t *testing.T) {
 	}
 	ty := block.ImpliedType()
 
-	v, ds := Compose(map[string]any{"name": "demo"}, ty, false, nil)
+	v, ds := Compose(map[string]any{"name": "demo"}, ty, EnvResolve, nil)
 	if ds.HasErrors() {
 		t.Fatalf("Compose: %+v", ds)
 	}

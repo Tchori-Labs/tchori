@@ -58,7 +58,8 @@ func runValidate(cmd *cobra.Command, _ []string) (int, error) {
 	}
 
 	// Before planning there are no resolved values, so references compose as
-	// unknowns — Compose converts them to the attribute's type, and providers
+	// unknowns. Unset env wrappers compose as unknown strings for the same
+	// reason; Compose converts references to the attribute's type, and providers
 	// must tolerate unknowns in ValidateResourceConfig.
 	unknownRef := func(config.Ref) (cty.Value, diag.Diagnostics) {
 		return cty.UnknownVal(cty.DynamicPseudoType), nil
@@ -80,7 +81,7 @@ func runValidate(cmd *cobra.Command, _ []string) (int, error) {
 			failed = true
 			continue
 		}
-		cv, cds := provider.Compose(r.Config, schema.Block.ImpliedType(), false, unknownRef)
+		cv, cds := provider.Compose(r.Config, schema.Block.ImpliedType(), provider.EnvUnknownIfUnset, unknownRef)
 		emitDiags(cds)
 		if cds.HasErrors() {
 			failed = true
