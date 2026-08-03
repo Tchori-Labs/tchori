@@ -97,6 +97,11 @@ the reference is nested inside an ordered collection (Tchori-Labs/tchori#11).
 `HasChanges()` is simply `create + update + delete + replace > 0` from
 `summary` — `no-op`-only plans exit `0`.
 
+Diagnostics do not alter this exit-code contract. Every provider-RPC failure
+carries the resource or provider address that issued the RPC; see the
+[diagnostic contract](diagnostics.md) for the JSON shape, pretty rendering,
+address qualification, and advisory non-JSON-response hint.
+
 ### format_version compatibility
 
 `plan.Read` rejects any plan whose `format_version` is not exactly the

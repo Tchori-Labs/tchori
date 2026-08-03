@@ -495,7 +495,7 @@ func TestApplyPartialFailure(t *testing.T) {
 	}
 	found := false
 	for _, d := range ds {
-		if d.Summary == "apply exploded" {
+		if d.Summary == "apply exploded" && d.Address == "tchoritest_thing.boom" {
 			found = true
 		}
 	}
@@ -523,6 +523,54 @@ func TestApplyPartialFailure(t *testing.T) {
 // on z_second. If Apply still executed in address order, a_first would run
 // first and resolveRef would fail with "reference to missing resource"
 // because z_second has no state yet.
+func TestApplyDestroyProviderDiagnosticHasResourceAddress(t *testing.T) {
+	const addr = "tchoritest_thing.web"
+	h := newHarness(t, map[string]*config.Resource{addr: thing("web", "explode_destroy")})
+	ctx := context.Background()
+	st := loadState(t, h.statePath)
+	if ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("create fixture: %#v", ds)
+	}
+
+	st = loadState(t, h.statePath)
+	ds := apply.Apply(ctx, h.plan(t, st, true), h.cfg, h.providers, h.schemas, st, h.statePath)
+	if len(ds) != 1 || ds[0].Summary != "destroy exploded" || ds[0].Address != addr {
+		t.Fatalf("destroy diagnostics = %#v", ds)
+	}
+	if loadState(t, h.statePath).Resources[addr] == nil {
+		t.Fatal("failed destroy removed the resource from state")
+	}
+}
+
+func TestApplyReplaceDoesNotDoublePrefixProviderDiagnostic(t *testing.T) {
+	const addr = "tchoritest_thing.web"
+	resource := thing("web", "before")
+	h := newHarness(t, map[string]*config.Resource{addr: resource})
+	ctx := context.Background()
+	st := loadState(t, h.statePath)
+	if ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("create fixture: %#v", ds)
+	}
+
+	resource.Config["name"] = "explode"
+	resource.Config["replace_me"] = "replacement"
+	st = loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "replace" {
+		t.Fatalf("replace plan = %#v", pl.Changes)
+	}
+	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if len(ds) != 1 || ds[0].Summary != "apply exploded" || ds[0].Address != addr {
+		t.Fatalf("replace diagnostics = %#v", ds)
+	}
+	if strings.Contains(ds[0].Address, addr+"."+addr) {
+		t.Fatalf("replace diagnostic was double-prefixed: %#v", ds[0])
+	}
+	if loadState(t, h.statePath).Resources[addr] != nil {
+		t.Fatal("replace destroy leg did not remain committed before create failure")
+	}
+}
+
 func TestApplyRefOrderBeatsAddressOrder(t *testing.T) {
 	aFirst := thing("a_first", "a_first")
 	aFirst.Config["tags"] = map[string]any{"ref": "${tchoritest_thing.z_second.id}"}

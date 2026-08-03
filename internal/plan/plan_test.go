@@ -370,6 +370,65 @@ func newPlanner(t *testing.T, cfg *config.Config, st *state.State) *plan.Planner
 const demoApplied = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":null,"rules":null,"tags":null}`
 const demoAppliedOld = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"old","rules":null,"tags":null}`
 
+func TestPlanGatewayHTMLRefreshDiagnostic(t *testing.T) {
+	const (
+		addr    = "tchoritest_thing.web"
+		summary = "Error reading project"
+		detail  = "decoding response: invalid character '<' looking for beginning of value"
+	)
+	cfg := testConfig(t, map[string]map[string]any{addr: {"name": "gateway_html"}})
+	st := stateWith(t, 1, map[string]string{addr: `{"echo":"gateway_html","id":"id-gateway_html","name":"gateway_html","replace_me":null,"rules":null,"tags":null}`})
+
+	pl, ds := newPlanner(t, cfg, st).Plan(context.Background())
+	if pl != nil {
+		t.Fatalf("Plan returned a plan despite refresh failure: %#v", pl)
+	}
+	if !ds.HasErrors() {
+		t.Fatalf("Plan diagnostics have no error: %#v", ds)
+	}
+	if len(ds) != 2 {
+		t.Fatalf("len(diagnostics) = %d, want provider error plus one hint: %#v", len(ds), ds)
+	}
+	if ds[0].Address != addr || ds[0].Summary != summary || ds[0].Detail != detail {
+		t.Fatalf("provider diagnostic was not attributed verbatim: %#v", ds[0])
+	}
+	if ds[1].Severity != "warning" || ds[1].Address != addr || ds[1].Summary != "provider received a non-JSON response (HTML)" || !strings.Contains(ds[1].Detail, "identity-aware proxy") {
+		t.Fatalf("advisory hint = %#v", ds[1])
+	}
+}
+
+func TestPlanGatewayAttributeRefreshDiagnostic(t *testing.T) {
+	const addr = "tchoritest_thing.web"
+	cfg := testConfig(t, map[string]map[string]any{addr: {"name": "gateway_attr"}})
+	st := stateWith(t, 1, map[string]string{addr: `{"echo":"gateway_attr","id":"id-gateway_attr","name":"gateway_attr","replace_me":null,"rules":null,"tags":null}`})
+	_, ds := newPlanner(t, cfg, st).Plan(context.Background())
+	if len(ds) != 1 || ds[0].Address != addr+".name" || ds[0].Summary != "invalid remote name" {
+		t.Fatalf("attribute diagnostic = %#v", ds)
+	}
+}
+
+func TestPlanValidateAndPlanDiagnosticsHaveResourceAddress(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		value   string
+		summary string
+	}{
+		{name: "validate RPC", value: "invalid", summary: "invalid name"},
+		{name: "plan RPC", value: "invalid_plan", summary: "invalid planned name"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const addr = "tchoritest_thing.web"
+			cfg := testConfig(t, map[string]map[string]any{addr: {"name": test.value}})
+			p := newPlanner(t, cfg, stateWith(t, 0, nil))
+			p.Refresh = false
+			_, ds := p.Plan(context.Background())
+			if len(ds) != 1 || ds[0].Address != addr || ds[0].Summary != test.summary {
+				t.Fatalf("diagnostics = %#v", ds)
+			}
+		})
+	}
+}
+
 func TestPlanRedactsSensitiveArtifactsAndPlannedRaw(t *testing.T) {
 	const sentinel = "tchori-e2e-super-secret-value"
 	addr := "tchoritest_secretful.demo"

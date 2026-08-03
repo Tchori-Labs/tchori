@@ -123,6 +123,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		// the in-memory state copy in sync.
 		if p.Refresh && hasPrior {
 			rv, rpriv, rds := client.ReadResource(ctx, res.Type, prior, priorPrivate)
+			rds = provider.Context(addr, rds)
 			ds = append(ds, rds...)
 			if rds.HasErrors() {
 				return nil, ds
@@ -162,6 +163,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		}
 
 		vds := client.ValidateResource(ctx, res.Type, configVal)
+		vds = provider.Context(addr, vds)
 		ds = append(ds, vds...)
 		if vds.HasErrors() {
 			return nil, ds
@@ -175,6 +177,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		proposed := provider.ProposedNew(schema.Block, prior, configVal)
 
 		pc, pds := client.PlanResource(ctx, res.Type, prior, proposed, configVal, priorPrivate)
+		pds = provider.Context(addr, pds)
 		ds = append(ds, pds...)
 		if pds.HasErrors() {
 			return nil, ds
