@@ -1,11 +1,13 @@
 package apply_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -175,6 +177,16 @@ func loadState(t *testing.T, path string) *state.State {
 	return st
 }
 
+func wantIncomplete(t *testing.T, st *state.State, failed string, applied, remaining []string) {
+	t.Helper()
+	if st.Incomplete == nil {
+		t.Fatal("state has no incomplete_apply marker")
+	}
+	if st.Incomplete.FailedAddress != failed || !slices.Equal(st.Incomplete.Applied, applied) || !slices.Equal(st.Incomplete.Remaining, remaining) {
+		t.Fatalf("incomplete_apply = %+v, want failed=%q applied=%v remaining=%v", st.Incomplete, failed, applied, remaining)
+	}
+}
+
 // stateAttrs re-loads the saved state file and decodes one resource's
 // ctyjson attributes into a plain map.
 func stateAttrs(t *testing.T, path, addr string) map[string]any {
@@ -216,8 +228,11 @@ func TestApplyCreate(t *testing.T) {
 	}
 
 	saved := loadState(t, h.statePath)
-	if saved.Serial != 1 {
-		t.Errorf("state serial = %d, want 1 (exactly one save for one change)", saved.Serial)
+	if saved.Serial != 3 {
+		t.Errorf("state serial = %d, want 3 (1 pre-flight + 1 change + 1 terminal save)", saved.Serial)
+	}
+	if saved.Incomplete != nil {
+		t.Fatalf("successful apply left marker: %+v", saved.Incomplete)
 	}
 }
 
@@ -241,7 +256,7 @@ func TestApplyLossyCreateUpdateReplaceAndDestroy(t *testing.T) {
 		t.Fatal("lossy planned create must retain unknown computed id")
 	}
 	createDs := apply.Apply(ctx, createPlan, h.cfg, h.providers, h.schemas, st, h.statePath)
-	if len(createDs) != 1 || createDs[0].Summary != "provider produced inconsistent result after apply" || !strings.Contains(createDs[0].Detail, "flag: planned true, applied false") {
+	if len(createDs) != 2 || createDs[0].Summary != "provider produced inconsistent result after apply" || !strings.Contains(createDs[0].Detail, "flag: planned true, applied false") {
 		t.Fatalf("create diagnostics = %#v", createDs)
 	}
 	if got := stateAttrs(t, h.statePath, addr)["flag"]; got != false {
@@ -269,7 +284,7 @@ func TestApplyLossyCreateUpdateReplaceAndDestroy(t *testing.T) {
 		t.Fatalf("replace plan = %#v", replacePlan.Changes[0])
 	}
 	replaceDs := apply.Apply(ctx, replacePlan, h.cfg, h.providers, h.schemas, st, h.statePath)
-	if len(replaceDs) != 1 || !strings.Contains(replaceDs[0].Detail, "flag: planned true, applied false") {
+	if len(replaceDs) != 2 || !strings.Contains(replaceDs[0].Detail, "flag: planned true, applied false") {
 		t.Fatalf("replace diagnostics = %#v", replaceDs)
 	}
 
@@ -295,7 +310,7 @@ func TestApplyLossyMapKeySet(t *testing.T) {
 			h := newHarness(t, map[string]*config.Resource{addr: lossyThing("svc", map[string]any{"tags": tc.tags})})
 			st := loadState(t, h.statePath)
 			ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
-			if len(ds) != 1 || !strings.Contains(ds[0].Detail, tc.want) {
+			if len(ds) != 2 || !strings.Contains(ds[0].Detail, tc.want) {
 				t.Fatalf("diagnostics = %#v", ds)
 			}
 		})
@@ -312,7 +327,7 @@ func TestApplyLossyNestedRedactionAndNullContainers(t *testing.T) {
 		})})
 		st := loadState(t, h.statePath)
 		ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
-		if len(ds) != 1 {
+		if len(ds) != 2 {
 			t.Fatalf("diagnostics = %#v", ds)
 		}
 		detail := ds[0].Detail
@@ -336,7 +351,7 @@ func TestApplyLossyNestedRedactionAndNullContainers(t *testing.T) {
 		})})
 		st := loadState(t, h.statePath)
 		ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
-		if len(ds) != 1 {
+		if len(ds) != 2 {
 			t.Fatalf("diagnostics = %#v", ds)
 		}
 		if !strings.Contains(ds[0].Detail, `tags: planned {"nullify":"visible"}, applied null`) || strings.Contains(ds[0].Detail, "tags.nullify") ||
@@ -360,7 +375,7 @@ func TestApplyLossyResolvedReferencesRemainChecked(t *testing.T) {
 	h := newHarness(t, map[string]*config.Resource{source.Address: source, lossyAddr: lossy})
 	st := loadState(t, h.statePath)
 	ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
-	if len(ds) != 2 || ds[0].Severity != diag.Warning || ds[1].Address != lossyAddr || !strings.Contains(ds[1].Detail, `tags["dropped"]: planned "id-source", applied absent`) || !strings.Contains(ds[1].Detail, "secret: planned (sensitive value), applied (sensitive value)") || strings.Contains(ds[1].Detail, "SOURCE") {
+	if len(ds) != 3 || ds[0].Severity != diag.Warning || ds[1].Address != lossyAddr || !strings.Contains(ds[1].Detail, `tags["dropped"]: planned "id-source", applied absent`) || !strings.Contains(ds[1].Detail, "secret: planned (sensitive value), applied (sensitive value)") || strings.Contains(ds[1].Detail, "SOURCE") {
 		t.Fatalf("diagnostics = %#v", ds)
 	}
 }
@@ -402,12 +417,19 @@ func TestApplyStalePlan(t *testing.T) {
 	// No provider is launched at all: a stale plan must be refused before
 	// Apply touches providers or the state file.
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	st := loadState(t, statePath) // empty: serial 0
+	st := loadState(t, statePath)
+	if err := st.Save(statePath); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(statePath) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	pl := &plan.Plan{
 		FormatVersion: "1.0",
 		EngineVersion: "0.1.0-dev",
-		StateSerial:   5, // plan captured at serial 5; current state is serial 0
+		StateSerial:   5, // plan captured at serial 5; current state is serial 1
 		Changes:       []*plan.Change{{Address: "tchoritest_thing.foo", Action: "create"}},
 		Summary:       plan.Summary{Create: 1},
 	}
@@ -425,8 +447,12 @@ func TestApplyStalePlan(t *testing.T) {
 	if !found {
 		t.Errorf("diagnostics do not include the stale-plan error: %+v", ds)
 	}
-	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
-		t.Errorf("state file was written during a refused apply (stat err = %v)", err)
+	after, err := os.ReadFile(statePath) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) || st.Serial != 1 || st.Incomplete != nil {
+		t.Errorf("state changed during stale-plan refusal: serial=%d marker=%+v\nbefore=%s\nafter=%s", st.Serial, st.Incomplete, before, after)
 	}
 }
 
@@ -441,12 +467,19 @@ func TestApplyStalePlan(t *testing.T) {
 // before Apply ever touches a provider or the state file.
 func TestApplyConfigDriftRefused(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	st := loadState(t, statePath) // empty: serial 0
+	st := loadState(t, statePath)
+	if err := st.Save(statePath); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(statePath) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	pl := &plan.Plan{
 		FormatVersion: "1.0",
 		EngineVersion: "0.1.0-dev",
-		StateSerial:   0,
+		StateSerial:   1,
 		Changes:       []*plan.Change{{Address: "tchoritest_thing.foo", Action: "create"}},
 		Summary:       plan.Summary{Create: 1},
 	}
@@ -468,8 +501,53 @@ func TestApplyConfigDriftRefused(t *testing.T) {
 	if !found {
 		t.Errorf("diagnostics do not include the config-drift error for tchoritest_thing.foo: %+v", ds)
 	}
-	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
-		t.Errorf("state file was written during a refused apply (stat err = %v)", err)
+	after, err := os.ReadFile(statePath) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) || st.Serial != 1 || st.Incomplete != nil {
+		t.Errorf("state changed during config-drift refusal: serial=%d marker=%+v\nbefore=%s\nafter=%s", st.Serial, st.Incomplete, before, after)
+	}
+}
+
+func TestApplyOrderFailureLeavesStateUntouched(t *testing.T) {
+	const addr = "tchoritest_thing.self"
+	statePath := filepath.Join(t.TempDir(), "state.json")
+	st := loadState(t, statePath)
+	if err := st.Save(statePath); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(statePath) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	self := thing("self", "self")
+	self.Config["tags"] = map[string]any{"self": "${tchoritest_thing.self.id}"}
+	cfg := &config.Config{Resources: map[string]*config.Resource{addr: self}}
+	pl := &plan.Plan{FormatVersion: "1.0", StateSerial: st.Serial, Changes: []*plan.Change{{Address: addr, Action: "create"}}}
+	if ds := apply.Apply(context.Background(), pl, cfg, nil, nil, st, statePath); !ds.HasErrors() {
+		t.Fatal("Apply accepted cyclic configuration")
+	}
+	after, err := os.ReadFile(statePath) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) || st.Serial != 1 || st.Incomplete != nil {
+		t.Fatalf("state changed during order refusal: serial=%d marker=%+v", st.Serial, st.Incomplete)
+	}
+}
+
+func TestApplySerialAdvancesByChangesPlusTwo(t *testing.T) {
+	h := newHarness(t, map[string]*config.Resource{
+		"tchoritest_thing.alpha": thing("alpha", "alpha"),
+		"tchoritest_thing.beta":  thing("beta", "beta"),
+	})
+	st := loadState(t, h.statePath)
+	if ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("Apply: %+v", ds)
+	}
+	if got := loadState(t, h.statePath).Serial; got != 4 {
+		t.Fatalf("serial = %d, want 4 (1 pre-flight + 2 change saves + 1 terminal)", got)
 	}
 }
 
@@ -511,9 +589,150 @@ func TestApplyPartialFailure(t *testing.T) {
 	if got := attrs["id"]; got != "id-alpha" {
 		t.Errorf(`first resource id = %v, want "id-alpha" (must stay saved after mid-sequence failure)`, got)
 	}
-	if saved.Serial != 1 {
-		t.Errorf("state serial = %d, want 1 (one save before the failure)", saved.Serial)
+	if saved.Serial != 3 {
+		t.Errorf("state serial = %d, want 3 (1 pre-flight + 1 change + 1 failure-finalizer save)", saved.Serial)
 	}
+	wantIncomplete(t, saved, "tchoritest_thing.boom", []string{"tchoritest_thing.alpha"}, []string{"tchoritest_thing.boom"})
+	raw, err := os.ReadFile(h.statePath) //nolint:gosec // test-controlled path
+	if err != nil || !strings.Contains(string(raw), `"incomplete_apply"`) {
+		t.Fatalf("partial state lacks incomplete_apply marker: err=%v bytes=%s", err, raw)
+	}
+}
+
+func TestApplyZeroAppliedFailureWritesMarker(t *testing.T) {
+	const addr = "tchoritest_thing.boom"
+	h := newHarness(t, map[string]*config.Resource{addr: thing("boom", "explode")})
+	st := loadState(t, h.statePath)
+	ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() {
+		t.Fatal("Apply succeeded despite provider failure")
+	}
+	saved := loadState(t, h.statePath)
+	wantIncomplete(t, saved, addr, []string{}, []string{addr})
+	if saved.Serial != 2 {
+		t.Fatalf("serial = %d, want 2 (pre-flight + failure finalizer)", saved.Serial)
+	}
+}
+
+func TestApplyMarkerSaveFailureRefusesProviderCall(t *testing.T) {
+	const addr = "tchoritest_thing.boom"
+	h := newHarness(t, map[string]*config.Resource{addr: thing("boom", "explode")})
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	h.statePath = filepath.Join(t.TempDir(), "missing", "state.json")
+	ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() || !diagnosticsContain(ds, "marking state incomplete") {
+		t.Fatalf("diagnostics = %+v, want marking failure", ds)
+	}
+	if diagnosticsContain(ds, "apply exploded") {
+		t.Fatalf("provider was called after marker save failed: %+v", ds)
+	}
+	if _, err := os.Stat(h.statePath); !os.IsNotExist(err) {
+		t.Fatalf("state file exists after refused apply: %v", err)
+	}
+}
+
+func TestApplyTerminalSaveFailureKeepsPreflightMarker(t *testing.T) {
+	const addr = "tchoritest_thing.boom"
+	h := newHarness(t, map[string]*config.Resource{addr: thing("boom", "explode")})
+	if err := os.Mkdir(h.statePath+".backup", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	st := loadState(t, h.statePath)
+	ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !diagnosticsContain(ds, "apply exploded") || !diagnosticsContain(ds, "saving incomplete state") {
+		t.Fatalf("diagnostics = %+v, want original provider and final-save errors", ds)
+	}
+	saved := loadState(t, h.statePath)
+	if saved.Incomplete == nil || len(saved.Incomplete.Remaining) != 1 || saved.Incomplete.Remaining[0] != addr {
+		t.Fatalf("on-disk pre-flight marker = %+v, want remaining %s", saved.Incomplete, addr)
+	}
+}
+
+func diagnosticsContain(ds diag.Diagnostics, summary string) bool {
+	for _, d := range ds {
+		if d.Summary == summary {
+			return true
+		}
+	}
+	return false
+}
+
+func TestApplyReplaceCreateFailureLeavesMarker(t *testing.T) {
+	const addr = "tchoritest_thing.foo"
+	h := newHarness(t, map[string]*config.Resource{addr: thing("foo", "foo")})
+	st := loadState(t, h.statePath)
+	if ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("seed apply: %+v", ds)
+	}
+	before := loadState(t, h.statePath)
+	h.cfg.Resources[addr].Config["name"] = "explode"
+	h.cfg.Resources[addr].Config["replace_me"] = "replacement"
+	pl := h.plan(t, before, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "replace" {
+		t.Fatalf("changes = %+v, want replace", pl.Changes)
+	}
+	ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, before, h.statePath)
+	if !diagnosticsContain(ds, "apply exploded") {
+		t.Fatalf("diagnostics = %+v, want create-leg failure", ds)
+	}
+	saved := loadState(t, h.statePath)
+	if saved.Resources[addr] != nil {
+		t.Fatal("resource remains after successful replace destroy leg")
+	}
+	wantIncomplete(t, saved, addr, []string{}, []string{addr})
+}
+
+func TestApplyStateOnlyDeleteFailureAfterSuccess(t *testing.T) {
+	const (
+		alpha  = "tchoritest_thing.alpha"
+		orphan = "tchoritest_thing.orphan"
+	)
+	h := newHarness(t, map[string]*config.Resource{alpha: thing("alpha", "alpha")})
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	pl.Changes = append(pl.Changes, &plan.Change{Address: orphan, Action: "delete"})
+	pl.Summary.Delete++
+	st.Resources[orphan] = &state.ResourceState{Type: "tchoritest_thing", Provider: "missing", Attributes: json.RawMessage(`{}`)}
+
+	ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !diagnosticsContain(ds, "provider not running") {
+		t.Fatalf("diagnostics = %+v, want provider-not-running delete failure", ds)
+	}
+	saved := loadState(t, h.statePath)
+	wantIncomplete(t, saved, orphan, []string{alpha}, []string{orphan})
+	if saved.Resources[alpha] == nil || saved.Resources[orphan] == nil {
+		t.Fatalf("resources = %+v, want successful alpha and untouched orphan", saved.Resources)
+	}
+}
+
+func TestApplyZeroChangeMarkerClearing(t *testing.T) {
+	t.Run("stale marker cleared with one save", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.json")
+		st := &state.State{Resources: map[string]*state.ResourceState{}, Incomplete: &state.IncompleteApply{Applied: []string{}, Remaining: []string{"thing.old"}}}
+		if err := st.Save(path); err != nil {
+			t.Fatal(err)
+		}
+		pl := &plan.Plan{FormatVersion: "1.0", StateSerial: st.Serial}
+		if ds := apply.Apply(context.Background(), pl, &config.Config{}, nil, nil, st, path); ds.HasErrors() {
+			t.Fatalf("Apply: %+v", ds)
+		}
+		got := loadState(t, path)
+		if got.Incomplete != nil || got.Serial != 2 {
+			t.Fatalf("state = %+v, want marker cleared at serial 2", got)
+		}
+	})
+	t.Run("converged empty apply writes nothing", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "state.json")
+		st := loadState(t, path)
+		pl := &plan.Plan{FormatVersion: "1.0", StateSerial: 0}
+		if ds := apply.Apply(context.Background(), pl, &config.Config{}, nil, nil, st, path); ds.HasErrors() {
+			t.Fatalf("Apply: %+v", ds)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("zero-change converged apply wrote state: %v", err)
+		}
+	})
 }
 
 // TestApplyRefOrderBeatsAddressOrder guards the fix for the bug where Apply
@@ -534,7 +753,7 @@ func TestApplyDestroyProviderDiagnosticHasResourceAddress(t *testing.T) {
 
 	st = loadState(t, h.statePath)
 	ds := apply.Apply(ctx, h.plan(t, st, true), h.cfg, h.providers, h.schemas, st, h.statePath)
-	if len(ds) != 1 || ds[0].Summary != "destroy exploded" || ds[0].Address != addr {
+	if len(ds) != 2 || ds[0].Summary != "destroy exploded" || ds[0].Address != addr {
 		t.Fatalf("destroy diagnostics = %#v", ds)
 	}
 	if loadState(t, h.statePath).Resources[addr] == nil {
@@ -560,7 +779,7 @@ func TestApplyReplaceDoesNotDoublePrefixProviderDiagnostic(t *testing.T) {
 		t.Fatalf("replace plan = %#v", pl.Changes)
 	}
 	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
-	if len(ds) != 1 || ds[0].Summary != "apply exploded" || ds[0].Address != addr {
+	if len(ds) != 2 || ds[0].Summary != "apply exploded" || ds[0].Address != addr {
 		t.Fatalf("replace diagnostics = %#v", ds)
 	}
 	if strings.Contains(ds[0].Address, addr+"."+addr) {
@@ -671,6 +890,16 @@ func TestApplyRejectsPoisonedStateReferencePropagation(t *testing.T) {
 			},
 		},
 	}
+	// Write and reload the safe fixture so its compare-and-swap base serial
+	// matches the file that the incomplete-apply preflight must save over.
+	stateBytes, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("marshal seeded state: %v", err)
+	}
+	if err := os.WriteFile(h.statePath, stateBytes, 0o600); err != nil {
+		t.Fatalf("write seeded state: %v", err)
+	}
+	st = loadState(t, h.statePath)
 	pl := h.plan(t, st, false)
 
 	// Apply-only fixture: after obtaining a safe plan, make b read the map
@@ -684,12 +913,12 @@ func TestApplyRejectsPoisonedStateReferencePropagation(t *testing.T) {
 	// to preserve the plan serial; the poisoned entry is intentionally not
 	// cleaned by TC-048, only refused when another outgoing value reads it.
 	st.Resources[aAddr].Attributes = json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"tags":{"parent":"${tchoritest_thing.ghost.id}"}}`)
-	stateBytes, err := json.Marshal(st)
+	stateBytes, err = json.Marshal(st)
 	if err != nil {
-		t.Fatalf("marshal seeded state: %v", err)
+		t.Fatalf("marshal poisoned state: %v", err)
 	}
 	if err := os.WriteFile(h.statePath, stateBytes, 0o600); err != nil {
-		t.Fatalf("write seeded state: %v", err)
+		t.Fatalf("write poisoned state: %v", err)
 	}
 
 	ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath)
@@ -735,9 +964,10 @@ func TestApplyDependencyFailureSkipsDependent(t *testing.T) {
 	if saved.Resources[whAddr] != nil || saved.Resources[tunnelAddr] != nil {
 		t.Fatalf("state resources = %+v, want neither failed dependency nor skipped dependent", saved.Resources)
 	}
-	if saved.Serial != 0 {
-		t.Fatalf("state serial = %d, want 0 because no change was saved", saved.Serial)
+	if saved.Serial != 2 {
+		t.Fatalf("state serial = %d, want 2 (marker save + failure-finalizer save; no resource recorded)", saved.Serial)
 	}
+	wantIncomplete(t, saved, tunnelAddr, []string{}, []string{tunnelAddr, whAddr})
 }
 
 // TestApplyReplace closes a coverage gap: no existing test drove the
@@ -780,8 +1010,8 @@ func TestApplyReplace(t *testing.T) {
 	if got := attrs["id"]; got != "id-foo" {
 		t.Errorf(`id after replace = %v, want "id-foo" (destroy-then-create still yields the deterministic fake id)`, got)
 	}
-	if saved.Serial != 3 {
-		t.Errorf("state serial = %d, want 3 (create save + destroy save + create save)", saved.Serial)
+	if saved.Serial != 7 {
+		t.Errorf("state serial = %d, want 7 (initial 3 saves + replace pre-flight + 2 legs + terminal)", saved.Serial)
 	}
 }
 
@@ -812,8 +1042,8 @@ func TestApplyDestroy(t *testing.T) {
 	if len(saved.Resources) != 0 {
 		t.Errorf("state still holds %d resources after destroy", len(saved.Resources))
 	}
-	if saved.Serial != 2 {
-		t.Errorf("state serial = %d, want 2 (create save + destroy save)", saved.Serial)
+	if saved.Serial != 6 {
+		t.Errorf("state serial = %d, want 6 (initial 3 saves + destroy pre-flight + leg + terminal)", saved.Serial)
 	}
 }
 
@@ -1087,8 +1317,8 @@ func TestApplySingleApplyResolvesListNestedRefCreateUpdate(t *testing.T) {
 	if ds := apply.Apply(ctx, pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
 		t.Fatalf("seed Apply: %+v", ds)
 	}
-	if saved := loadState(t, h.statePath); saved.Serial != 1 {
-		t.Fatalf("seed state serial = %d, want 1", saved.Serial)
+	if saved := loadState(t, h.statePath); saved.Serial != 3 {
+		t.Fatalf("seed state serial = %d, want 3", saved.Serial)
 	}
 
 	// Now add "a" (create) and give "b" a rules list referencing a's id
@@ -1127,10 +1357,10 @@ func TestApplySingleApplyResolvesListNestedRefCreateUpdate(t *testing.T) {
 		t.Errorf("b rules[0].token_id = %q, want %q (a's applied id, resolved within the single apply)", got, aID)
 	}
 
-	// Exactly one save per change across both apply runs: seed apply saved
-	// once (serial 1), this apply saves a and b (2 more changes) -> 3.
-	if saved := loadState(t, h.statePath); saved.Serial != 3 {
-		t.Errorf("state serial = %d, want 3 (one save per change across both applies)", saved.Serial)
+	// Each non-empty apply adds a pre-flight marker and terminal clear in
+	// addition to its per-change saves: 3 for the seed plus 4 here.
+	if saved := loadState(t, h.statePath); saved.Serial != 7 {
+		t.Errorf("state serial = %d, want 7 (bracketing saves across both applies)", saved.Serial)
 	}
 }
 
@@ -1175,8 +1405,8 @@ func TestApplySingleApplyResolvesListNestedRefCreateCreate(t *testing.T) {
 	}
 
 	saved := loadState(t, h.statePath)
-	if saved.Serial != 2 {
-		t.Errorf("state serial = %d, want 2 (one save per change)", saved.Serial)
+	if saved.Serial != 4 {
+		t.Errorf("state serial = %d, want 4 (pre-flight + two changes + terminal)", saved.Serial)
 	}
 	if len(saved.Resources) != 2 {
 		t.Errorf("state has %d resources, want 2", len(saved.Resources))

@@ -132,6 +132,7 @@ func runPlan(cmd *cobra.Command, out string, refresh bool) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	emitIncompleteStateWarning(st)
 
 	planner := &plan.Planner{
 		Config:        rt.Config,
@@ -234,6 +235,7 @@ func runApply(cmd *cobra.Command, args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	emitIncompleteStateWarning(st)
 
 	ads := apply.Apply(ctx, pl, rt.Config, rt.Providers, rt.Schemas, st, stateFileName)
 	emitDiags(ads)
@@ -277,6 +279,7 @@ func runDestroy(cmd *cobra.Command, out string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	emitIncompleteStateWarning(st)
 
 	planner := &plan.Planner{
 		Config:        rt.Config,
@@ -465,6 +468,12 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 
 // --- state -------------------------------------------------------------------
 
+func emitIncompleteStateWarning(st *state.State) {
+	if warning, ok := st.IncompleteWarning(); ok {
+		emitDiags(diag.Diagnostics{warning})
+	}
+}
+
 func newStateCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "state",
@@ -483,6 +492,12 @@ func newStateCmd() *cobra.Command {
 			Args:  cobra.ExactArgs(1),
 			RunE:  exitRun(runStateShow),
 		},
+		&cobra.Command{
+			Use:   "status",
+			Short: "Report whether state was left by a completed apply",
+			Args:  cobra.NoArgs,
+			RunE:  exitRun(runStateStatus),
+		},
 	)
 	return cmd
 }
@@ -494,6 +509,41 @@ func runStateList(cmd *cobra.Command, _ []string) (int, error) {
 	}
 	for _, addr := range slices.Sorted(maps.Keys(st.Resources)) {
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), addr)
+	}
+	return 0, nil
+}
+
+// runStateStatus is the CI convergence gate added for issue #56 / TC-049. It
+// reads state only and never launches providers; incomplete state exits 1.
+func runStateStatus(cmd *cobra.Command, _ []string) (int, error) {
+	st, err := state.Load(stateFileName)
+	if err != nil {
+		return 1, err
+	}
+	if flagJSON {
+		result := struct {
+			Converged       bool                   `json:"converged"`
+			IncompleteApply *state.IncompleteApply `json:"incomplete_apply,omitempty"`
+		}{Converged: st.Converged(), IncompleteApply: st.Incomplete}
+		body, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return 1, err
+		}
+		if _, err := fmt.Fprintln(cmd.OutOrStdout(), string(body)); err != nil {
+			return 1, err
+		}
+	} else if st.Converged() {
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "State is converged.")
+	} else {
+		failed := st.Incomplete.FailedAddress
+		if failed == "" {
+			failed = "unknown (apply may still have been in flight)"
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "State is incomplete. Failed address: %s\nApplied: %v\nRemaining: %v\n",
+			failed, st.Incomplete.Applied, st.Incomplete.Remaining)
+	}
+	if !st.Converged() {
+		return 1, nil
 	}
 	return 0, nil
 }

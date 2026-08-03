@@ -69,6 +69,7 @@ type State struct {
 	FormatVersion  string                    `json:"format_version"` // "1.0"
 	Serial         uint64                    `json:"serial"`
 	Resources      map[string]*ResourceState `json:"resources"` // key = address
+	Incomplete     *IncompleteApply          `json:"incomplete_apply,omitempty"`
 	baseSerial     uint64                    `json:"-"`
 	resolver       SensitiveResolver         `json:"-"`
 	sensitiveHints map[string][]string       `json:"-"`

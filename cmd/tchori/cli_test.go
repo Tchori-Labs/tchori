@@ -381,10 +381,11 @@ func TestCLIApplyReportsInconsistentProviderResult(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("apply: exit %d, want 1; stderr %s", code, stderr)
 	}
-	var d struct{ Severity, Address, Detail string }
-	if err := json.Unmarshal([]byte(strings.TrimSpace(stderr)), &d); err != nil {
-		t.Fatalf("stderr is not one JSON diagnostic: %v\n%s", err, stderr)
+	ds := decodeDiagnosticLines(t, stderr)
+	if len(ds) != 2 {
+		t.Fatalf("diagnostics = %#v, want inconsistent-result error and incomplete-state warning", ds)
 	}
+	d := ds[0]
 	if d.Severity != "error" || d.Address != "tchoritest_lossy.svc" || !strings.Contains(d.Detail, "flag: planned true, applied false") || strings.Contains(d.Detail, "do-not-print") {
 		t.Fatalf("diagnostic = %#v", d)
 	}
@@ -645,6 +646,54 @@ func TestImportAndPostImportReadDiagnosticsHaveResourceAddress(t *testing.T) {
 			t.Fatalf("post-import refresh diagnostics = %#v", ds)
 		}
 	})
+}
+
+func TestCLIStateStatusAfterFailedApply(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, "explode")
+	pd := "--plugin-dir=" + pluginDir
+	if _, stderr, code := runCLI(t, dir, "plan", pd, "-out", "failed.json"); code != 2 {
+		t.Fatalf("plan: exit %d, want 2: %s", code, stderr)
+	}
+	if _, stderr, code := runCLI(t, dir, "apply", pd, "failed.json"); code != 1 || !strings.Contains(stderr, "apply exploded") {
+		t.Fatalf("failed apply: exit %d stderr=%s", code, stderr)
+	}
+
+	stdout, _, code := runCLI(t, dir, "state", "status")
+	if code != 1 || !strings.Contains(stdout, "tchoritest_thing.demo") {
+		t.Fatalf("state status: exit %d stdout=%q", code, stdout)
+	}
+	if stdout, stderr, code := runCLI(t, dir, "state", "list"); code != 0 || stdout != "" {
+		t.Fatalf("state list after failure: exit %d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	stdout, _, code = runCLI(t, dir, "-json", "state", "status")
+	if code != 1 {
+		t.Fatalf("json state status: exit %d stdout=%s", code, stdout)
+	}
+	var status struct {
+		Converged bool `json:"converged"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &status); err != nil || status.Converged {
+		t.Fatalf("json status = %q parsed=%+v err=%v", stdout, status, err)
+	}
+
+	// Recovery planning remains available and warns instead of changing the
+	// established 0/2 plan exit contract.
+	_, stderr, code := runCLI(t, dir, "plan", pd, "-out", "recovery.json")
+	if code != 2 || !strings.Contains(stderr, `"severity":"warning"`) || !strings.Contains(stderr, "incomplete apply") {
+		t.Fatalf("recovery plan: exit %d stderr=%s", code, stderr)
+	}
+	writeConfig(t, dir, "recovered")
+	if _, stderr, code = runCLI(t, dir, "plan", pd, "-out", "recovery.json"); code != 2 {
+		t.Fatalf("recovery plan after config fix: exit %d stderr=%s", code, stderr)
+	}
+	if _, stderr, code = runCLI(t, dir, "apply", pd, "recovery.json"); code != 0 {
+		t.Fatalf("recovery apply: exit %d stderr=%s", code, stderr)
+	}
+	stdout, _, code = runCLI(t, dir, "state", "status")
+	if code != 0 || !strings.Contains(stdout, "converged") {
+		t.Fatalf("recovered state status: exit %d stdout=%q", code, stdout)
+	}
 }
 
 func TestCLIRejectsEmbeddedReference(t *testing.T) {

@@ -2,20 +2,23 @@
 // updates and replaces run in dependency order (the config's topological
 // sort, cfg.Order() — NOT pl.Changes' document order, which is merely
 // sorted alphabetically by address for plan.json determinism), deletes run
-// last in reverse dependency order. The state file is re-saved after every
-// successful provider call so a mid-sequence failure never loses the
-// resources already applied (partial-state safety). Unresolved
-// reference-shaped values are rejected before every config-bearing provider
-// call, including before the destroy leg of a replace; provider-returned
-// values remain outside that validation boundary.
+// last in reverse dependency order. State is marked incomplete on disk before
+// the first provider call (or apply refuses to run), re-saved after every
+// successful provider call, finalized on failure, and cleared only after full
+// completion. A successful apply with N provider-change saves therefore
+// advances serial by N+2; a failed non-empty apply advances it by at least 2.
+// Pre-flight refusals do not mutate state. Unresolved reference-shaped values
+// are rejected before every config-bearing provider call, including before the
+// destroy leg of a replace; provider-returned values remain outside that
+// validation boundary.
 //
 // After create, update, and the create leg of replace, apply also checks the
 // returned state against concretely-authored planned values. Shallow-known
 // object/map containers and positionally aligned lists/tuples are traversed
 // despite unknown computed descendants; an authored map owns its complete key
-// set. Null or unknown resource roots
-// fail before persistence, and other unknown/unencodable results fail without
-// writing that address. Destroy retains its separate null-result guard.
+// set. Null or unknown resource roots fail before persistence, and other
+// unknown/unencodable results fail without writing that address. Destroy
+// retains its separate null-result guard.
 package apply
 
 import (
@@ -41,9 +44,14 @@ import (
 // (else "plan does not match configuration" error diag — see the
 // configuration-drift guard below), then executes changes: creates/updates/
 // replaces in dependency order, deletes last in reverse dependency order.
-// After EVERY successful ApplyResource the state is updated in memory AND
-// saved to statePath (partial-state safety). First error aborts remaining
-// changes but keeps completed ones saved.
+// Before the first ApplyResource, Apply durably marks statePath incomplete and
+// refuses to execute if that save fails. After EVERY successful ApplyResource
+// the state is updated in memory AND saved (partial-state safety). The first
+// error aborts remaining changes, finalizes the marker, and keeps completed
+// work saved; full completion clears the marker. A non-empty successful run
+// with N provider-change saves advances serial by N+2. A failed run advances it
+// by at least 2, so callers must compute a new plan before retrying. Stale-plan,
+// ordering, and configuration-drift refusals happen before any save.
 //
 // Ordering note: pl.Changes is sorted alphabetically by address (see
 // plan.finalize) purely so plan.json is byte-for-byte deterministic — that
@@ -59,6 +67,7 @@ import (
 // state_serial is compared against the serial captured at plan time, which
 // only matches the pre-apply state.
 func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map[string]*provider.Client, schemas map[string]*provider.ProviderSchemas, st *state.State, statePath string) diag.Diagnostics {
+	hadMarker := st.Incomplete != nil
 	if pl.StateSerial != st.Serial {
 		return diag.Diagnostics{diag.Errorf("", "stale plan", fmt.Sprintf(
 			"plan was created against state serial %d but the current state serial is %d; run plan again",
@@ -178,17 +187,60 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 		return driftDiags
 	}
 
+	marked := len(ordered) > 0
+	if marked {
+		remaining := make([]string, len(ordered))
+		for i, ch := range ordered {
+			remaining[i] = ch.Address
+		}
+		previousMarker, previousSerial := st.Incomplete, st.Serial
+		st.Incomplete = &state.IncompleteApply{Applied: []string{}, Remaining: remaining}
+		if err := ex.save(); err != nil {
+			st.Incomplete, st.Serial = previousMarker, previousSerial
+			return diag.Diagnostics{diag.Errorf("", "marking state incomplete",
+				fmt.Sprintf("apply refused to run because non-convergence could not be recorded before the first provider call: %s", err))}
+		}
+	}
+
 	var ds diag.Diagnostics
-	for _, ch := range ordered {
+	for i, ch := range ordered {
 		step := ex.applyChange(ctx, ch)
 		ds = append(ds, step...)
 		if step.HasErrors() {
-			// Abort remaining changes. Everything already applied has been
-			// saved to statePath change by change, so completed work is kept.
+			// The per-change save happens inside applyChange, before this loop can
+			// advance the split. This final save is therefore authoritative.
+			st.Incomplete.FailedAddress = ch.Address
+			st.Incomplete.Applied = addresses(ordered[:i])
+			st.Incomplete.Remaining = addresses(ordered[i:])
+			if err := ex.save(); err != nil {
+				ds = append(ds, diag.Errorf(ch.Address, "saving incomplete state", err.Error()))
+			}
+			ds = append(ds, diag.Warnf(ch.Address, "state left incomplete",
+				fmt.Sprintf("state is marked non-converged after failure at %s; run tchori state status for details", ch.Address)))
 			return ds
+		}
+		// Intermediate saves contain progress as of the previous change because
+		// applyChange saves before returning. The failure finalizer above writes
+		// the exact split when it matters.
+		st.Incomplete.Applied = addresses(ordered[:i+1])
+		st.Incomplete.Remaining = addresses(ordered[i+1:])
+	}
+
+	st.Incomplete = nil
+	if marked || ex.saveCount > 0 || hadMarker {
+		if err := ex.save(); err != nil {
+			return append(ds, diag.Errorf("", "clearing incomplete state", err.Error()))
 		}
 	}
 	return ds
+}
+
+func addresses(changes []*plan.Change) []string {
+	out := make([]string, len(changes))
+	for i, ch := range changes {
+		out[i] = ch.Address
+	}
+	return out
 }
 
 // executor carries the shared apply context so the per-change helpers do
@@ -200,9 +252,20 @@ type executor struct {
 	st        *state.State
 	statePath string
 	applied   map[string]cty.Value // full in-process values for same-run references
+	saveCount int
 }
 
-// applyChange executes one plan change and persists its result.
+func (ex *executor) save() error {
+	if err := ex.st.Save(ex.statePath); err != nil {
+		return err
+	}
+	ex.saveCount++
+	return nil
+}
+
+// applyChange executes one plan change and persists its result. For TC-048,
+// every non-delete config is composed before action dispatch so replace cannot
+// destroy the prior object before an unresolved-reference failure is known.
 func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagnostics {
 	addr := ch.Address
 
@@ -328,7 +391,7 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 			"ApplyResource returned a non-null state for a null planned value"))
 	}
 	delete(ex.st.Resources, addr)
-	if err := ex.st.Save(ex.statePath); err != nil {
+	if err := ex.save(); err != nil {
 		return append(ds, diag.Errorf(addr, "saving state", err.Error()))
 	}
 	return append(ds, unresolvedWarnings(ex.st)...)
@@ -412,7 +475,7 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	if len(redactedPaths) != 0 {
 		ds = append(ds, diag.Warnf(addr, "sensitive attributes withheld from state", fmt.Sprintf("withheld paths: %s; capture provider-issued credentials in a secret store", strings.Join(redactedPaths, ", "))))
 	}
-	if err := ex.st.Save(ex.statePath); err != nil {
+	if err := ex.save(); err != nil {
 		return append(ds, diag.Errorf(addr, "saving state", err.Error()))
 	}
 	ds = append(ds, unresolvedWarnings(ex.st)...)

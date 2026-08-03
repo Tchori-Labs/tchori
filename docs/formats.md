@@ -119,6 +119,7 @@ the reference is nested inside an ordered collection (Tchori-Labs/tchori#11).
 | `tchori plan [-out FILE]` | no changes (`Plan.HasChanges()` false) | changes pending | error (config/provider/runtime failure; diagnostics on stderr) |
 | `tchori destroy -out FILE` | nothing to destroy | destroy plan has deletions | error |
 | `tchori apply PLANFILE` | applied successfully | *(not used — apply is terminal)* | error: stale plan, configuration drift, or a provider apply failure |
+| `tchori state status` | state is converged | *(not used)* | state carries `incomplete_apply`, or cannot be read |
 
 `HasChanges()` is simply `create + update + delete + replace > 0` from
 `summary` — `no-op`-only plans exit `0`.
@@ -208,6 +209,7 @@ creates.
 | `format_version` | string | State document schema version. Currently always `"1.0"` (unexported `state.formatVersion`). |
 | `serial` | integer | Monotonically incremented once per successful `Save` call — see Serial semantics below. |
 | `resources` | object | Map of resource address (`type.name`) to `ResourceState`. |
+| `incomplete_apply` | object, omitted when converged | Durable evidence that the last apply did not complete; see below. |
 
 ### ResourceState fields
 
@@ -221,6 +223,28 @@ creates.
 | `sensitive_paths` | array of strings, omitted if empty | Sorted effective, index-insensitive sensitivity contract. It survives config removal and drives backups, delete plans, orphan handling, and provider-free read masking. |
 | `sensitive_scanned` | boolean, omitted when false | Provenance marker set after live schema/config resolution, including for a definitively non-sensitive resource. Read surfaces use it to distinguish checked entries from legacy entries with unknown provenance. |
 
+### Incomplete apply lifecycle
+
+`incomplete_apply` contains `failed_address` (omitted while a run is still in
+flight), `applied`, and `remaining`. The two lists are always JSON arrays,
+including when empty. The record contains resource **addresses only**: never
+attribute values, provider responses, private data, diagnostic details that
+might echo values, or timestamps.
+
+For every non-empty apply, tchori writes this marker to disk **before the first
+provider call**. If that pre-flight save fails, apply refuses to issue any
+provider request. Per-change saves preserve the marker while work proceeds. On
+the first failure, a final save records the exact failed address and
+applied/remaining split; on full success, a terminal save removes the marker.
+A process killed mid-run or a failed finalizing save therefore still leaves an
+artifact that admits it is non-converged. Stale-plan, configuration-order, and
+configuration-drift refusals write nothing. A zero-change apply writes no new
+marker, although it does clear a stale marker from an earlier run.
+
+Use `tchori state status` as the convergence gate: exit 0 means converged and
+exit 1 means incomplete. `plan`, `apply`, and `destroy` warn when loading a
+marked file, while planning remains available for recovery.
+
 ### Serial semantics
 
 - `state.Load` on a missing path returns a fresh, empty state:
@@ -228,12 +252,12 @@ creates.
 - Each successful `Save` increments `Serial`, regardless of whether the
   resource data actually changed. A save rejected because another process
   committed from the same base does not increment it.
-- Apply saves state after *each* successfully applied resource, not once
-  per `apply` invocation — so an apply that creates two resources bumps
-  `serial` by 2 (visible in the worked example below: two creates take the
-  file from serial 0 to serial 2). This is also what makes partial-apply
-  safety possible: if a later resource in the same apply fails, everything
-  already applied is already saved under its own incremented serial.
+- A non-empty successful apply with N provider change-leg saves advances
+  `serial` by **N+2**: one durable pre-flight marker save, N per-leg saves,
+  and one terminal clear. A failed apply advances it by at least 2 even if
+  no resource completed (pre-flight marker plus failure finalizer). A replace
+  has two provider legs and therefore two per-leg saves. Recompute the plan
+  before retrying any failed apply because its original state serial is stale.
 
 ### Locking, backup, and durability behavior
 
@@ -260,8 +284,10 @@ creates.
    bytes. The backup deliberately applies no literal-instance exemptions and
    retains previously persisted paths, so the prior document is scrubbed under
    the rules that wrote it even when the current declaration was removed.
-   The fresh-temp-and-rename symlink, directory, and `0600` hardening remains
-   unchanged.
+   Because apply now performs bracketing saves, the backup left by a successful
+   apply normally contains a marker-carrying intermediate, not the pre-apply
+   state. The fresh-temp-and-rename symlink, directory, and `0600` hardening
+   remains unchanged.
 4. Sanitizes every live state entry, including resources untouched by this
    apply. A resolvable entry uses current schema/config paths as authoritative,
    honors per-instance literal exemptions, intersects stale markers with the
@@ -336,7 +362,9 @@ leaves `O_RDWR|O_NONBLOCK` FIFO-open behavior undefined.
   (`plan.finalize`).
 - `state.json`'s `resources` is a Go map, but `encoding/json` always
   marshals map keys in sorted order — so the file's byte content does not
-  depend on Go map insertion order. `TestSaveDeterministicAcrossInsertionOrder`
+  depend on Go map insertion order. A converged marker is a pointer with
+  `omitempty`, so converged files retain the established key set and order;
+  an incomplete marker has no timestamp. `TestSaveDeterministicAcrossInsertionOrder`
   pins this down directly: two states built by inserting the same three
   resources in different orders `Save` to byte-identical files.
 - Together, re-running plan or save against unchanged input reproduces the
@@ -351,7 +379,9 @@ must carry `format_version` exactly `"1.0"`, including rejecting a missing
 or empty field — a state file tchori itself wrote always carries `"1.0"`
 (see `Save`), so anything else is a file this engine did not write and
 should not guess about. A missing file is not subject to this check at all
-(it synthesizes a fresh empty state instead).
+(it synthesizes a fresh empty state instead). `incomplete_apply` is an additive,
+optional field, so `format_version` remains `"1.0"`. An older tchori binary can
+read a marked file but will silently drop the marker if it re-saves that state.
 
 ### Example
 
@@ -361,7 +391,7 @@ prefix `demo-`):
 ```json
 {
   "format_version": "1.0",
-  "serial": 2,
+  "serial": 4,
   "resources": {
     "tchoritest_thing.a": {
       "type": "tchoritest_thing",
@@ -391,9 +421,9 @@ prefix `demo-`):
 }
 ```
 
-Note `serial: 2`, not `1`: `apply` saved once after `tchoritest_thing.a`
-applied and again after `tchoritest_thing.b` applied. Planning against this
-state again produces two `no-op` changes and exits `0`.
+Note `serial: 4`: apply saved the pre-flight marker, saved once after each of
+the two resources applied, then saved once more to clear the marker. Planning
+against this state again produces two `no-op` changes and exits `0`.
 
 ## Staleness and configuration drift at apply
 
