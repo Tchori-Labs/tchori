@@ -370,6 +370,73 @@ func newPlanner(t *testing.T, cfg *config.Config, st *state.State) *plan.Planner
 const demoApplied = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":null,"rules":null,"tags":null}`
 const demoAppliedOld = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"old","rules":null,"tags":null}`
 
+func driftApplied(name, echo string) string {
+	return fmt.Sprintf(`{"echo":%q,"id":%q,"name":%q,"replace_me":null,"rules":null,"tags":null}`, echo, "id-"+name, name)
+}
+
+func TestPlanRecordsRefreshDriftWithoutChangingExitSemantics(t *testing.T) {
+	const addr = "tchoritest_thing.demo"
+	cfg := testConfig(t, map[string]map[string]any{addr: {"name": "drift-a"}})
+	p := newPlanner(t, cfg, stateWith(t, 3, map[string]string{addr: driftApplied("drift-a", "healthy")}))
+
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+	if pl.HasChanges() {
+		t.Fatal("drift-only plan must not report pending changes")
+	}
+	if len(pl.Drift) != 1 || pl.Drift[0].Address != addr || !slices.Equal(pl.Drift[0].Paths, []string{"echo"}) {
+		t.Fatalf("drift = %#v", pl.Drift)
+	}
+	if !bytes.Contains(pl.Drift[0].After, []byte(`"degraded:unhealthy"`)) {
+		t.Fatalf("drift after = %s", pl.Drift[0].After)
+	}
+}
+
+func TestPlanRefreshDriftDisabledAndMatching(t *testing.T) {
+	const addr = "tchoritest_thing.demo"
+	cfg := testConfig(t, map[string]map[string]any{addr: {"name": "drift-a"}})
+	for _, test := range []struct {
+		name    string
+		echo    string
+		refresh bool
+	}{
+		{name: "refresh disabled", echo: "healthy", refresh: false},
+		{name: "refresh matches", echo: "degraded:unhealthy", refresh: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p := newPlanner(t, cfg, stateWith(t, 1, map[string]string{addr: driftApplied("drift-a", test.echo)}))
+			p.Refresh = test.refresh
+			pl, ds := p.Plan(context.Background())
+			if ds.HasErrors() {
+				t.Fatalf("Plan diagnostics: %+v", ds)
+			}
+			if len(pl.Drift) != 0 {
+				t.Fatalf("unexpected drift: %#v", pl.Drift)
+			}
+		})
+	}
+}
+
+func TestPlanRefreshDriftSortedByAddress(t *testing.T) {
+	resources := map[string]map[string]any{
+		"tchoritest_thing.zed":   {"name": "drift-z"},
+		"tchoritest_thing.alpha": {"name": "drift-a"},
+	}
+	states := map[string]string{
+		"tchoritest_thing.zed":   driftApplied("drift-z", "healthy"),
+		"tchoritest_thing.alpha": driftApplied("drift-a", "healthy"),
+	}
+	pl, ds := newPlanner(t, testConfig(t, resources), stateWith(t, 1, states)).Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+	if len(pl.Drift) != 2 || pl.Drift[0].Address != "tchoritest_thing.alpha" || pl.Drift[1].Address != "tchoritest_thing.zed" {
+		t.Fatalf("drift order = %#v", pl.Drift)
+	}
+}
+
 func TestPlanGatewayHTMLRefreshDiagnostic(t *testing.T) {
 	const (
 		addr    = "tchoritest_thing.web"

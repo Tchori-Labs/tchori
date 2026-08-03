@@ -503,6 +503,14 @@ func (s *server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 					Attribute: tftypes.NewAttributePath().WithAttributeName("name"),
 				}}}, nil
 			}
+			if strings.HasPrefix(name, "drift-") {
+				attrs["echo"] = tftypes.NewValue(tftypes.String, "degraded:unhealthy")
+				newState, err := tfprotov6.NewDynamicValue(thingType, tftypes.NewValue(thingType, attrs))
+				if err != nil {
+					return nil, err
+				}
+				return &tfprotov6.ReadResourceResponse{NewState: &newState, Private: req.Private}, nil
+			}
 		}
 	}
 	// No backing store: echo current state (and private) unchanged.

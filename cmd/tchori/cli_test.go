@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 
 	"github.com/tchori-labs/tchori/internal/diag"
+	"github.com/tchori-labs/tchori/internal/plan"
 )
 
 // The CLI is tested end to end: TestMain builds the real tchori binary and
@@ -477,6 +479,102 @@ func TestCLIProtocol5ApplyReportsProvider400WithAbortAccounting(t *testing.T) {
 	assertAPIFailureDiagnostics(t, stderr, "tchoritest5_thing.demo")
 }
 
+func TestCLIRefreshDriftRenderedOnBothProtocols(t *testing.T) {
+	protocols := []struct {
+		name    string
+		write   func(*testing.T, string, string)
+		address string
+	}{
+		{name: "protocol6", write: writeConfig, address: "tchoritest_thing.demo"},
+		{name: "protocol5", write: writeConfig5, address: "tchoritest5_thing.demo"},
+	}
+	for _, protocol := range protocols {
+		protocol := protocol
+		t.Run(protocol.name+"_pending_update", func(t *testing.T) {
+			dir := t.TempDir()
+			seedAppliedResource(t, dir, protocol.write, "drift-a")
+			protocol.write(t, dir, "drift-b")
+			stdout, stderr, code := runCLI(t, dir, "plan", "--plugin-dir="+pluginDir, "-out", "pending.json")
+			if code != 2 {
+				t.Fatalf("plan: exit %d, want 2\nstdout: %s\nstderr: %s", code, stdout, stderr)
+			}
+			for _, text := range []string{"echo = \"degraded:unhealthy\" -> (known after apply)", "Note: objects have changed outside tchori"} {
+				if !strings.Contains(stdout, text) {
+					t.Errorf("plan stdout missing %q:\n%s", text, stdout)
+				}
+			}
+			assertSavedDrift(t, filepath.Join(dir, "pending.json"), protocol.address, "echo")
+		})
+
+		t.Run(protocol.name+"_no_pending_change", func(t *testing.T) {
+			dir := t.TempDir()
+			seedAppliedResource(t, dir, protocol.write, "drift-a")
+			stdout, stderr, code := runCLI(t, dir, "plan", "--plugin-dir="+pluginDir, "-out", "drift.json")
+			if code != 0 {
+				t.Fatalf("plan: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+			}
+			for _, text := range []string{"Note: objects have changed outside tchori", "degraded:unhealthy", "No changes. Configuration matches state."} {
+				if !strings.Contains(stdout, text) {
+					t.Errorf("plan stdout missing %q:\n%s", text, stdout)
+				}
+			}
+			assertSavedDrift(t, filepath.Join(dir, "drift.json"), protocol.address, "echo")
+		})
+	}
+}
+
+func TestCLIProtocol5VanishedObjectDrift(t *testing.T) {
+	dir := t.TempDir()
+	seedAppliedResource(t, dir, writeConfig5, "vanish")
+	stdout, stderr, code := runCLI(t, dir, "plan", "--plugin-dir="+pluginDir, "-out", "vanished.json")
+	if code != 2 {
+		t.Fatalf("plan: exit %d, want 2\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "tchoritest5_thing.demo (object no longer exists)") || !strings.Contains(stdout, "+ tchoritest5_thing.demo") {
+		t.Fatalf("vanished plan output missing drift/create markers:\n%s", stdout)
+	}
+	var pl plan.Plan
+	readJSONFile(t, filepath.Join(dir, "vanished.json"), &pl)
+	if len(pl.Drift) != 1 || pl.Drift[0].Address != "tchoritest5_thing.demo" || string(pl.Drift[0].After) != "null" {
+		t.Fatalf("vanished drift = %#v", pl.Drift)
+	}
+}
+
+func seedAppliedResource(t *testing.T, dir string, write func(*testing.T, string, string), name string) {
+	t.Helper()
+	write(t, dir, name)
+	pd := "--plugin-dir=" + pluginDir
+	if stdout, stderr, code := runCLI(t, dir, "plan", pd, "-out", "seed.json"); code != 2 {
+		t.Fatalf("seed plan: exit %d, want 2\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if stdout, stderr, code := runCLI(t, dir, "apply", pd, "seed.json"); code != 0 {
+		t.Fatalf("seed apply: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+}
+
+func assertSavedDrift(t *testing.T, path, address, changedPath string) {
+	t.Helper()
+	var pl plan.Plan
+	readJSONFile(t, path, &pl)
+	if pl.FormatVersion != "1.0" {
+		t.Fatalf("format_version = %q, want 1.0", pl.FormatVersion)
+	}
+	if len(pl.Drift) != 1 || pl.Drift[0].Address != address || !slices.Contains(pl.Drift[0].Paths, changedPath) {
+		t.Fatalf("drift = %#v, want one %s entry at %s", pl.Drift, changedPath, address)
+	}
+}
+
+func readJSONFile(t *testing.T, path string, target any) {
+	t.Helper()
+	b, err := os.ReadFile(path) //nolint:gosec // G304: test-only path is always rooted in t.TempDir
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if err := json.Unmarshal(b, target); err != nil {
+		t.Fatalf("decode %s: %v\n%s", path, err, b)
+	}
+}
+
 func TestCLILifecycle(t *testing.T) {
 	dir := t.TempDir()
 	writeConfig(t, dir, "demo")
@@ -507,6 +605,9 @@ func TestCLILifecycle(t *testing.T) {
 	}
 	if doc["format_version"] != "1.0" {
 		t.Errorf("plan -json format_version = %v, want %q", doc["format_version"], "1.0")
+	}
+	if _, exists := doc["drift"]; exists {
+		t.Errorf("drift-free plan -json unexpectedly contains drift: %s", stdout)
 	}
 
 	// plan -out -> plan file written, still exit 2.

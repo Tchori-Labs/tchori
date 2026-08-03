@@ -216,6 +216,14 @@ func (s *server) ReadResource(ctx context.Context, req *tfprotov5.ReadResourceRe
 					Detail:   "decoding response: invalid character '<' looking for beginning of value",
 				}}}, nil
 			}
+			if strings.HasPrefix(name, "drift-") {
+				attrs["echo"] = tftypes.NewValue(tftypes.String, "degraded:unhealthy")
+				newState, err := tfprotov5.NewDynamicValue(thingType, tftypes.NewValue(thingType, attrs))
+				if err != nil {
+					return nil, err
+				}
+				return &tfprotov5.ReadResourceResponse{NewState: &newState, Private: req.Private}, nil
+			}
 		}
 	}
 	// No backing store: echo current state (and private) unchanged.

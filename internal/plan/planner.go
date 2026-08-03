@@ -120,8 +120,10 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		}
 
 		// Refresh: re-read the real object, use the result as prior, and keep
-		// the in-memory state copy in sync.
+		// the in-memory state copy in sync. Preserve the persisted reporting
+		// value first so out-of-band changes can be recorded in the plan.
 		if p.Refresh && hasPrior {
+			recordedAttrs := append(json.RawMessage(nil), rs.Attributes...)
 			rv, rpriv, rds := client.ReadResource(ctx, res.Type, prior, priorPrivate)
 			rds = provider.Context(addr, rds)
 			ds = append(ds, rds...)
@@ -130,6 +132,11 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 			}
 			if rv.IsNull() {
 				// The object vanished out of band: plan from a null prior.
+				pl.Drift = append(pl.Drift, &Drift{
+					Address: addr,
+					Before:  recordedAttrs,
+					After:   json.RawMessage("null"),
+				})
 				delete(p.State.Resources, addr)
 				prior = cty.NullVal(ty)
 				priorPrivate = nil
@@ -142,6 +149,14 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 				if err != nil {
 					ds = append(ds, diag.Errorf(addr, "cannot encode refreshed state", err.Error()))
 					return nil, ds
+				}
+				drift, err := newDrift(addr, recordedAttrs, attrs)
+				if err != nil {
+					ds = append(ds, diag.Errorf(addr, "cannot compare refreshed state", err.Error()))
+					return nil, ds
+				}
+				if drift != nil {
+					pl.Drift = append(pl.Drift, drift)
 				}
 				rs.Attributes = attrs
 				rs.Private = rpriv
@@ -408,10 +423,32 @@ func sortedStateAddrs(st *state.State) []string {
 	return addrs
 }
 
-// finalize sorts the changes by address (document determinism) and counts
-// the summary; no-op changes are listed but never counted.
+func newDrift(address string, before, after json.RawMessage) (*Drift, error) {
+	beforeValue, err := decodeJSON(before)
+	if err != nil {
+		return nil, fmt.Errorf("decode recorded value: %w", err)
+	}
+	afterValue, err := decodeJSON(after)
+	if err != nil {
+		return nil, fmt.Errorf("decode refreshed value: %w", err)
+	}
+	paths := changedPaths(beforeValue, afterValue)
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	return &Drift{
+		Address: address,
+		Before:  append(json.RawMessage(nil), before...),
+		After:   append(json.RawMessage(nil), after...),
+		Paths:   paths,
+	}, nil
+}
+
+// finalize sorts changes and drift by address (document determinism) and
+// counts the summary; no-op changes and drift are never counted.
 func finalize(pl *Plan) {
 	sort.Slice(pl.Changes, func(i, j int) bool { return pl.Changes[i].Address < pl.Changes[j].Address })
+	sort.Slice(pl.Drift, func(i, j int) bool { return pl.Drift[i].Address < pl.Drift[j].Address })
 	for _, ch := range pl.Changes {
 		switch ch.Action {
 		case "create":

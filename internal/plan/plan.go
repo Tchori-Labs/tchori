@@ -23,6 +23,13 @@ type Change struct {
 	Private         []byte          `json:"private,omitempty"`
 }
 
+type Drift struct {
+	Address string          `json:"address"`
+	Before  json.RawMessage `json:"before"`
+	After   json.RawMessage `json:"after"`
+	Paths   []string        `json:"paths,omitempty"`
+}
+
 type Summary struct {
 	Create  int `json:"create"`
 	Update  int `json:"update"`
@@ -35,6 +42,7 @@ type Plan struct {
 	EngineVersion string    `json:"engine_version"`
 	StateSerial   uint64    `json:"state_serial"`
 	Changes       []*Change `json:"changes"` // sorted by Address
+	Drift         []*Drift  `json:"drift,omitempty"`
 	Summary       Summary   `json:"summary"`
 }
 

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -154,7 +155,7 @@ func runPlan(cmd *cobra.Command, out string, refresh bool) (int, error) {
 			return 1, fmt.Errorf("writing plan to %s: %s", out, err)
 		}
 	}
-	if err := writePlanOutput(cmd.OutOrStdout(), pl); err != nil {
+	if err := writePlanOutput(cmd.OutOrStdout(), pl, planSensitivePredicate(rt.Config, st, rt.Schemas)); err != nil {
 		return 1, err
 	}
 	if pl.HasChanges() {
@@ -163,9 +164,9 @@ func runPlan(cmd *cobra.Command, out string, refresh bool) (int, error) {
 	return 0, nil
 }
 
-// writePlanOutput prints the plan document as JSON when -json is set, else a
-// human summary: one line per non-no-op change and a totals line.
-func writePlanOutput(w io.Writer, pl *plan.Plan) error {
+// writePlanOutput prints the plan document as JSON when -json is set, else its
+// attribute-level human representation.
+func writePlanOutput(w io.Writer, pl *plan.Plan, sensitivePath func(address, path string) bool) error {
 	if flagJSON {
 		b, err := json.MarshalIndent(pl, "", "  ")
 		if err != nil {
@@ -175,35 +176,67 @@ func writePlanOutput(w io.Writer, pl *plan.Plan) error {
 		_, err = w.Write(b)
 		return err
 	}
-	if !pl.HasChanges() {
-		_, _ = fmt.Fprintln(w, "No changes. Configuration matches state.")
-		return nil
-	}
-	for _, c := range pl.Changes {
-		if c.Action == "no-op" {
-			continue
-		}
-		_, _ = fmt.Fprintf(w, "%s %s\n", actionSymbol(c.Action), c.Address)
-	}
-	s := pl.Summary
-	_, _ = fmt.Fprintf(w, "Plan: %d to create, %d to update, %d to delete, %d to replace.\n",
-		s.Create, s.Update, s.Delete, s.Replace)
-	return nil
+	return plan.RenderHuman(w, pl, sensitivePath)
 }
 
-func actionSymbol(action string) string {
-	switch action {
-	case "create":
-		return "+"
-	case "update":
-		return "~"
-	case "delete":
-		return "-"
-	case "replace":
-		return "-/+"
-	default:
-		return " "
+func planSensitivePredicate(cfg *config.Config, st *state.State, schemas map[string]*provider.ProviderSchemas) func(address, path string) bool {
+	type pathInfo struct {
+		paths    []string
+		resolved bool
 	}
+	cache := make(map[string]pathInfo)
+	return func(address, path string) bool {
+		info, ok := cache[address]
+		if !ok {
+			var providerName, typeName string
+			var declared []string
+			var raw map[string]any
+			if cfg != nil {
+				if res := cfg.Resources[address]; res != nil {
+					providerName, typeName = res.Provider, res.Type
+					declared, raw = res.SensitiveAttributes, res.Config
+				}
+			}
+			if typeName == "" && st != nil {
+				if rs := st.Resources[address]; rs != nil {
+					providerName, typeName = rs.Provider, rs.Type
+					declared = rs.SensitivePaths
+				}
+			}
+			if ps := schemas[providerName]; ps != nil && typeName != "" {
+				if schema, _, known := ps.LookupResourceType(typeName); known && schema != nil {
+					if spec, ds := sensitive.Resolve(schema.Block, declared, raw); !ds.HasErrors() {
+						info.paths, info.resolved = spec.Paths(), true
+					}
+				}
+			}
+			cache[address] = info
+		}
+		if !info.resolved {
+			return true // fail closed when an address cannot be tied to a schema
+		}
+		logical := logicalAttributePath(path)
+		for _, candidate := range info.paths {
+			candidate = logicalAttributePath(candidate)
+			if logical == candidate || strings.HasPrefix(logical, candidate+".") {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func logicalAttributePath(path string) string {
+	path = strings.NewReplacer("[", ".", "]", "").Replace(path)
+	parts := strings.FieldsFunc(path, func(r rune) bool { return r == '.' })
+	for i := range parts {
+		parts[i] = strings.Trim(parts[i], `"`)
+	}
+	parts = slices.DeleteFunc(parts, func(part string) bool {
+		_, err := strconv.Atoi(part)
+		return err == nil
+	})
+	return strings.Join(parts, ".")
 }
 
 // --- apply -------------------------------------------------------------------
@@ -301,7 +334,7 @@ func runDestroy(cmd *cobra.Command, out string) (int, error) {
 		if err := plan.Write(pl, out); err != nil {
 			return 1, fmt.Errorf("writing plan to %s: %s", out, err)
 		}
-		if err := writePlanOutput(cmd.OutOrStdout(), pl); err != nil {
+		if err := writePlanOutput(cmd.OutOrStdout(), pl, planSensitivePredicate(rt.Config, st, rt.Schemas)); err != nil {
 			return 1, err
 		}
 		if pl.HasChanges() {
@@ -316,7 +349,7 @@ func runDestroy(cmd *cobra.Command, out string) (int, error) {
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No resources to destroy.")
 		return 0, nil
 	}
-	if err := writePlanOutput(cmd.OutOrStdout(), pl); err != nil {
+	if err := writePlanOutput(cmd.OutOrStdout(), pl, planSensitivePredicate(rt.Config, st, rt.Schemas)); err != nil {
 		return 1, err
 	}
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
