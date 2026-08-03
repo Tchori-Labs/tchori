@@ -115,10 +115,6 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 20 # Registry and provider lifecycle typically finish under 10 minutes; ~2x headroom bounds hangs.
-    env:
-      HTTPS_PROXY: 'http://127.0.0.1:1'
-      HTTP_PROXY: 'http://127.0.0.1:1'
-      NO_PROXY: '127.0.0.1,localhost'
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -127,7 +123,14 @@ jobs:
           go-version-file: 'go.mod'
           cache: true
 
+      - name: warm module cache
+        run: go mod download
+
       - name: e2e (fake provider lifecycle + real registry install + protocol-5 adapter lifecycle)
+        env:
+          HTTPS_PROXY: 'http://127.0.0.1:1'
+          HTTP_PROXY: 'http://127.0.0.1:1'
+          NO_PROXY: '127.0.0.1,localhost'
         run: go test -tags e2e ./e2e -v
 
   goreleaser:

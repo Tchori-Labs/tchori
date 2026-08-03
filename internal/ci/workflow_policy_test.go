@@ -8,6 +8,89 @@ import (
 	"testing"
 )
 
+func TestE2EProxyEnvIsStepScopedLiveWorkflow(t *testing.T) {
+	if err := E2EProxyEnvIsStepScoped(readLiveWorkflow(t)); err != nil {
+		t.Fatalf("check live e2e proxy scope: %v", err)
+	}
+}
+
+func TestE2EProxyEnvIsStepScopedFixtures(t *testing.T) {
+	tests := []struct {
+		name         string
+		workflowYAML string
+		wantError    string
+	}{
+		{
+			name: "step-scoped denial passes",
+			workflowYAML: `jobs:
+  e2e:
+    steps:
+      - uses: actions/checkout@0123456789012345678901234567890123456789
+      - run: go mod download
+      - run: go test -tags e2e ./e2e -v
+        env:
+          HTTPS_PROXY: 'http://127.0.0.1:1'
+          HTTP_PROXY: 'http://127.0.0.1:1'
+          NO_PROXY: '127.0.0.1,localhost'
+`,
+		},
+		{
+			name: "pre-fix job-scoped denial is rejected",
+			workflowYAML: `jobs:
+  e2e:
+    env:
+      HTTPS_PROXY: 'http://127.0.0.1:1'
+      HTTP_PROXY: 'http://127.0.0.1:1'
+      NO_PROXY: '127.0.0.1,localhost'
+    steps:
+      - uses: actions/checkout@0123456789012345678901234567890123456789
+      - run: go test -tags e2e ./e2e -v
+`,
+			wantError: "at job scope",
+		},
+		{
+			name: "deleted denial is rejected",
+			workflowYAML: `jobs:
+  e2e:
+    steps:
+      - run: go test -tags e2e ./e2e -v
+`,
+			wantError: "e2e test step must declare",
+		},
+		{
+			name: "proxy on setup step is rejected",
+			workflowYAML: `jobs:
+  e2e:
+    steps:
+      - uses: actions/setup-go@0123456789012345678901234567890123456789
+        env:
+          HTTP_PROXY: 'http://127.0.0.1:1'
+      - run: go test -tags e2e ./e2e -v
+        env:
+          HTTPS_PROXY: 'http://127.0.0.1:1'
+          HTTP_PROXY: 'http://127.0.0.1:1'
+          NO_PROXY: '127.0.0.1,localhost'
+`,
+			wantError: "only the e2e test step",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := E2EProxyEnvIsStepScoped([]byte(tt.workflowYAML))
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("E2EProxyEnvIsStepScoped() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("E2EProxyEnvIsStepScoped() error = %v, want error containing %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
 func TestJobsMissingTimeoutLiveWorkflow(t *testing.T) {
 	missing, err := JobsMissingTimeout(readLiveWorkflow(t))
 	if err != nil {
