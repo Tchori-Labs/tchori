@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/convert"
@@ -63,11 +64,12 @@ type RefResolver func(ref config.Ref) (cty.Value, diag.Diagnostics)
 
 // Compose converts raw JSON config into a cty.Value conforming to ty:
 // missing optional/computed attrs -> null; whole-string refs (per
-// config.ParseRef) -> resolve(); {"env":"VAR"} wrappers -> string from
-// environment, permitted only when allowEnv is true (error diag if the
-// variable is unset; error diag when allowEnv is false — the spec allows env
-// wrappers only in provider config, so callers pass true for provider config
-// and false for resource configs); unexpected attributes -> error diag
+// config.ParseRef) -> resolve(); {"env":"VAR"} or {"env":["VAR_A","VAR_B"]}
+// wrappers -> string from the first environment variable that is set,
+// permitted only when allowEnv is true (error diag if every variable is
+// unset; error diag when allowEnv is false — the spec allows env wrappers only
+// in provider config, so callers pass true for provider config and false for
+// resource configs); unexpected attributes -> error diag
 // naming the attribute. Reference-shaped strings that survive either raw
 // conversion or post-composition resolution are hard errors under TC-048.
 // Those diagnostics identify the attribute path only because Compose has no
@@ -116,8 +118,9 @@ func rawToCty(path string, raw any, ty cty.Type, allowEnv bool, resolve RefResol
 		}
 	}
 
-	// An {"env": "VAR"} wrapper is only meaningful where a primitive is
-	// expected; at object/map types a single-key "env" object is plain data.
+	// An {"env": "VAR"} or {"env": ["VAR_A", "VAR_B"]} wrapper is only
+	// meaningful where a primitive is expected; at object/map types a
+	// single-key "env" object is plain data.
 	// The spec allows wrappers only in provider config, so resource-config
 	// composition (allowEnv=false) rejects them outright.
 	if m, ok := raw.(map[string]any); ok && ty.IsPrimitiveType() && isEnvWrapper(m) {
@@ -256,20 +259,42 @@ func resolveRefValue(path, refStr string, ref config.Ref, ty cty.Type, resolve R
 	return cv, diags
 }
 
-// resolveEnvValue reads an {"env": "VAR"} wrapper. Wrappers are only valid
-// where a string is expected; the variable must be set (empty string is set).
+// resolveEnvValue reads an {"env": "VAR"} or
+// {"env": ["VAR_A", "VAR_B"]} wrapper. Wrappers are only valid where a
+// string is expected. Candidates are consulted in order and the first one
+// that is set wins; an empty string counts as set.
 func resolveEnvValue(path string, m map[string]any, ty cty.Type) (cty.Value, diag.Diagnostics) {
-	name, _ := m["env"].(string)
+	names, valid := envWrapperNames(m)
+	if !valid {
+		if values, ok := m["env"].([]any); ok {
+			if len(values) == 0 {
+				return cty.NilVal, diag.Diagnostics{diag.Errorf("", "invalid env wrapper",
+					fmt.Sprintf("attribute %q: {\"env\": ...} requires at least one environment variable name", path))}
+			}
+			for i, value := range values {
+				if _, ok := value.(string); !ok {
+					return cty.NilVal, diag.Diagnostics{diag.Errorf("", "invalid env wrapper",
+						fmt.Sprintf("attribute %q: {\"env\": ...} candidate at index %d must be a string", path, i))}
+				}
+			}
+		}
+		return cty.NilVal, diag.Diagnostics{diag.Errorf("", "invalid env wrapper",
+			fmt.Sprintf("attribute %q has a malformed {\"env\": ...} wrapper", path))}
+	}
 	if ty != cty.String {
 		return cty.NilVal, diag.Diagnostics{diag.Errorf("", "invalid env wrapper",
-			fmt.Sprintf("attribute %q: {\"env\": %q} is only valid where a string is expected, not %s", path, name, ty.FriendlyName()))}
+			fmt.Sprintf("attribute %q: {\"env\": %s} is only valid where a string is expected, not %s",
+				path, quotedNames(names), ty.FriendlyName()))}
 	}
-	val, set := os.LookupEnv(name)
-	if !set {
-		return cty.NilVal, diag.Diagnostics{diag.Errorf("", "environment variable not set",
-			fmt.Sprintf("attribute %q reads environment variable %q, which is not set", path, name))}
+	for _, name := range names {
+		if val, set := os.LookupEnv(name); set {
+			return cty.StringVal(val), nil
+		}
 	}
-	return cty.StringVal(val), nil
+	detail := fmt.Sprintf("attribute %q: none of the candidate environment variables %s are set.\n", path, quotedNames(names)) +
+		"These names come from the {\"env\": ...} wrapper in *.tchori.json; tchori defines no built-in or provider-specific environment variable names.\n" +
+		"Export one of these variables, or add the name your environment already uses to the wrapper list."
+	return cty.NilVal, diag.Diagnostics{diag.Errorf("", "environment variable not set", detail)}
 }
 
 // numberToCty converts the Go values encoding/json (and config loaders using
@@ -293,13 +318,51 @@ func numberToCty(path string, raw any) (cty.Value, diag.Diagnostics) {
 	}
 }
 
-// isEnvWrapper reports whether m has the exact {"env": "<string>"} shape.
+// isEnvWrapper reports whether m has the single-key env-wrapper shape. The
+// payload may be a string or a candidate list; resolveEnvValue diagnoses a
+// malformed candidate list.
 func isEnvWrapper(m map[string]any) bool {
 	if len(m) != 1 {
 		return false
 	}
-	_, ok := m["env"].(string)
-	return ok
+	switch m["env"].(type) {
+	case string, []any:
+		return true
+	default:
+		return false
+	}
+}
+
+// envWrapperNames returns a well-formed wrapper's candidate names in config
+// order. Its caller is responsible for diagnosing malformed candidate lists.
+func envWrapperNames(m map[string]any) ([]string, bool) {
+	switch value := m["env"].(type) {
+	case string:
+		return []string{value}, true
+	case []any:
+		if len(value) == 0 {
+			return nil, false
+		}
+		names := make([]string, len(value))
+		for i, candidate := range value {
+			name, ok := candidate.(string)
+			if !ok {
+				return nil, false
+			}
+			names[i] = name
+		}
+		return names, true
+	default:
+		return nil, false
+	}
+}
+
+func quotedNames(names []string) string {
+	quoted := make([]string, len(names))
+	for i, name := range names {
+		quoted[i] = fmt.Sprintf("%q", name)
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func joinPath(base, name string) string {

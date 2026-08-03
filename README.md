@@ -25,8 +25,10 @@ Status: **0.1.0-dev** — pre-MVP, under active development, built in public.
    dependency graph. A reference-shaped `${...}` that survives in a value
    tchori would send to a provider is a hard `unresolved reference` error at
    validate, plan, and apply; shell-style literals such as `${HOME}` remain
-   legal. Secrets come from the environment via `{"env": "VAR_NAME"}`
-   wrappers — they never live in config files.
+   legal. Provider values come from the environment via
+   `{"env": "VAR_NAME"}` or ordered fallback
+   `{"env": ["PRIMARY", "ALTERNATE"]}` wrappers, so secrets never need to
+   live in config files. See [configuration and environment values](docs/configuration.md).
 3. **Machine-readable diagnostics.** Every error and warning is a structured
    JSON object on stderr (`{"severity","summary","detail","address"}`) — the
    agent retry loop, not a wall of prose. Pretty rendering only when stderr
@@ -143,7 +145,8 @@ success is durable across abrupt host failure. On Windows the directory-fsync
 step is a documented no-op (directory fsync is not a supported primitive there;
 NTFS journals rename metadata itself), so only the temp-file fsync provides the
 explicit barrier -- the effective durability outcome is unchanged.
-References: [plan and state formats](docs/formats.md) and the
+References: [configuration and environment values](docs/configuration.md),
+[plan and state formats](docs/formats.md), and the
 [diagnostic contract](docs/diagnostics.md).
 
 It also records whether the apply that last wrote it completed: `tchori state status`

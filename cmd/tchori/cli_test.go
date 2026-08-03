@@ -808,6 +808,74 @@ func TestChdirGlobalFlag(t *testing.T) {
 	}
 }
 
+func TestValidateChdirEnvCandidateFallback(t *testing.T) {
+	const (
+		baseURL  = "TCHORI_TEST_BASE_URL"
+		endpoint = "TCHORI_TEST_ENDPOINT"
+		resolved = "candidate-prefix-do-not-emit-"
+	)
+	for _, name := range []string{baseURL, endpoint} {
+		t.Setenv(name, "restore-for-cleanup")
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatalf("Unsetenv(%q): %v", name, err)
+		}
+	}
+
+	cfgDir := t.TempDir()
+	cfg := `{
+  "providers": {
+    "tchoritest": {
+      "source": "tchori-labs/tchoritest",
+      "version": "0.0.1",
+      "config": {"prefix": {"env": ["TCHORI_TEST_BASE_URL", "TCHORI_TEST_ENDPOINT"]}}
+    }
+  },
+  "resources": {
+    "tchoritest_thing.demo": {"config": {"name": "demo"}}
+  }
+}`
+	if err := os.WriteFile(filepath.Join(cfgDir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	elsewhere := t.TempDir() // exercise the reported command from outside the config directory
+	args := []string{"-chdir=" + cfgDir, "validate", "--plugin-dir=" + pluginDir}
+
+	_, stderr, code := runCLI(t, elsewhere, args...)
+	if code != 1 {
+		t.Fatalf("validate with all candidates unset: exit %d, want 1\nstderr: %s", code, stderr)
+	}
+	diags := decodeDiagnosticLines(t, stderr)
+	if len(diags) != 1 || diags[0].Summary != "environment variable not set" {
+		t.Fatalf("diagnostics = %+v, want one environment variable not set error\nstderr: %s", diags, stderr)
+	}
+	detail := diags[0].Detail
+	baseAt := strings.Index(detail, `"`+baseURL+`"`)
+	endpointAt := strings.Index(detail, `"`+endpoint+`"`)
+	if baseAt < 0 || endpointAt < baseAt {
+		t.Errorf("diagnostic does not name candidates in config order: %q", detail)
+	}
+	for _, want := range []string{`{"env": ...}`, "*.tchori.json", "no built-in or provider-specific", "add the name"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("diagnostic %q does not contain guidance %q", detail, want)
+		}
+	}
+	if strings.Contains(stderr, resolved) {
+		t.Errorf("unset diagnostic leaked a resolved environment value: %s", stderr)
+	}
+
+	t.Setenv(baseURL, resolved)
+	stdout, stderr, code := runCLI(t, elsewhere, args...)
+	if code != 0 {
+		t.Fatalf("validate with fallback candidate set: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Configuration is valid.") {
+		t.Errorf("stdout = %q, want validation success", stdout)
+	}
+	if strings.Contains(stderr, resolved) {
+		t.Errorf("successful validation leaked the resolved environment value to stderr: %s", stderr)
+	}
+}
+
 func TestVersion(t *testing.T) {
 	stdout, _, code := runCLI(t, t.TempDir(), "version")
 	if code != 0 {

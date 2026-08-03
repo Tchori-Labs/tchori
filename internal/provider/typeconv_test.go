@@ -123,6 +123,194 @@ func TestComposeEnvUnset(t *testing.T) {
 	}
 }
 
+func TestComposeEnvCandidateResolution(t *testing.T) {
+	const (
+		first  = "TCHORI_TEST_ENV_CANDIDATE_FIRST"
+		second = "TCHORI_TEST_ENV_CANDIDATE_SECOND"
+	)
+
+	tests := []struct {
+		name       string
+		candidates []any
+		firstValue *string
+		lastValue  *string
+		want       string
+	}{
+		{
+			name:       "first candidate wins when both are set",
+			candidates: []any{first, second},
+			firstValue: stringPointer("selected-first"),
+			lastValue:  stringPointer("ignored-second"),
+			want:       "selected-first",
+		},
+		{
+			name:       "empty first candidate wins",
+			candidates: []any{first, second},
+			firstValue: stringPointer(""),
+			lastValue:  stringPointer("ignored-second"),
+			want:       "",
+		},
+		{
+			name:       "last candidate wins when first is unset",
+			candidates: []any{first, second},
+			lastValue:  stringPointer("selected-second"),
+			want:       "selected-second",
+		},
+		{
+			name:       "duplicate candidate names resolve normally",
+			candidates: []any{first, first},
+			firstValue: stringPointer("selected-duplicate"),
+			want:       "selected-duplicate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			unsetEnv(t, first)
+			unsetEnv(t, second)
+			if tt.firstValue != nil {
+				t.Setenv(first, *tt.firstValue)
+			}
+			if tt.lastValue != nil {
+				t.Setenv(second, *tt.lastValue)
+			}
+
+			ty := cty.Object(map[string]cty.Type{"token": cty.String})
+			raw := map[string]any{"token": map[string]any{"env": tt.candidates}}
+			got, diags := Compose(raw, ty, true, nil)
+			if diags.HasErrors() {
+				t.Fatalf("unexpected diagnostics: %+v", diags)
+			}
+			if value := got.GetAttr("token"); !value.RawEquals(cty.StringVal(tt.want)) {
+				t.Errorf("resolved token = %#v, want selected candidate", value)
+			}
+		})
+	}
+}
+
+func TestComposeEnvCandidatesUnset(t *testing.T) {
+	const (
+		first  = "TCHORI_TEST_ENV_ALL_UNSET_FIRST"
+		second = "TCHORI_TEST_ENV_ALL_UNSET_SECOND"
+	)
+	unsetEnv(t, first)
+	unsetEnv(t, second)
+
+	ty := cty.Object(map[string]cty.Type{"token": cty.String})
+	raw := map[string]any{"token": map[string]any{"env": []any{first, second, first}}}
+	_, diags := Compose(raw, ty, true, nil)
+	if !diags.HasErrors() {
+		t.Fatal("Compose succeeded; want error diagnostic when all candidates are unset")
+	}
+	if diags[0].Summary != "environment variable not set" {
+		t.Fatalf("summary = %q, want environment variable not set", diags[0].Summary)
+	}
+	detail := diags[0].Detail
+	firstAt := strings.Index(detail, `"`+first+`"`)
+	secondAt := strings.Index(detail, `"`+second+`"`)
+	duplicateAt := strings.LastIndex(detail, `"`+first+`"`)
+	if firstAt < 0 || secondAt < firstAt || duplicateAt < secondAt {
+		t.Errorf("detail does not preserve candidate order and duplicates: %q", detail)
+	}
+	for _, want := range []string{`{"env": ...}`, "*.tchori.json", "no built-in or provider-specific", "add the name"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("detail %q does not contain guidance %q", detail, want)
+		}
+	}
+}
+
+func TestComposeMalformedEnvCandidateLists(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []any
+		want    string
+	}{
+		{name: "empty", payload: []any{}, want: "at least one environment variable name"},
+		{name: "first element is not a string", payload: []any{1}, want: "index 0"},
+		{name: "later element is not a string", payload: []any{"A", 2}, want: "index 1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ty := cty.Object(map[string]cty.Type{"token": cty.String})
+			raw := map[string]any{"token": map[string]any{"env": tt.payload}}
+			_, diags := Compose(raw, ty, true, nil)
+			if !diags.HasErrors() {
+				t.Fatal("Compose succeeded; want invalid env wrapper diagnostic")
+			}
+			if diags[0].Summary != "invalid env wrapper" || !strings.Contains(diags[0].Detail, tt.want) {
+				t.Errorf("diagnostic = %+v, want invalid env wrapper containing %q", diags[0], tt.want)
+			}
+		})
+	}
+}
+
+func TestComposeEnvNonWrapperPayloads(t *testing.T) {
+	for _, payload := range []any{nil, map[string]any{"a": "b"}} {
+		ty := cty.Object(map[string]cty.Type{"token": cty.String})
+		raw := map[string]any{"token": map[string]any{"env": payload}}
+		_, diags := Compose(raw, ty, true, nil)
+		if !diags.HasErrors() || diags[0].Summary != "type mismatch" {
+			t.Errorf("payload %#v diagnostics = %+v, want type mismatch", payload, diags)
+		}
+	}
+}
+
+func TestComposeEnvCandidateListTypeSurfaces(t *testing.T) {
+	for _, primitive := range []cty.Type{cty.Bool, cty.Number} {
+		ty := cty.Object(map[string]cty.Type{"value": primitive})
+		raw := map[string]any{"value": map[string]any{"env": []any{"A", "B"}}}
+		_, diags := Compose(raw, ty, true, nil)
+		if !diags.HasErrors() || diags[0].Summary != "invalid env wrapper" {
+			t.Errorf("type %s diagnostics = %+v, want invalid env wrapper", primitive.FriendlyName(), diags)
+		}
+	}
+
+	// At a map-of-lists type, the same shape remains ordinary data.
+	mapTy := cty.Object(map[string]cty.Type{"labels": cty.Map(cty.List(cty.String))})
+	got, diags := Compose(map[string]any{
+		"labels": map[string]any{"env": []any{"a", "b"}},
+	}, mapTy, true, nil)
+	if diags.HasErrors() {
+		t.Fatalf("plain map data produced diagnostics: %+v", diags)
+	}
+	wantMap := cty.MapVal(map[string]cty.Value{
+		"env": cty.ListVal([]cty.Value{cty.StringVal("a"), cty.StringVal("b")}),
+	})
+	if value := got.GetAttr("labels"); !value.RawEquals(wantMap) {
+		t.Errorf("labels = %#v, want env key preserved as plain list data", value)
+	}
+
+	// An object with another key is not the exact wrapper shape.
+	stringTy := cty.Object(map[string]cty.Type{"token": cty.String})
+	_, diags = Compose(map[string]any{
+		"token": map[string]any{"env": "A", "other": 1},
+	}, stringTy, true, nil)
+	if !diags.HasErrors() || diags[0].Summary != "type mismatch" {
+		t.Errorf("multi-key object diagnostics = %+v, want type mismatch", diags)
+	}
+}
+
+func TestComposeEnvCandidateListDisallowed(t *testing.T) {
+	ty := cty.Object(map[string]cty.Type{"token": cty.String})
+	raw := map[string]any{"token": map[string]any{"env": []any{"A", "B"}}}
+	_, diags := Compose(raw, ty, false, nil)
+	if !diags.HasErrors() || diags[0].Summary != "env wrappers are only allowed in provider config" {
+		t.Errorf("diagnostics = %+v, want provider-config-only rejection", diags)
+	}
+}
+
+func stringPointer(value string) *string {
+	return &value
+}
+
+func unsetEnv(t *testing.T, name string) {
+	t.Helper()
+	t.Setenv(name, "restore-for-cleanup")
+	if err := os.Unsetenv(name); err != nil {
+		t.Fatalf("Unsetenv(%q): %v", name, err)
+	}
+}
+
 func TestComposeEnvWrapperNonString(t *testing.T) {
 	ty := cty.Object(map[string]cty.Type{"count": cty.Number})
 	raw := map[string]any{"count": map[string]any{"env": "SOME_VAR"}}
