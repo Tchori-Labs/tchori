@@ -1,11 +1,48 @@
 package provider
 
 import (
+	"context"
+	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"github.com/tchori-labs/tchori/internal/provider/proto/tfplugin5"
 	"github.com/tchori-labs/tchori/internal/provider/proto/tfplugin6"
 )
+
+func TestProtocol5GatewayHTMLDiagnosticContext(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "terraform-provider-tchoritest5")
+	cmd := exec.Command("go", "build", "-o", bin, "./internal/provider/testprovider5") //nolint:gosec // fixed build command and test-owned output path
+	cmd.Dir = filepath.Join("..", "..")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build protocol-5 test provider: %v\n%s", err, out)
+	}
+
+	ctx := context.Background()
+	client, err := Launch(ctx, bin)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	schemas, ds := client.Schemas(ctx)
+	if ds.HasErrors() {
+		t.Fatalf("Schemas: %#v", ds)
+	}
+	schema := schemas.ResourceTypes["tchoritest5_thing"]
+	current, ds := Compose(map[string]any{"name": "gateway_html"}, schema.Block.ImpliedType(), false, nil)
+	if ds.HasErrors() {
+		t.Fatalf("Compose: %#v", ds)
+	}
+	_, _, ds = client.ReadResource(ctx, "tchoritest5_thing", current, nil)
+	if len(ds) != 1 || ds[0].Summary != "Error reading project" || ds[0].Detail != "decoding response: invalid character '<' looking for beginning of value" || ds[0].Address != "" {
+		t.Fatalf("protocol-5 diagnostic conversion = %#v", ds)
+	}
+
+	ds = Context("tchoritest5_thing.web", ds)
+	if len(ds) != 2 || ds[0].Address != "tchoritest5_thing.web" || ds[1].Severity != "warning" || ds[1].Address != "tchoritest5_thing.web" {
+		t.Fatalf("contextual protocol-5 diagnostics = %#v", ds)
+	}
+}
 
 func TestDynamicValue5to6(t *testing.T) {
 	if got := dynamicValue5to6(nil); got != nil {

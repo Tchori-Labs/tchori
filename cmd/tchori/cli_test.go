@@ -112,6 +112,27 @@ func runCLIEnv(t *testing.T, dir string, env map[string]string, args ...string) 
 
 // writeConfig writes a one-provider one-resource config whose provider is
 // resolved from the type prefix (tchoritest_thing -> tchoritest).
+func writeNamedConfig(t *testing.T, dir, address, name, prefix string) {
+	t.Helper()
+	cfg := fmt.Sprintf(`{
+  "providers": {
+    "tchoritest": {
+      "source": "tchori-labs/tchoritest",
+      "version": "0.0.1",
+      "config": {"prefix": %q}
+    }
+  },
+  "resources": {
+    %q: {
+      "config": {"name": %q}
+    }
+  }
+}`, prefix, address, name)
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
 func writeConfig(t *testing.T, dir, name string) {
 	t.Helper()
 	cfg := fmt.Sprintf(`{
@@ -136,6 +157,42 @@ func writeConfig(t *testing.T, dir, name string) {
 // writeConfig5 writes a one-provider one-resource config against the
 // protocol-5 fake provider (tchoritest5_thing -> tchoritest5), proving the
 // tfplugin5 adapter composes with the full command surface.
+func decodeDiagnosticLines(t *testing.T, stderr string) []struct {
+	Severity string `json:"severity"`
+	Summary  string `json:"summary"`
+	Detail   string `json:"detail"`
+	Address  string `json:"address"`
+} {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(stderr), "\n")
+	out := make([]struct {
+		Severity string `json:"severity"`
+		Summary  string `json:"summary"`
+		Detail   string `json:"detail"`
+		Address  string `json:"address"`
+	}, 0, len(lines))
+	for _, line := range lines {
+		// terraform-plugin-go writes its own timestamped provider log lines to
+		// the inherited stderr when a fake RPC returns an error diagnostic.
+		// The engine diagnostics themselves remain one compact JSON object per
+		// line; ignore those provider-subprocess logs here.
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var d struct {
+			Severity string `json:"severity"`
+			Summary  string `json:"summary"`
+			Detail   string `json:"detail"`
+			Address  string `json:"address"`
+		}
+		if err := json.Unmarshal([]byte(line), &d); err != nil {
+			t.Fatalf("stderr line is not one compact JSON diagnostic: %v\nline: %s\nstderr: %s", err, line, stderr)
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
 func writeConfig5(t *testing.T, dir, name string) {
 	t.Helper()
 	cfg := fmt.Sprintf(`{
@@ -514,6 +571,82 @@ func TestCLILifecycleProtocol5(t *testing.T) {
 	}
 }
 
+func TestPlanGatewayHTMLDiagnosticsAreAttributedJSONLines(t *testing.T) {
+	const addr = "tchoritest_thing.web"
+	dir := t.TempDir()
+	writeNamedConfig(t, dir, addr, "gateway_html", "t-")
+	stateDoc := `{
+  "format_version": "1.0",
+  "serial": 1,
+  "resources": {
+    "tchoritest_thing.web": {
+      "type": "tchoritest_thing",
+      "provider": "tchoritest",
+      "attributes": {"echo":"gateway_html","id":"id-gateway_html","name":"gateway_html","replace_me":null,"rules":null,"tags":null}
+    }
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(stateDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, code := runCLI(t, dir, "plan", "--plugin-dir="+pluginDir, "-json")
+	if code != 1 {
+		t.Fatalf("plan: exit %d, want 1\nstderr: %s", code, stderr)
+	}
+	ds := decodeDiagnosticLines(t, stderr)
+	if len(ds) != 2 {
+		t.Fatalf("diagnostics = %#v, want error and one hint", ds)
+	}
+	if ds[0].Severity != "error" || ds[0].Address != addr || ds[0].Summary != "Error reading project" || ds[0].Detail != "decoding response: invalid character '<' looking for beginning of value" {
+		t.Fatalf("provider diagnostic = %#v", ds[0])
+	}
+	if ds[1].Severity != "warning" || ds[1].Address != addr || ds[1].Summary != "provider received a non-JSON response (HTML)" {
+		t.Fatalf("hint diagnostic = %#v", ds[1])
+	}
+}
+
+func TestConfigureGatewayHTMLDiagnosticHasProviderAddress(t *testing.T) {
+	dir := t.TempDir()
+	writeNamedConfig(t, dir, "tchoritest_thing.web", "demo", "gateway_html")
+	_, stderr, code := runCLI(t, dir, "validate", "--plugin-dir="+pluginDir)
+	if code != 1 {
+		t.Fatalf("validate: exit %d, want 1\nstderr: %s", code, stderr)
+	}
+	ds := decodeDiagnosticLines(t, stderr)
+	if len(ds) != 2 || ds[0].Address != "provider.tchoritest" || ds[1].Address != "provider.tchoritest" || ds[1].Severity != "warning" {
+		t.Fatalf("configure diagnostics = %#v", ds)
+	}
+}
+
+func TestImportAndPostImportReadDiagnosticsHaveResourceAddress(t *testing.T) {
+	const addr = "tchoritest_thing.web"
+	t.Run("ImportResource", func(t *testing.T) {
+		dir := t.TempDir()
+		writeNamedConfig(t, dir, addr, "demo", "t-")
+		_, stderr, code := runCLI(t, dir, "import", "--plugin-dir="+pluginDir, addr, "missing")
+		if code != 1 {
+			t.Fatalf("import: exit %d, want 1\nstderr: %s", code, stderr)
+		}
+		ds := decodeDiagnosticLines(t, stderr)
+		if len(ds) != 1 || ds[0].Summary != "resource does not exist" || ds[0].Address != addr {
+			t.Fatalf("import diagnostics = %#v", ds)
+		}
+	})
+	t.Run("post-import ReadResource", func(t *testing.T) {
+		dir := t.TempDir()
+		writeNamedConfig(t, dir, addr, "gateway_html", "t-")
+		_, stderr, code := runCLI(t, dir, "import", "--plugin-dir="+pluginDir, addr, "t-id-gateway_html")
+		if code != 1 {
+			t.Fatalf("import refresh: exit %d, want 1\nstderr: %s", code, stderr)
+		}
+		ds := decodeDiagnosticLines(t, stderr)
+		if len(ds) != 2 || ds[0].Summary != "Error reading project" || ds[0].Address != addr || ds[1].Severity != "warning" || ds[1].Address != addr {
+			t.Fatalf("post-import refresh diagnostics = %#v", ds)
+		}
+	})
+}
+
 func TestValidateInvalidName(t *testing.T) {
 	dir := t.TempDir()
 	writeConfig(t, dir, "invalid") // fake provider rejects name == "invalid"
@@ -528,6 +661,9 @@ func TestValidateInvalidName(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "invalid name") {
 		t.Errorf("stderr does not carry the provider's diagnostic summary: %q", stderr)
+	}
+	if !strings.Contains(stderr, `"address":"tchoritest_thing.demo"`) {
+		t.Errorf("stderr does not attribute the provider diagnostic: %q", stderr)
 	}
 }
 

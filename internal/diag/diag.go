@@ -29,6 +29,30 @@ type Diagnostic struct {
 // Diagnostics is an ordered list of Diagnostic values.
 type Diagnostics []Diagnostic
 
+// InContext attributes provider diagnostics to the engine context that issued
+// their RPC. An empty diagnostic address becomes ctx; an existing provider
+// attribute path is qualified as ctx.Address. The returned slice is a copy so
+// callers never mutate the provider-owned batch.
+//
+// Apply InContext exactly once, at the boundary where provider RPC diagnostics
+// enter engine code that knows the address. Applying it twice double-prefixes
+// existing addresses.
+func (ds Diagnostics) InContext(ctx string) Diagnostics {
+	if len(ds) == 0 || ctx == "" {
+		return ds
+	}
+	out := make(Diagnostics, len(ds))
+	copy(out, ds)
+	for i := range out {
+		if out[i].Address == "" {
+			out[i].Address = ctx
+		} else {
+			out[i].Address = ctx + "." + out[i].Address
+		}
+	}
+	return out
+}
+
 // HasErrors reports whether ds contains at least one Error-severity
 // Diagnostic.
 func (ds Diagnostics) HasErrors() bool {

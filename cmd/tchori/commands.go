@@ -87,6 +87,7 @@ func runValidate(cmd *cobra.Command, _ []string) (int, error) {
 			continue
 		}
 		vds := rt.Providers[r.Provider].ValidateResource(ctx, r.Type, cv)
+		vds = provider.Context(addr, vds)
 		emitDiags(vds)
 		if vds.HasErrors() {
 			failed = true
@@ -414,12 +415,14 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 	ty := schema.Block.ImpliedType()
 
 	imported, private, ds := client.ImportResource(ctx, res.Type, id, ty)
+	ds = provider.Context(address, ds)
 	emitDiags(ds)
 	if ds.HasErrors() {
 		return 1, nil
 	}
 
 	refreshed, refreshedPrivate, ds := client.ReadResource(ctx, res.Type, imported, private)
+	ds = provider.Context(address, ds)
 	emitDiags(ds)
 	if ds.HasErrors() {
 		return 1, nil

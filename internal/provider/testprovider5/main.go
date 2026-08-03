@@ -207,6 +207,15 @@ func (s *server) ReadResource(ctx context.Context, req *tfprotov5.ReadResourceRe
 				}
 				return &tfprotov5.ReadResourceResponse{NewState: &nullDV}, nil
 			}
+			// TC-050 / issue #52 reproduction hook: mirror the protocol-6
+			// fake's unpathed Coolify HTML decode failure byte-for-byte.
+			if name == "gateway_html" {
+				return &tfprotov5.ReadResourceResponse{Diagnostics: []*tfprotov5.Diagnostic{{
+					Severity: tfprotov5.DiagnosticSeverityError,
+					Summary:  "Error reading project",
+					Detail:   "decoding response: invalid character '<' looking for beginning of value",
+				}}}, nil
+			}
 		}
 	}
 	// No backing store: echo current state (and private) unchanged.

@@ -293,6 +293,15 @@ func (s *server) ConfigureProvider(ctx context.Context, req *tfprotov6.Configure
 			}
 		}
 	}
+	// TC-050 / issue #52 reproduction hook: emulate a provider decoding an
+	// identity-aware proxy's HTML response during configuration.
+	if s.prefix == "gateway_html" {
+		return &tfprotov6.ConfigureProviderResponse{Diagnostics: []*tfprotov6.Diagnostic{{
+			Severity: tfprotov6.DiagnosticSeverityError,
+			Summary:  "Error reading project",
+			Detail:   "decoding response: invalid character '<' looking for beginning of value",
+		}}}, nil
+	}
 	return &tfprotov6.ConfigureProviderResponse{}, nil
 }
 
@@ -394,6 +403,42 @@ func (s *server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 	if !knownResourceType(req.TypeName) {
 		return &tfprotov6.ReadResourceResponse{Diagnostics: []*tfprotov6.Diagnostic{unknownResourceTypeDiagnostic(req.TypeName)}}, nil
 	}
+	if req.TypeName == "tchoritest_thing" {
+		cur, err := req.CurrentState.Unmarshal(thingType)
+		if err != nil {
+			return nil, err
+		}
+		if !cur.IsNull() {
+			var attrs map[string]tftypes.Value
+			if err := cur.As(&attrs); err != nil {
+				return nil, err
+			}
+			var name string
+			if n := attrs["name"]; n.IsKnown() && !n.IsNull() {
+				if err := n.As(&name); err != nil {
+					return nil, err
+				}
+			}
+			// TC-050 / issue #52 reproduction hooks: gateway_html mirrors the
+			// Coolify provider's unpathed decode error byte-for-byte, while
+			// gateway_attr proves provider attribute paths are qualified.
+			switch name {
+			case "gateway_html":
+				return &tfprotov6.ReadResourceResponse{Diagnostics: []*tfprotov6.Diagnostic{{
+					Severity: tfprotov6.DiagnosticSeverityError,
+					Summary:  "Error reading project",
+					Detail:   "decoding response: invalid character '<' looking for beginning of value",
+				}}}, nil
+			case "gateway_attr":
+				return &tfprotov6.ReadResourceResponse{Diagnostics: []*tfprotov6.Diagnostic{{
+					Severity:  tfprotov6.DiagnosticSeverityError,
+					Summary:   "invalid remote name",
+					Detail:    "the remote API rejected this attribute",
+					Attribute: tftypes.NewAttributePath().WithAttributeName("name"),
+				}}}, nil
+			}
+		}
+	}
 	// No backing store: echo current state (and private) unchanged.
 	return &tfprotov6.ReadResourceResponse{
 		NewState: req.CurrentState,
@@ -437,6 +482,21 @@ func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanReso
 	var attrs map[string]tftypes.Value
 	if err := proposed.As(&attrs); err != nil {
 		return nil, err
+	}
+	var name string
+	if n := attrs["name"]; n.IsKnown() && !n.IsNull() {
+		if err := n.As(&name); err != nil {
+			return nil, err
+		}
+	}
+	// TC-050 fixture for PlanResourceChange attribution, paired with the
+	// existing "invalid" ValidateResourceConfig hook.
+	if name == "invalid_plan" {
+		return &tfprotov6.PlanResourceChangeResponse{Diagnostics: []*tfprotov6.Diagnostic{{
+			Severity: tfprotov6.DiagnosticSeverityError,
+			Summary:  "invalid planned name",
+			Detail:   `the name "invalid_plan" cannot be planned`,
+		}}}, nil
 	}
 
 	var priorAttrs map[string]tftypes.Value
@@ -608,8 +668,34 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 	if err != nil {
 		return nil, err
 	}
-	// Destroy: planned state is null; acknowledge the deletion.
+	// Destroy: planned state is null. The explode_destroy fixture returns a
+	// provider diagnostic so TC-050 can prove the destroy call-site context;
+	// all other resources acknowledge deletion unchanged.
 	if planned.IsNull() {
+		prior, err := req.PriorState.Unmarshal(thingType)
+		if err != nil {
+			return nil, err
+		}
+		if !prior.IsNull() {
+			var attrs map[string]tftypes.Value
+			if err := prior.As(&attrs); err != nil {
+				return nil, err
+			}
+			var name string
+			if err := attrs["name"].As(&name); err != nil {
+				return nil, err
+			}
+			if name == "explode_destroy" {
+				return &tfprotov6.ApplyResourceChangeResponse{
+					NewState: req.PriorState,
+					Diagnostics: []*tfprotov6.Diagnostic{{
+						Severity: tfprotov6.DiagnosticSeverityError,
+						Summary:  "destroy exploded",
+						Detail:   `the name "explode_destroy" always fails to destroy`,
+					}},
+				}, nil
+			}
+		}
 		return &tfprotov6.ApplyResourceChangeResponse{NewState: req.PlannedState}, nil
 	}
 	var attrs map[string]tftypes.Value

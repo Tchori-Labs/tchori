@@ -303,6 +303,7 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 // "destroy this object" — then removes the resource from state and saves.
 func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeName, addr string, ty cty.Type, prior cty.Value, priorPrivate []byte) diag.Diagnostics {
 	newState, _, ds := client.ApplyResource(ctx, typeName, prior, cty.NullVal(ty), cty.NullVal(ty), priorPrivate)
+	ds = provider.Context(addr, ds)
 	if ds.HasErrors() {
 		return ds
 	}
@@ -356,6 +357,7 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	planned = resolvePlannedUnknowns(planned, cfgVal)
 
 	newState, newPrivate, applyDs := client.ApplyResource(ctx, typeName, prior, planned, cfgVal, ch.Private)
+	applyDs = provider.Context(addr, applyDs)
 	ds = append(ds, applyDs...)
 	if ds.HasErrors() {
 		return ds
