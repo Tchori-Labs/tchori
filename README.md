@@ -412,8 +412,9 @@ Manager test network.
 ## Security
 
 Found a suspected vulnerability? Follow the private disclosure process in
-[`SECURITY.md`](SECURITY.md). Do not disclose it in a public issue, pull request,
-or discussion.
+[`SECURITY.md`](SECURITY.md) and the maintainer/board procedure in the
+[security disclosure channel runbook](docs/security-disclosure-channel.md). Do
+not disclose it in a public issue, pull request, or discussion.
 
 ## License
 

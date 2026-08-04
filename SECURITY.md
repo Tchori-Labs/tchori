@@ -9,6 +9,8 @@ guarantees.
 
 ## Reporting a vulnerability
 
+<!-- security-channel: pending -->
+
 Report suspected vulnerabilities privately through GitHub private vulnerability
 reporting: open the repository's **Security** tab, choose **Report a
 vulnerability**, and submit a private GitHub Security Advisory.
@@ -23,8 +25,10 @@ GitHub private vulnerability reporting is unavailable.
 > currently enabled, and no board-approved private security contact is
 > documented. Maintainers must enable private vulnerability reporting and/or
 > designate and document a private fallback contact before this policy is fully
-> operative. Until then, do not publish vulnerability details through a public
-> repository channel.
+> operative. Follow the [security disclosure channel runbook](docs/security-disclosure-channel.md)
+> for the exact repository-admin and board procedure and its read-only audit.
+> Until then, do not publish vulnerability details through a public repository
+> channel.
 
 ## What to include
 
