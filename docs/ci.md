@@ -26,7 +26,10 @@ a clean control before the required context can pass. The Go test run covers:
   client; and
 - the `internal/ci` policy guard that prevents the live smoke from gaining a
   `pull_request` or `push` trigger and prevents public-registry references from
-  entering non-smoke e2e sources.
+  entering non-smoke e2e sources; and
+- the `internal/security` disclosure-policy guard over `SECURITY.md` and the
+  README, plus its stubbed-`gh` matrix harness for
+  `scripts/verify-security-contact.sh`.
 
 The required `e2e` job runs checkout, Go setup, and module download with normal
 network access. Its e2e test step runs the complete CLI lifecycle,

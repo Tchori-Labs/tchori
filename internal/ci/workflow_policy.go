@@ -17,12 +17,37 @@ type workflowDoc struct {
 }
 
 type workflowJob struct {
-	TimeoutMinutes  *int              `yaml:"timeout-minutes"`
-	Needs           any               `yaml:"needs"`
-	If              string            `yaml:"if"`
-	ContinueOnError bool              `yaml:"continue-on-error"`
-	Env             map[string]string `yaml:"env"`
-	Steps           []workflowStep    `yaml:"steps"`
+	TimeoutMinutes  *int                `yaml:"timeout-minutes"`
+	Needs           any                 `yaml:"needs"`
+	If              string              `yaml:"if"`
+	ContinueOnError bool                `yaml:"continue-on-error"`
+	Environment     workflowEnvironment `yaml:"environment"`
+	Permissions     map[string]string   `yaml:"permissions"`
+	Env             map[string]string   `yaml:"env"`
+	Steps           []workflowStep      `yaml:"steps"`
+}
+
+type workflowEnvironment struct {
+	Name string
+}
+
+func (e *workflowEnvironment) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		e.Name = node.Value
+		return nil
+	case yaml.MappingNode:
+		var value struct {
+			Name string `yaml:"name"`
+		}
+		if err := node.Decode(&value); err != nil {
+			return err
+		}
+		e.Name = value.Name
+		return nil
+	default:
+		return fmt.Errorf("environment must be a string or mapping")
+	}
 }
 
 type workflowStep struct {

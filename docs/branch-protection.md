@@ -180,6 +180,8 @@ rulebook in [`AGENTS.md`](../AGENTS.md):
   from `.github/CODEOWNERS` (`@VictorCano`).
 - Agents never merge or approve their own pull requests.
 - Releases still require board sign-off recorded in `Tchori-Labs/main`.
+  The separate protected `release` Environment is declared, applied, and
+  audited through the [release-Environment runbook](releasing.md#release-environment-requirements).
   Agents may prepare a release PR; they never tag or push a release.
 
 The release and board-sign-off rules are unchanged by this ruleset.

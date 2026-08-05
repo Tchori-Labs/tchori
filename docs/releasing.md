@@ -11,26 +11,97 @@ the `Tchori-Labs/main` repository. Agents may prepare a release change, but they
 must not create or push the tag, dispatch the release workflow, approve its
 deployment, or publish the release.
 
-A repository administrator must configure the GitHub Environment named
-`release` before the first release:
+The live enforcement mechanism is the GitHub Environment named `release`.
+The reviewable source of truth is
+[`.github/environments/release.json`](../.github/environments/release.json),
+with its exact custom policies declared in
+[`.github/environments/release-deployment-branch-policies.json`](../.github/environments/release-deployment-branch-policies.json).
+Committing these files does not apply the Environment.
 
-1. In **Settings → Environments → release**, add `@VictorCano` as a required
-   reviewer (the same human review intent encoded by `CODEOWNERS`). Prevent
-   self-review and administrator bypass where the repository plan supports
-   those controls.
-2. Set deployment branch and tag rules to allow only the protected `main`
-   branch and tags matching `v*`. A manual dispatch runs from `main` but must
-   name an existing `v*` tag; a tag push runs from that tag.
-3. Confirm these rules in repository settings before every release-process
-   change. Merely declaring `environment: release` in YAML does not create or
-   protect the Environment.
+### Release Environment requirements
 
-Both release jobs in `.github/workflows/release.yml` reference this
-Environment, so GitHub pauses the selected job for its required human review.
-The `dry-run` job has only `contents: read`, `id-token: write`, and
-`attestations: write`; it cannot create or modify a GitHub Release. The
-`publish` job alone receives job-scoped `contents: write` in addition to OIDC
-and attestation access. No other workflow or job receives publish permissions.
+| Requirement | Declared policy |
+| --- | --- |
+| One human reviews every selected release job. | The only required reviewer is `@VictorCano` (GitHub user id `6369606`), matching [`.github/CODEOWNERS`](../.github/CODEOWNERS). |
+| The actor who initiated a deployment cannot approve it. | `prevent_self_review` is `true`. |
+| Only the release branch and release tags may deploy. | Custom deployment policies contain exactly branch `main` and tag pattern `v*`; protected-branches mode is disabled because it cannot express this branch-and-tag pair. |
+| Both release modes remain gated. | The `dry-run` and `publish` jobs in `.github/workflows/release.yml` both declare `environment: release`; neither may be ungated. |
+| Publish access remains least-privileged. | `dry-run` keeps `contents: read`; only `publish` receives `contents: write`. Both jobs retain their job-scoped OIDC and attestation permissions. |
+
+GitHub's Environment REST API exposes `prevent_self_review`, but it does not
+expose a per-Environment administrator-bypass toggle. No unsupported field is
+invented in the payload. The related no-standing-admin-bypass control is the
+empty `bypass_actors` list in the protected-main ruleset documented in
+[`branch-protection.md`](branch-protection.md); it is a branch-ruleset control,
+not an Environment property.
+
+### Apply (repository admin only)
+
+These commands mutate live repository settings. They are exclusively a human
+repository-administrator step. An agent whose permissions do not show
+`admin: true` must stop after preparing the payload and must never claim that
+protection is active.
+
+From the repository root, confirm repository administration, create or update
+the Environment from the committed PUT body, then create the two declared
+custom deployment policies:
+
+```sh
+gh api repos/Tchori-Labs/tchori --jq .permissions
+# Continue only when the response contains: "admin": true
+
+gh api --method PUT repos/Tchori-Labs/tchori/environments/release \
+  --input .github/environments/release.json
+
+gh api --method POST \
+  repos/Tchori-Labs/tchori/environments/release/deployment-branch-policies \
+  -f name=main -f type=branch
+
+gh api --method POST \
+  repos/Tchori-Labs/tchori/environments/release/deployment-branch-policies \
+  -f 'name=v*' -f type=tag
+```
+
+If policies already exist, reconcile them to the exact declared pair rather
+than creating duplicates. Preserve the API responses as evidence. A failed or
+partial response is not proof of protection.
+
+### Audit and verify
+
+Read the live Environment and its independently managed custom policies, then
+run the fail-closed verifier from the repository root:
+
+```sh
+gh api repos/Tchori-Labs/tchori/environments/release
+gh api \
+  repos/Tchori-Labs/tchori/environments/release/deployment-branch-policies
+scripts/verify-release-environment.sh
+```
+
+The verifier prints a PASS or FAIL for each machine-auditable criterion and
+exits non-zero when the Environment is absent, weakened, or unreadable. An
+all-PASS run proves live structure only: it does not replace the board
+sign-off gate or the per-deployment `@VictorCano` approval in maintainer
+runbook step 4 below. Merely declaring `environment: release` in workflow YAML
+does not create or protect the Environment.
+
+### Current application status
+
+**PENDING as of 2026-08-03.** The live list response is
+`{"total_count":0,"environments":[]}`, and the detail and deployment-policy
+endpoints return HTTP 404. The non-admin Tchorizo token cannot apply the
+payload. The administrator handoff is recorded in
+[issue #77](https://github.com/Tchori-Labs/tchori/issues/77#issuecomment-5165580020),
+where eventual admin-visible readback and all-PASS evidence must also be
+recorded. Until that evidence exists,
+[TC-059](https://github.com/Tchori-Labs/tchori/issues/66)
+remains blocked together with its separate TC-068 board-decision gate.
+
+Both release jobs reference this Environment, so once it is correctly applied
+GitHub pauses the selected job for required human review. The `dry-run` job
+cannot create or modify a GitHub Release; the `publish` job alone receives
+job-scoped `contents: write`. No other workflow or job receives publish
+permissions.
 
 ## Maintainer runbook
 
