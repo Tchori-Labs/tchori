@@ -185,6 +185,4 @@ rulebook in [`AGENTS.md`](../AGENTS.md):
   Agents may prepare a release PR; they never tag or push a release.
 
 The release and board-sign-off rules are unchanged by this ruleset.
-`AGENTS.md` remains the authoritative human-gate rulebook. TC-007's
-complementary triage and merge ownership documentation can be cross-linked
-here after `docs/task-ownership.md` lands.
+`AGENTS.md` remains the authoritative human-gate rulebook.

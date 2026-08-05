@@ -405,10 +405,6 @@ upgrade or broader code change. Vulnerabilities are never suppressed or given
 a successful exit code without an explicit written rationale that names the
 advisory; any suppression must also be documented inline where it is applied.
 
-Provider acceptance: `docs/acceptance-admanager.md` is the manual checklist
-for running `terraform-provider-admanager` under tchori against a Google Ad
-Manager test network.
-
 ## Security
 
 Found a suspected vulnerability? Follow the private disclosure process in
