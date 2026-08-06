@@ -269,6 +269,9 @@ After a successful import, run `tchori plan` to confirm it landed cleanly: a
 correctly declared config block should show no changes against the newly
 imported state.
 
+A credentialed operator adopting the existing `tchori.com.br` Cloudflare DNS
+records should follow the [manual Cloudflare import acceptance runbook](docs/acceptance-cloudflare-import.md).
+
 ## MCP server
 
 `tchori mcp` serves MCP over stdio from the directory holding your config and
