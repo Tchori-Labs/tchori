@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -84,18 +86,44 @@ func ReleaseWorkflowMatchesPolicy(workflowYAML []byte) error {
 			return fmt.Errorf("%s job must declare environment: release", name)
 		}
 	}
-	if got := doc.Jobs["dry-run"].Permissions["contents"]; got != "read" {
+	workflowLevelPermissions, err := parseWorkflowPermissions(workflowYAML)
+	if err != nil {
+		return err
+	}
+	if got := effectiveContentsPermission(doc.Jobs["dry-run"], workflowLevelPermissions); got != "read" {
 		return fmt.Errorf("dry-run job contents permission = %q, want read", got)
 	}
-	if got := doc.Jobs["publish"].Permissions["contents"]; got != "write" {
+	if got := effectiveContentsPermission(doc.Jobs["publish"], workflowLevelPermissions); got != "write" {
 		return fmt.Errorf("publish job contents permission = %q, want write", got)
 	}
 	for name, job := range doc.Jobs {
-		if name != "publish" && job.Permissions["contents"] == "write" {
+		if name != "publish" && effectiveContentsPermission(job, workflowLevelPermissions) == "write" {
 			return fmt.Errorf("%s job must not receive contents: write; only publish may write", name)
 		}
 	}
 	return nil
+}
+
+// parseWorkflowPermissions extracts the workflow-level permissions block,
+// which a job without a job-level permissions block inherits in full.
+func parseWorkflowPermissions(workflowYAML []byte) (workflowPermissions, error) {
+	var top struct {
+		Permissions workflowPermissions `yaml:"permissions"`
+	}
+	if err := yaml.Unmarshal(workflowYAML, &top); err != nil {
+		return nil, fmt.Errorf("parse workflow yaml: %w", err)
+	}
+	return top.Permissions, nil
+}
+
+// effectiveContentsPermission resolves the contents permission a job
+// actually runs with: its own job-level permissions block if it declares
+// one, otherwise the workflow-level block it silently inherits.
+func effectiveContentsPermission(job workflowJob, workflowLevelPermissions workflowPermissions) string {
+	if job.Permissions != nil {
+		return job.Permissions["contents"]
+	}
+	return workflowLevelPermissions["contents"]
 }
 
 // ValidateReleaseEnvironmentPayload checks the committed PUT body and the
@@ -174,6 +202,9 @@ func ValidateLiveReleaseEnvironment(environmentsJSON, environmentJSON, branchPol
 	if err := json.Unmarshal(branchPoliciesJSON, &policies); err != nil {
 		violations = append(violations, fmt.Sprintf("release deployment branch policies are not auditable: %v", err))
 		return violations
+	}
+	if policies.TotalCount > len(policies.BranchPolicies) {
+		violations = append(violations, fmt.Sprintf("release deployment branch policies response is truncated: total_count %d exceeds the %d entries returned (paginate to fetch the rest)", policies.TotalCount, len(policies.BranchPolicies)))
 	}
 	violations = append(violations, validateBranchPolicies(policies.BranchPolicies)...)
 	return violations
