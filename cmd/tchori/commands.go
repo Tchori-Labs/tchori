@@ -197,10 +197,17 @@ func planSensitivePredicate(cfg *config.Config, st *state.State, schemas map[str
 					declared, raw = res.SensitiveAttributes, res.Config
 				}
 			}
-			if typeName == "" && st != nil {
+			// Union with state-recorded sensitive paths rather than
+			// overwriting: a resource still present in config may have had
+			// its sensitive_attributes declaration narrowed or removed while
+			// the live remote object still holds the secret value state last
+			// recorded as sensitive.
+			if st != nil {
 				if rs := st.Resources[address]; rs != nil {
-					providerName, typeName = rs.Provider, rs.Type
-					declared = rs.SensitivePaths
+					if typeName == "" {
+						providerName, typeName = rs.Provider, rs.Type
+					}
+					declared = append(append([]string(nil), declared...), rs.SensitivePaths...)
 				}
 			}
 			if ps := schemas[providerName]; ps != nil && typeName != "" {

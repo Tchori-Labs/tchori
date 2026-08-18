@@ -22,7 +22,7 @@ type workflowJob struct {
 	If              string              `yaml:"if"`
 	ContinueOnError bool                `yaml:"continue-on-error"`
 	Environment     workflowEnvironment `yaml:"environment"`
-	Permissions     map[string]string   `yaml:"permissions"`
+	Permissions     workflowPermissions `yaml:"permissions"`
 	Env             map[string]string   `yaml:"env"`
 	Steps           []workflowStep      `yaml:"steps"`
 }
@@ -47,6 +47,37 @@ func (e *workflowEnvironment) UnmarshalYAML(node *yaml.Node) error {
 		return nil
 	default:
 		return fmt.Errorf("environment must be a string or mapping")
+	}
+}
+
+// workflowPermissions is a job's or workflow's permissions block. GitHub
+// Actions accepts either an explicit per-scope mapping or the shorthand
+// strings read-all/write-all. For this policy's purposes (it only inspects
+// the contents scope) the shorthands expand to the equivalent contents
+// permission.
+type workflowPermissions map[string]string
+
+func (p *workflowPermissions) UnmarshalYAML(node *yaml.Node) error {
+	switch node.Kind {
+	case yaml.ScalarNode:
+		switch node.Value {
+		case "read-all":
+			*p = workflowPermissions{"contents": "read"}
+		case "write-all":
+			*p = workflowPermissions{"contents": "write"}
+		default:
+			return fmt.Errorf("permissions string must be read-all or write-all, got %q", node.Value)
+		}
+		return nil
+	case yaml.MappingNode:
+		var value map[string]string
+		if err := node.Decode(&value); err != nil {
+			return err
+		}
+		*p = value
+		return nil
+	default:
+		return fmt.Errorf("permissions must be a string or mapping")
 	}
 }
 

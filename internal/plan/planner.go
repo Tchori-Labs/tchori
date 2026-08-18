@@ -92,7 +92,31 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 			return nil, ds
 		}
 		ty := schema.Block.ImpliedType()
-		spec, specDs := sensitive.Resolve(schema.Block, res.SensitiveAttributes, res.Config)
+
+		// declared is the effective sensitive-path input to spec below: the
+		// union of config's sensitive_attributes and whatever this resource's
+		// state already recorded as sensitive. State sensitivity memory must
+		// be monotonic — a path once recorded as sensitive (a legacy
+		// plaintext write predating the declaration, or a declaration config
+		// has since narrowed or dropped) stays redacted in Change.Before,
+		// Drift, plan -json/-out, and the re-persisted state, not just while
+		// config keeps declaring it. A state-recorded path that no longer
+		// exists in the current schema cannot hold a value there anymore
+		// (the provider dropped or renamed the attribute), so it is filtered
+		// out here rather than handed to sensitive.Resolve, which would
+		// reject an unknown path and hard-fail the whole plan.
+		rs, hasPrior := p.State.Resources[addr]
+		declared := res.SensitiveAttributes
+		if hasPrior {
+			var recalled []string
+			for _, path := range rs.SensitivePaths {
+				if schemaHasPath(schema.Block, path) {
+					recalled = append(recalled, path)
+				}
+			}
+			declared = unionPaths(declared, recalled)
+		}
+		spec, specDs := sensitive.Resolve(schema.Block, declared, res.Config)
 		ds = append(ds, specDs...)
 		if specDs.HasErrors() {
 			return nil, ds
@@ -101,7 +125,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		// Prior value from state, decoded against the schema's implied type.
 		prior := cty.NullVal(ty)
 		var priorPrivate []byte
-		rs, hasPrior := p.State.Resources[addr]
+		var redactedPrior cty.Value
 		if hasPrior {
 			pv, err := provider.DecodeJSON(rs.Attributes, ty)
 			if err != nil {
@@ -110,7 +134,8 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 			}
 			prior = pv
 			priorPrivate = rs.Private
-			_, legacyPaths, err := spec.Redact(prior)
+			var legacyPaths []string
+			redactedPrior, legacyPaths, err = spec.Redact(prior)
 			if err != nil {
 				return nil, append(ds, diag.Errorf(addr, "cannot inspect sensitive state", err.Error()))
 			}
@@ -120,10 +145,16 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		}
 
 		// Refresh: re-read the real object, use the result as prior, and keep
-		// the in-memory state copy in sync. Preserve the persisted reporting
-		// value first so out-of-band changes can be recorded in the plan.
+		// the in-memory state copy in sync.
 		if p.Refresh && hasPrior {
-			recordedAttrs := append(json.RawMessage(nil), rs.Attributes...)
+			// recordedAttrs is the redacted reporting copy of rs.Attributes
+			// used for Drift.Before below, built here (not above) since it is
+			// only ever consumed on this refresh path.
+			recordedAttrs, err := ctyjson.Marshal(redactedPrior, ty)
+			if err != nil {
+				ds = append(ds, diag.Errorf(addr, "cannot encode recorded state", err.Error()))
+				return nil, ds
+			}
 			rv, rpriv, rds := client.ReadResource(ctx, res.Type, prior, priorPrivate)
 			rds = provider.Context(addr, rds)
 			ds = append(ds, rds...)
@@ -161,6 +192,11 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 				rs.Attributes = attrs
 				rs.Private = rpriv
 				rs.Redacted = redactedPaths
+				// spec was built from the union above, so spec.Paths() is
+				// itself the monotonic union of what rs.SensitivePaths held
+				// on entry and this run's declarations: this assignment can
+				// only add newly schema- or config-sensitive paths, never
+				// drop a still-schema-valid recorded one.
 				rs.SensitivePaths = spec.Paths()
 				rs.SensitiveScanned = true
 				prior = rv
@@ -388,6 +424,72 @@ func replaceRequired(prior, planned cty.Value, paths []string) bool {
 
 // attrPath retains the package-private call site while sharing one renderer/parser.
 func attrPath(dotted string) cty.Path { return sensitive.AttrPath(dotted) }
+
+// unionPaths returns the union of a and b, preserving a's order and
+// appending unseen entries from b. sensitive.Resolve sorts and dedupes the
+// effective path set again internally, so the exact order produced here is
+// not load-bearing.
+func unionPaths(a, b []string) []string {
+	if len(b) == 0 {
+		return a
+	}
+	seen := make(map[string]bool, len(a))
+	for _, p := range a {
+		seen[p] = true
+	}
+	out := append([]string(nil), a...)
+	for _, p := range b {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// schemaHasPath reports whether dotted names an attribute or nested block
+// reachable from block, mirroring internal/sensitive's own schema walk
+// (unexported there). It exists so a state-recorded sensitive path from an
+// older provider schema — an attribute the provider has since dropped or
+// renamed — can be pruned from the union above instead of being handed to
+// sensitive.Resolve, which rejects unknown paths and would hard-fail the
+// whole plan over a path that can no longer hold a value anyway.
+func schemaHasPath(block *provider.SchemaBlock, dotted string) bool {
+	return schemaBlockHasPath(block, strings.Split(dotted, "."))
+}
+
+func schemaBlockHasPath(block *provider.SchemaBlock, parts []string) bool {
+	if block == nil || len(parts) == 0 {
+		return false
+	}
+	if nested, ok := block.Blocks[parts[0]]; ok && nested != nil {
+		if len(parts) == 1 {
+			return true
+		}
+		return schemaBlockHasPath(nested.Block, parts[1:])
+	}
+	attr, ok := block.Attributes[parts[0]]
+	if !ok || attr == nil {
+		return false
+	}
+	if len(parts) == 1 {
+		return true
+	}
+	return schemaTypeHasPath(attr.Type, parts[1:])
+}
+
+func schemaTypeHasPath(ty cty.Type, parts []string) bool {
+	for ty.IsListType() || ty.IsSetType() || ty.IsMapType() {
+		ty = ty.ElementType()
+	}
+	if !ty.IsObjectType() || len(parts) == 0 || !ty.HasAttribute(parts[0]) {
+		return false
+	}
+	if len(parts) == 1 {
+		return true
+	}
+	return schemaTypeHasPath(ty.AttributeType(parts[0]), parts[1:])
+}
 
 // nullOutUnknowns is the research-digest workaround for ctyjson.Marshal
 // rejecting unknown values: replace every unknown with a typed null and
