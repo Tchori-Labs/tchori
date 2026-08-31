@@ -314,13 +314,54 @@ explicit policy surface.
 ## Development
 
 ```sh
-go test ./...                         # unit + protocol tests (in-process fake provider)
-go test -race -timeout=2m ./...       # full untagged suite under the race detector
+scripts/check.sh                      # the whole gate, in CI order
+scripts/check.sh fast                 # red/green loop: go test -count=1 ./...
+```
+
+`scripts/check.sh` needs the two pinned external linters on `PATH`:
+
+```sh
+go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.0
+```
+
+The individual test commands it wraps:
+
+```sh
+go test -count=1 ./...                # unit + protocol tests (in-process fake provider)
+go test -count=1 -race -timeout=2m ./...
+                                      # full untagged suite under the race detector
+go test -count=1 -run TestScript ./cmd/tchori
+                                      # CLI acceptance scripts in
+                                      # cmd/tchori/testdata/script/*.txtar
 go test -tags e2e ./e2e -v            # built binary: fake-provider lifecycle, fixture
                                       # registry install, protocol-5 adapter lifecycle
                                       # against a real protocol-5-only binary
                                       # (fixture-based; no network required)
 ```
+
+`-count=1` is deliberate everywhere: with the Go build cache warm, a `go test`
+step can report PASS without executing anything, which is worthless as
+evidence that the suite ran against the current tree.
+
+The `check` job also runs the suite coverage-instrumented
+(`-covermode=atomic -coverprofile=cover.out`) and prints the total to the job
+summary via `scripts/coverage-summary.sh`, which is also the local command:
+
+```sh
+bash scripts/coverage-summary.sh cover.out   # total: (statements) 76.3%
+```
+
+That script excludes the generated `tfplugin{5,6}` protobuf stubs and the
+`testprovider*` fixture binaries: they are 4886 of roughly 7000 profile
+blocks, permanently at 0%, and leaving them in reports 26.5% instead of 76.3%.
+Coverage of the CLI is still understated, because `go test` only attributes
+statements executed inside the test process and the CLI tests run the built
+binary as a subprocess.
+
+Coverage is **measured, not gated**: it is a floor and a trend signal, and it
+cannot distinguish a test written before the code from one written after. The
+order is enforced by review and by `AGENTS.md`, not by a percentage.
 
 CI runs the full race suite directly inside the required `check` job. It
 measured 47.5 seconds cold and 20.8 seconds for a warm three-run stability

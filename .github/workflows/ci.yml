@@ -53,11 +53,17 @@ jobs:
         timeout-minutes: 3
         run: bash scripts/actionlint-verify.sh
 
-      - name: go test
-        run: go test ./...
+      - name: go test (coverage-instrumented)
+        # -count=1 defeats the test cache: a cached PASS is not evidence the
+        # suite ran against this commit. Coverage is measured, not gated.
+        run: go test -count=1 -covermode=atomic -coverprofile=cover.out ./...
+
+      - name: coverage summary
+        run: |
+          bash scripts/coverage-summary.sh cover.out | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: go test (race detector)
-        run: go test -race -timeout=2m ./...
+        run: go test -count=1 -race -timeout=2m ./...
 
   vulncheck:
     name: vulncheck

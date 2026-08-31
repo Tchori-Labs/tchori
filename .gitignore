@@ -2,3 +2,7 @@
 /tchori
 /dist/
 *.test
+
+# coverage profiles produced by scripts/check.sh and the CI check job
+/cover.out
+/cover.filtered.out
