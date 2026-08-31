@@ -331,6 +331,31 @@ two-minute per-package timeout is more than three times the slowest observed
 package (35.8 seconds) while bounding hung tests; tag-gated e2e coverage
 remains in its existing job.
 
+Pull requests target `develop`. The required `pr-source` context rejects any
+pull request into `main` whose head is not `develop`; see
+[`docs/branch-protection.md`](docs/branch-protection.md).
+
+### CLI acceptance scripts
+
+`cmd/tchori/testdata/script/*.txtar` are
+[testscript](https://pkg.go.dev/github.com/rogpeppe/go-internal/testscript)
+acceptance tests for the CLI surface: each file drives the real binary as a
+subprocess and asserts argv handling, stdout, stderr and exit status, with any
+input files embedded in the same archive. They are the cheapest place to write
+a failing test for CLI behavior — a new expectation is a few lines of script,
+not a Go harness.
+
+```sh
+go test -count=1 -run TestScript ./cmd/tchori          # run every script
+go test -count=1 -run 'TestScript/help' ./cmd/tchori   # one script
+go test -count=1 -run TestScript ./cmd/tchori -update  # refresh in-archive goldens
+```
+
+Scripts must invoke the CLI as `exec tchori` (`RequireExplicitExec`), so a
+`tchori` that happens to sit on the host `PATH` can never satisfy a script.
+`$HOME`, the XDG directories and the proxy variables are pinned inside the
+script's work directory, so a script that reaches the network fails closed.
+
 ### Secret scanning
 
 Install the same pinned Gitleaks release used by CI, then scan every fetched Git

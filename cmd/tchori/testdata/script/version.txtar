@@ -1,0 +1,9 @@
+# tchori version prints the engine version as a single bare line on stdout and
+# exits 0. The value is a build-time variable (internal/version.Version, which
+# goreleaser overrides at release time), so what is pinned here is the shape
+# agents parse: exactly one semver line, a trailing newline, nothing else, and
+# a clean stderr.
+
+exec tchori version
+stdout '\A[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+\-]*\n\z'
+! stderr .

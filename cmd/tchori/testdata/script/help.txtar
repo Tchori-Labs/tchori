@@ -1,0 +1,47 @@
+# --help succeeds (exit 0) and writes usage to stdout, never stderr.
+#
+# The root usage is pinned byte for byte against an in-archive golden: it is
+# the CLI's command index, so any added, renamed or re-described command shows
+# up in review as a golden diff instead of slipping through. Refresh it with
+#   go test ./cmd/tchori -run TestScript -update
+# A subcommand's usage is asserted on its stable lines instead, so adding a
+# global flag churns one golden rather than every one of them.
+
+exec tchori --help
+cmp stdout root-help.txt
+! stderr .
+
+exec tchori validate --help
+stdout '^Validate configuration: schema, references, cycles, provider resource checks$'
+stdout '^  tchori validate \[flags\]$'
+stdout '^Global Flags:$'
+stdout '^      --plugin-dir string   directory searched first for provider binaries'
+! stderr .
+
+-- root-help.txt --
+tchori is an agent-native everything-as-code engine
+
+Usage:
+  tchori [command]
+
+Available Commands:
+  apply       Execute a saved plan file (there is no plan-less apply)
+  completion  Generate the autocompletion script for the specified shell
+  destroy     Plan deletion of all managed resources; -out writes the plan, no -out applies after TTY confirmation
+  help        Help about any command
+  import      Adopt an existing real-world resource into state under a config-declared address
+  mcp         Serve state_list/state_show/plan/provider_schema over MCP stdio
+  plan        Compute changes; exit 2 when changes are pending, 0 when none
+  providers   Manage provider binaries
+  state       Inspect the state file
+  validate    Validate configuration: schema, references, cycles, provider resource checks
+  version     Print the tchori engine version
+
+Flags:
+      --chdir string        switch to this directory before running the command
+  -h, --help                help for tchori
+      --json                force machine-readable output even on a TTY
+      --no-color            disable color output (tchori MVP output is already colorless)
+      --plugin-dir string   directory searched first for provider binaries (local development); resolved after -chdir when relative
+
+Use "tchori [command] --help" for more information about a command.
