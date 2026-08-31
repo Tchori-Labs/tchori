@@ -52,15 +52,24 @@ This is the `tchori` engine repo — the product, not the company state root
 
 ## Before opening a PR
 
-Run, from the repo root:
+Run, from the repo root. Install the pinned actionlint version documented in
+`README.md` before running workflow validation:
 ```bash
 gofmt -l .
 go vet ./...
+GOOS=windows go vet ./...
 golangci-lint run
+bash scripts/actionlint-verify.sh
 go test ./...
 ```
-CI's `check` job (`.github/workflows/ci.yml`) re-runs the same four checks
-and is a required status check — it must be green before merge.
+CI's `check` job (`.github/workflows/ci.yml`) re-runs all six checks, validates
+GitHub Actions workflows, and runs the bounded full-suite race detector. It is
+a required status check and must be green before merge.
+
+## Branch protection
+
+See [`docs/branch-protection.md`](docs/branch-protection.md) for the importable
+`main` ruleset and the repository-admin apply, audit, and verification runbook.
 
 ## Security
 

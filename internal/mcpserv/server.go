@@ -17,13 +17,14 @@ import (
 	"github.com/tchori-labs/tchori/internal/plan"
 	"github.com/tchori-labs/tchori/internal/provider"
 	"github.com/tchori-labs/tchori/internal/runtime"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 	"github.com/tchori-labs/tchori/internal/state"
 	"github.com/tchori-labs/tchori/internal/version"
 )
 
 // Serve runs an MCP stdio server exposing exactly:
 //
-//	state_list()                -> {"addresses": [...]}
+//	state_list()                -> {"addresses": [...], "converged": bool, "incomplete_apply"?: {...}}
 //	state_show(address string)  -> the resource's state JSON
 //	plan()                      -> the plan.Plan document as JSON
 //	provider_schema(name string)-> resource-type schemas as JSON
@@ -44,7 +45,7 @@ func newServer(workdir string) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "state_list",
-		Description: "List the addresses of all resources in tchori state.",
+		Description: "List resource addresses and report whether tchori state is converged.",
 	}, h.stateList)
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "state_show",
@@ -95,10 +96,13 @@ func (h *handlers) statePath() string {
 }
 
 type stateListResult struct {
-	Addresses []string `json:"addresses"`
+	Addresses       []string               `json:"addresses"`
+	Converged       bool                   `json:"converged"`
+	IncompleteApply *state.IncompleteApply `json:"incomplete_apply,omitempty"`
 }
 
-// stateList reads state.json only; no providers are launched.
+// stateList reads state.json only; no providers are launched. For issue #56 /
+// TC-049 its collection result includes the artifact's convergence status.
 func (h *handlers) stateList(_ context.Context, _ *mcp.CallToolRequest, _ any) (*mcp.CallToolResult, any, error) {
 	st, err := state.Load(h.statePath())
 	if err != nil {
@@ -109,7 +113,11 @@ func (h *handlers) stateList(_ context.Context, _ *mcp.CallToolRequest, _ any) (
 		addrs = append(addrs, addr)
 	}
 	sort.Strings(addrs)
-	return jsonResult(stateListResult{Addresses: addrs})
+	return jsonResult(stateListResult{
+		Addresses:       addrs,
+		Converged:       st.Converged(),
+		IncompleteApply: st.Incomplete,
+	})
 }
 
 // stateShowInput: Address has no omitempty tag, so the SDK's schema
@@ -119,13 +127,19 @@ type stateShowInput struct {
 }
 
 type stateShowResult struct {
-	Address    string          `json:"address"`
-	Type       string          `json:"type"`
-	Provider   string          `json:"provider"`
-	Attributes json.RawMessage `json:"attributes"`
+	Address          string          `json:"address"`
+	Type             string          `json:"type"`
+	Provider         string          `json:"provider"`
+	Attributes       json.RawMessage `json:"attributes"`
+	Redacted         []string        `json:"redacted,omitempty"`
+	SensitivePaths   []string        `json:"sensitive_paths,omitempty"`
+	SensitiveScanned bool            `json:"sensitive_scanned,omitempty"`
+	Note             string          `json:"note,omitempty"`
 }
 
-// stateShow reads state.json only; no providers are launched.
+// stateShow reads state.json only; no providers are launched. Convergence is
+// deliberately reported by the collection-level state_list tool, not this
+// single-address lookup.
 func (h *handlers) stateShow(_ context.Context, _ *mcp.CallToolRequest, in stateShowInput) (*mcp.CallToolResult, any, error) {
 	st, err := state.Load(h.statePath())
 	if err != nil {
@@ -136,12 +150,40 @@ func (h *handlers) stateShow(_ context.Context, _ *mcp.CallToolRequest, in state
 		return errResult(diag.Diagnostics{diag.Errorf(in.Address, "resource not in state",
 			fmt.Sprintf("no resource %q in state", in.Address))})
 	}
+	attrs := append(json.RawMessage(nil), rs.Attributes...)
+	redacted := append([]string(nil), rs.Redacted...)
+	note := ""
+	if len(rs.SensitivePaths) != 0 {
+		var changed []string
+		// No provider/config is launched here, so rendering intentionally uses
+		// conservative path-level masking and never writes the result back.
+		attrs, changed, err = sensitive.RedactJSON(attrs, rs.SensitivePaths, nil)
+		if err != nil {
+			return errResult(diag.Diagnostics{diag.Errorf(in.Address, "failed to mask sensitive state", err.Error())})
+		}
+		redacted = mergeStringSets(redacted, changed)
+	} else if !rs.SensitiveScanned {
+		note = "this state entry was not checked for sensitive values and may contain unredacted values; it will be checked on the next save-producing apply"
+	}
 	return jsonResult(stateShowResult{
-		Address:    in.Address,
-		Type:       rs.Type,
-		Provider:   rs.Provider,
-		Attributes: rs.Attributes,
+		Address: in.Address, Type: rs.Type, Provider: rs.Provider, Attributes: attrs,
+		Redacted: redacted, SensitivePaths: rs.SensitivePaths, SensitiveScanned: rs.SensitiveScanned, Note: note,
 	})
+}
+
+func mergeStringSets(groups ...[]string) []string {
+	set := map[string]bool{}
+	for _, group := range groups {
+		for _, value := range group {
+			set[value] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for value := range set {
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // planTool builds the full provider runtime, runs the planner with refresh

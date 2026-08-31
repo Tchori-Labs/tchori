@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/zclconf/go-cty/cty"
 	"github.com/zclconf/go-cty/cty/convert"
@@ -25,28 +26,57 @@ import (
 // msgpack: it is the only encoding in the protocol that can carry unknown
 // values (cty/msgpack encodes them as a msgpack extension).
 func EncodeDynamic(v cty.Value, ty cty.Type) (*tfplugin6.DynamicValue, error) {
-	b, err := msgpack.Marshal(v, ty)
+	b, err := msgpack.Marshal(v, ty.WithoutOptionalAttributesDeep())
 	if err != nil {
 		return nil, fmt.Errorf("msgpack encode: %w", err)
 	}
 	return &tfplugin6.DynamicValue{Msgpack: b}, nil
 }
 
+// DecodeMsgpack decodes msgpack at a deeply marker-free value type. The cty
+// decoder can panic while aggregating malformed heterogeneous collections;
+// issue #50 requires that provider data instead become an ordinary error.
+func DecodeMsgpack(b []byte, ty cty.Type) (v cty.Value, err error) {
+	ty = ty.WithoutOptionalAttributesDeep()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			v = cty.NilVal
+			err = fmt.Errorf("cty panic decoding %s: %v", ty.FriendlyName(), recovered)
+		}
+	}()
+	return msgpack.Unmarshal(b, ty)
+}
+
+// DecodeJSON decodes cty JSON at a deeply marker-free value type. As with
+// DecodeMsgpack, residual cty panics from malformed data are recovered and
+// returned as errors rather than crashing plan or apply (issue #50).
+func DecodeJSON(b []byte, ty cty.Type) (v cty.Value, err error) {
+	ty = ty.WithoutOptionalAttributesDeep()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			v = cty.NilVal
+			err = fmt.Errorf("cty panic decoding %s: %v", ty.FriendlyName(), recovered)
+		}
+	}()
+	return ctyjson.Unmarshal(b, ty)
+}
+
 // DecodeDynamic decodes a protocol DynamicValue as ty. Msgpack is preferred;
 // Json is accepted as a fallback for providers that answer in JSON. A nil or
 // empty DynamicValue decodes to a null value of ty.
 func DecodeDynamic(dv *tfplugin6.DynamicValue, ty cty.Type) (cty.Value, error) {
+	ty = ty.WithoutOptionalAttributesDeep()
 	switch {
 	case dv == nil:
 		return cty.NullVal(ty), nil
 	case len(dv.Msgpack) > 0:
-		v, err := msgpack.Unmarshal(dv.Msgpack, ty)
+		v, err := DecodeMsgpack(dv.Msgpack, ty)
 		if err != nil {
 			return cty.NilVal, fmt.Errorf("msgpack decode: %w", err)
 		}
 		return v, nil
 	case len(dv.Json) > 0:
-		v, err := ctyjson.Unmarshal(dv.Json, ty)
+		v, err := DecodeJSON(dv.Json, ty)
 		if err != nil {
 			return cty.NilVal, fmt.Errorf("json decode: %w", err)
 		}
@@ -61,28 +91,51 @@ func DecodeDynamic(dv *tfplugin6.DynamicValue, ty cty.Type) (cty.Value, error) {
 // attributes that are not known until apply.
 type RefResolver func(ref config.Ref) (cty.Value, diag.Diagnostics)
 
+// EnvPolicy controls how Compose handles an unset variable referenced by an
+// {"env":"VAR"} wrapper. EnvResolve, the zero value, requires the variable
+// to be set and emits an error otherwise. EnvUnknownIfUnset resolves a set
+// variable normally but composes an unset variable as an unknown string.
+type EnvPolicy uint8
+
+const (
+	EnvResolve EnvPolicy = iota
+	EnvUnknownIfUnset
+)
+
 // Compose converts raw JSON config into a cty.Value conforming to ty:
 // missing optional/computed attrs -> null; whole-string refs (per
-// config.ParseRef) -> resolve(); {"env":"VAR"} wrappers -> string from
-// environment, permitted only when allowEnv is true (error diag if the
-// variable is unset; error diag when allowEnv is false — the spec allows env
-// wrappers only in provider config, so callers pass true for provider config
-// and false for resource configs); unexpected attributes -> error diag
-// naming the attribute.
-func Compose(raw map[string]any, ty cty.Type, allowEnv bool, resolve RefResolver) (cty.Value, diag.Diagnostics) {
+// config.ParseRef) -> resolve(); {"env":"VAR"} or {"env":["VAR_A","VAR_B"]}
+// wrappers at string-typed attributes -> values governed by env; unexpected
+// attributes -> error diagnostics naming the attribute. Reference-shaped
+// strings that survive either raw conversion or post-composition resolution
+// are hard errors under TC-048. Those diagnostics identify the attribute path
+// only because Compose has no resource address in scope. Values returned by
+// providers are not composed or scanned here.
+func Compose(raw map[string]any, ty cty.Type, env EnvPolicy, resolve RefResolver) (cty.Value, diag.Diagnostics) {
+	ty = ty.WithoutOptionalAttributesDeep()
 	if !ty.IsObjectType() {
 		return cty.NilVal, diag.Diagnostics{diag.Errorf("", "internal error: Compose requires an object type", "got "+ty.FriendlyName())}
 	}
 	if raw == nil {
 		raw = map[string]any{}
 	}
-	return rawToCty("", raw, ty, allowEnv, resolve)
+	composed, ds := rawToCty("", raw, ty, env, resolve)
+	if ds.HasErrors() {
+		return composed, ds
+	}
+	for _, finding := range FindUnresolvedReferences(composed) {
+		ds = append(ds, UnresolvedReferenceDiagnostic("", finding))
+	}
+	if ds.HasErrors() {
+		return cty.NilVal, ds
+	}
+	return composed, ds
 }
 
 // rawToCty converts one raw JSON value into a cty.Value of exactly type ty,
 // recursing generically driven by ty. path is the dotted attribute path used
 // in diagnostics ("" at the root).
-func rawToCty(path string, raw any, ty cty.Type, allowEnv bool, resolve RefResolver) (cty.Value, diag.Diagnostics) {
+func rawToCty(path string, raw any, ty cty.Type, env EnvPolicy, resolve RefResolver) (cty.Value, diag.Diagnostics) {
 	// JSON null is a valid value at any type.
 	if raw == nil {
 		return cty.NullVal(ty), nil
@@ -96,18 +149,18 @@ func rawToCty(path string, raw any, ty cty.Type, allowEnv bool, resolve RefResol
 		if ref, isRef := config.ParseRef(s); isRef {
 			return resolveRefValue(path, s, ref, ty, resolve)
 		}
+		if match, found := config.FindUnresolvedReference(s); found {
+			finding := UnresolvedReferenceFinding{Path: path, Match: match}
+			return cty.NilVal, diag.Diagnostics{UnresolvedReferenceDiagnostic("", finding)}
+		}
 	}
 
-	// An {"env": "VAR"} wrapper is only meaningful where a primitive is
-	// expected; at object/map types a single-key "env" object is plain data.
-	// The spec allows wrappers only in provider config, so resource-config
-	// composition (allowEnv=false) rejects them outright.
+	// An {"env": "VAR"} or {"env": ["VAR_A", "VAR_B"]} wrapper is only
+	// meaningful where a primitive is expected; at object/map/list types a
+	// single-key "env" object is plain data. resolveEnvValue rejects primitive
+	// types other than string.
 	if m, ok := raw.(map[string]any); ok && ty.IsPrimitiveType() && isEnvWrapper(m) {
-		if !allowEnv {
-			return cty.NilVal, diag.Diagnostics{diag.Errorf("", "env wrappers are only allowed in provider config",
-				fmt.Sprintf("attribute %q uses an {\"env\": ...} wrapper, which is valid only inside a provider's config block", path))}
-		}
-		return resolveEnvValue(path, m, ty)
+		return resolveEnvValue(path, m, ty, env)
 	}
 
 	switch {
@@ -138,7 +191,7 @@ func rawToCty(path string, raw any, ty cty.Type, allowEnv bool, resolve RefResol
 				attrs[name] = cty.NullVal(atys[name])
 				continue
 			}
-			av, adiags := rawToCty(joinPath(path, name), rv, atys[name], allowEnv, resolve)
+			av, adiags := rawToCty(joinPath(path, name), rv, atys[name], env, resolve)
 			diags = append(diags, adiags...)
 			if adiags.HasErrors() {
 				return cty.NilVal, diags
@@ -159,7 +212,7 @@ func rawToCty(path string, raw any, ty cty.Type, allowEnv bool, resolve RefResol
 		var diags diag.Diagnostics
 		elems := make(map[string]cty.Value, len(m))
 		for _, k := range sortedKeys(m) {
-			ev, ediags := rawToCty(joinPath(path, k), m[k], ety, allowEnv, resolve)
+			ev, ediags := rawToCty(joinPath(path, k), m[k], ety, env, resolve)
 			diags = append(diags, ediags...)
 			if ediags.HasErrors() {
 				return cty.NilVal, diags
@@ -183,7 +236,7 @@ func rawToCty(path string, raw any, ty cty.Type, allowEnv bool, resolve RefResol
 		var diags diag.Diagnostics
 		elems := make([]cty.Value, 0, len(l))
 		for i, rv := range l {
-			ev, ediags := rawToCty(fmt.Sprintf("%s[%d]", path, i), rv, ety, allowEnv, resolve)
+			ev, ediags := rawToCty(fmt.Sprintf("%s[%d]", path, i), rv, ety, env, resolve)
 			diags = append(diags, ediags...)
 			if ediags.HasErrors() {
 				return cty.NilVal, diags
@@ -238,20 +291,46 @@ func resolveRefValue(path, refStr string, ref config.Ref, ty cty.Type, resolve R
 	return cv, diags
 }
 
-// resolveEnvValue reads an {"env": "VAR"} wrapper. Wrappers are only valid
-// where a string is expected; the variable must be set (empty string is set).
-func resolveEnvValue(path string, m map[string]any, ty cty.Type) (cty.Value, diag.Diagnostics) {
-	name, _ := m["env"].(string)
+// resolveEnvValue reads an {"env": "VAR"} or
+// {"env": ["VAR_A", "VAR_B"]} wrapper. Wrappers are only valid where a
+// string is expected. Candidates are consulted in order and the first one
+// that is set wins; an empty string counts as set. Policy controls the result
+// when every candidate is unset.
+func resolveEnvValue(path string, m map[string]any, ty cty.Type, env EnvPolicy) (cty.Value, diag.Diagnostics) {
+	names, valid := envWrapperNames(m)
+	if !valid {
+		if values, ok := m["env"].([]any); ok {
+			if len(values) == 0 {
+				return cty.NilVal, diag.Diagnostics{diag.Errorf("", "invalid env wrapper",
+					fmt.Sprintf("attribute %q: {\"env\": ...} requires at least one environment variable name", path))}
+			}
+			for i, value := range values {
+				if _, ok := value.(string); !ok {
+					return cty.NilVal, diag.Diagnostics{diag.Errorf("", "invalid env wrapper",
+						fmt.Sprintf("attribute %q: {\"env\": ...} candidate at index %d must be a string", path, i))}
+				}
+			}
+		}
+		return cty.NilVal, diag.Diagnostics{diag.Errorf("", "invalid env wrapper",
+			fmt.Sprintf("attribute %q has a malformed {\"env\": ...} wrapper", path))}
+	}
 	if ty != cty.String {
 		return cty.NilVal, diag.Diagnostics{diag.Errorf("", "invalid env wrapper",
-			fmt.Sprintf("attribute %q: {\"env\": %q} is only valid where a string is expected, not %s", path, name, ty.FriendlyName()))}
+			fmt.Sprintf("attribute %q: {\"env\": %s} is only valid where a string is expected, not %s",
+				path, quotedNames(names), ty.FriendlyName()))}
 	}
-	val, set := os.LookupEnv(name)
-	if !set {
-		return cty.NilVal, diag.Diagnostics{diag.Errorf("", "environment variable not set",
-			fmt.Sprintf("attribute %q reads environment variable %q, which is not set", path, name))}
+	for _, name := range names {
+		if val, set := os.LookupEnv(name); set {
+			return cty.StringVal(val), nil
+		}
 	}
-	return cty.StringVal(val), nil
+	if env == EnvUnknownIfUnset {
+		return cty.UnknownVal(cty.String), nil
+	}
+	detail := fmt.Sprintf("attribute %q: none of the candidate environment variables %s are set.\n", path, quotedNames(names)) +
+		"These names come from the {\"env\": ...} wrapper in *.tchori.json; tchori defines no built-in or provider-specific environment variable names.\n" +
+		"Export one of these variables, or add the name your environment already uses to the wrapper list."
+	return cty.NilVal, diag.Diagnostics{diag.Errorf("", "environment variable not set", detail)}
 }
 
 // numberToCty converts the Go values encoding/json (and config loaders using
@@ -275,13 +354,51 @@ func numberToCty(path string, raw any) (cty.Value, diag.Diagnostics) {
 	}
 }
 
-// isEnvWrapper reports whether m has the exact {"env": "<string>"} shape.
+// isEnvWrapper reports whether m has the single-key env-wrapper shape. The
+// payload may be a string or a candidate list; resolveEnvValue diagnoses a
+// malformed candidate list.
 func isEnvWrapper(m map[string]any) bool {
 	if len(m) != 1 {
 		return false
 	}
-	_, ok := m["env"].(string)
-	return ok
+	switch m["env"].(type) {
+	case string, []any:
+		return true
+	default:
+		return false
+	}
+}
+
+// envWrapperNames returns a well-formed wrapper's candidate names in config
+// order. Its caller is responsible for diagnosing malformed candidate lists.
+func envWrapperNames(m map[string]any) ([]string, bool) {
+	switch value := m["env"].(type) {
+	case string:
+		return []string{value}, true
+	case []any:
+		if len(value) == 0 {
+			return nil, false
+		}
+		names := make([]string, len(value))
+		for i, candidate := range value {
+			name, ok := candidate.(string)
+			if !ok {
+				return nil, false
+			}
+			names[i] = name
+		}
+		return names, true
+	default:
+		return nil, false
+	}
+}
+
+func quotedNames(names []string) string {
+	quoted := make([]string, len(names))
+	for i, name := range names {
+		quoted[i] = fmt.Sprintf("%q", name)
+	}
+	return strings.Join(quoted, ", ")
 }
 
 func joinPath(base, name string) string {

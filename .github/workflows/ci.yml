@@ -8,14 +8,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
     name: check
     runs-on: ubuntu-latest
+    timeout-minutes: 15 # Lint, tests, and the ~1-minute race run finish in 5–8 minutes; ~2x headroom bounds hangs.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -32,53 +37,137 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: go vet (windows cross-compile)
+        run: GOOS=windows go vet ./...
+
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: v2.12
 
+      - name: install actionlint
+        timeout-minutes: 5
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+
+      - name: validate GitHub Actions workflows
+        timeout-minutes: 3
+        run: bash scripts/actionlint-verify.sh
+
       - name: go test
         run: go test ./...
+
+      - name: go test (race detector)
+        run: go test -race -timeout=2m ./...
+
+  vulncheck:
+    name: vulncheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+
+      - name: govulncheck
+        timeout-minutes: 6
+        run: timeout 5m govulncheck ./...
+
+  secretscan:
+    name: secretscan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      - name: install Gitleaks
+        timeout-minutes: 5
+        run: |
+          GOBIN="$RUNNER_TEMP/bin" go install github.com/zricethezav/gitleaks/v8@v8.30.1
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: scan full Git history
+        timeout-minutes: 6
+        run: timeout 5m gitleaks git . --log-opts=--all --no-banner --config .gitleaks.toml --redact --exit-code 1
+
+      - name: scan working tree
+        timeout-minutes: 6
+        run: timeout 5m gitleaks dir . --no-banner --config .gitleaks.toml --redact --exit-code 1
+
+      - name: verify synthetic secret detection
+        timeout-minutes: 2
+        run: bash scripts/gitleaks-selftest.sh
 
   e2e:
     name: e2e
     needs: check
     runs-on: ubuntu-latest
+    timeout-minutes: 20 # Registry and provider lifecycle typically finish under 10 minutes; ~2x headroom bounds hangs.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: 'go.mod'
           cache: true
 
-      - name: e2e (fake provider lifecycle + real registry install + protocol-5 failure)
+      - name: warm module cache
+        run: go mod download
+
+      - name: e2e (fake provider lifecycle + real registry install + protocol-5 adapter lifecycle)
+        env:
+          HTTPS_PROXY: 'http://127.0.0.1:1'
+          HTTP_PROXY: 'http://127.0.0.1:1'
+          NO_PROXY: '127.0.0.1,localhost'
         run: go test -tags e2e ./e2e -v
 
   goreleaser:
     name: goreleaser
     needs: check
     runs-on: ubuntu-latest
+    timeout-minutes: 30 # Snapshot cross-builds typically finish under 15 minutes; ~2x headroom bounds stalls.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: 'go.mod'
           cache: true
 
       - name: goreleaser check
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
           version: '~> v2'
           args: check
 
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+
       - name: goreleaser snapshot build
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
           version: '~> v2'
-          args: release --snapshot --clean
+          # Snapshot mode still runs signing in GoReleaser v2.17; CI has no OIDC.
+          args: release --snapshot --clean --skip=sign
+
+      - name: Verify snapshot SBOMs
+        run: |
+          sbom="$(find dist -maxdepth 1 -type f -name '*.sbom.json' -print -quit)"
+          test -n "$sbom"
+          ls dist/*.sbom.json

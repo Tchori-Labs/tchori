@@ -28,6 +28,39 @@ func TestParseRef(t *testing.T) {
 	}
 }
 
+func TestFindUnresolvedReference(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "reported suffix", input: "${cloudflare_tunnel.waha.id}.cfargotunnel.com", want: "${cloudflare_tunnel.waha.id}"},
+		{name: "prefix", input: "prefix-${null_resource.a.id}", want: "${null_resource.a.id}"},
+		{name: "prefix and suffix", input: "prefix-${null_resource.a.id}-suffix", want: "${null_resource.a.id}"},
+		{name: "multiple returns first", input: "${null_resource.a.id}-${null_resource.b.id}", want: "${null_resource.a.id}"},
+		// The detector reports valid whole-string references too. Compose must
+		// call ParseRef first so this still resolves rather than errors.
+		{name: "whole string reference", input: "${null_resource.a.id}", want: "${null_resource.a.id}"},
+		{name: "uppercase type near miss", input: "${Null_resource.a.id}", want: "${Null_resource.a.id}"},
+		{name: "two segments no attribute", input: "${null_resource.a}", want: "${null_resource.a}"},
+		{name: "shell variable", input: "${HOME}"},
+		{name: "shell default", input: "${VAR:-x}"},
+		{name: "empty braces", input: "${}"},
+		{name: "money", input: "$100"},
+		{name: "no dollar", input: "{a.b.c}"},
+		{name: "plain text", input: "plain text"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, found := FindUnresolvedReference(tt.input)
+			if got != tt.want || found != (tt.want != "") {
+				t.Errorf("FindUnresolvedReference(%q) = (%q, %t), want (%q, %t)", tt.input, got, found, tt.want, tt.want != "")
+			}
+		})
+	}
+}
+
 func TestExtractRefs(t *testing.T) {
 	cfg := map[string]any{
 		"b_ref": "${null_resource.b.id}",
@@ -84,6 +117,67 @@ func testConfig(resources map[string]map[string]any) *Config {
 		}
 	}
 	return c
+}
+
+func TestDependencies(t *testing.T) {
+	c := testConfig(map[string]map[string]any{
+		"null_resource.a": {},
+		"null_resource.b": {
+			"first":  "${null_resource.a.id}",
+			"second": "${null_resource.a.other}",
+		},
+		"null_resource.c": {
+			"z": "${null_resource.b.id}",
+			"a": "${null_resource.a.id}",
+		},
+	})
+	got, diags := c.Dependencies()
+	if diags.HasErrors() {
+		t.Fatalf("Dependencies diagnostics: %+v", diags)
+	}
+	want := map[string][]string{
+		"null_resource.a": {},
+		"null_resource.b": {"null_resource.a"},
+		"null_resource.c": {"null_resource.a", "null_resource.b"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("Dependencies() = %#v, want %#v", got, want)
+	}
+}
+
+func TestDependenciesTransitiveChainReturnsDirectEdges(t *testing.T) {
+	c := testConfig(map[string]map[string]any{
+		"null_resource.a": {},
+		"null_resource.b": {"dep": "${null_resource.a.id}"},
+		"null_resource.c": {"dep": "${null_resource.b.id}"},
+	})
+	got, diags := c.Dependencies()
+	if diags.HasErrors() {
+		t.Fatalf("Dependencies diagnostics: %+v", diags)
+	}
+	if !reflect.DeepEqual(got["null_resource.c"], []string{"null_resource.b"}) {
+		t.Fatalf("c dependencies = %v, want direct dependency b only", got["null_resource.c"])
+	}
+}
+
+func TestDependenciesUndeclaredReference(t *testing.T) {
+	c := testConfig(map[string]map[string]any{
+		"null_resource.a": {"dep": "${null_resource.ghost.id}"},
+	})
+	got, diags := c.Dependencies()
+	if got != nil || !diags.HasErrors() {
+		t.Fatalf("Dependencies() = (%v, %+v), want nil and undeclared-reference error", got, diags)
+	}
+	if diags[0].Summary != "reference to undeclared resource" || diags[0].Address != "null_resource.a" {
+		t.Fatalf("diagnostic = %+v", diags[0])
+	}
+}
+
+func TestDependenciesEmptyConfig(t *testing.T) {
+	got, diags := testConfig(map[string]map[string]any{}).Dependencies()
+	if diags.HasErrors() || got == nil || len(got) != 0 {
+		t.Fatalf("Dependencies() = (%#v, %+v), want non-nil empty map and no errors", got, diags)
+	}
 }
 
 func TestOrderChain(t *testing.T) {

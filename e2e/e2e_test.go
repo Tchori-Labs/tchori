@@ -5,14 +5,18 @@
 //   - lifecycle: validate → plan → apply → plan (no-op) → destroy plan →
 //     apply, against the in-repo fake tfplugin6 provider via --plugin-dir,
 //     with a real cross-resource reference chain
-//   - registry_install: a real download from registry.opentofu.org,
-//     SHA256-verified, cache layout asserted via `providers list -json`
-//     (install never launches the binary, so its protocol is irrelevant)
-//   - protocol5_graceful_failure: launching the installed protocol-5-only
-//     null provider fails with exit 1 and a structured diagnostic naming
-//     the protocol mismatch
+//   - registry_install: a download from an in-process fixture registry,
+//     SHA256-verified with cache layout asserted via `providers list -json`
+//   - protocol5_lifecycle: the fixture-installed, protocol-5-only
+//     provider (the in-repo testprovider5 binary, served by the fixture
+//     registry under the opentofu/null source name — see
+//     fixtureregistry_test.go) runs a full validate → plan → apply →
+//     plan (no-op) → destroy → apply lifecycle through the tfplugin5
+//     adapter, proving the adapter composes with the complete CLI path
+//     end to end (not just package-level RPCs, covered separately in
+//     internal/provider and cmd/tchori)
 //
-// Run with: go test -tags e2e ./e2e -v   (network required)
+// Run with: go test -tags e2e ./e2e -v   (no network required)
 package e2e
 
 import (
@@ -30,9 +34,15 @@ import (
 
 // nullVersion pins opentofu/null per research-registry.md §6 (verified
 // 2026-07-10). Every published version of opentofu/null serves plugin
-// protocol 5 only (§2) — which is exactly what the graceful-failure subtest
-// needs. Do not swap in a different provider without re-verifying.
+// protocol 5 only (§2). This suite never touches the real opentofu/null
+// binary or the public registry (see fixtureregistry_test.go): the fixture
+// registry serves the in-repo testprovider5 binary under this version and
+// source name instead, so the download/cache-layout assertions and the
+// protocol-5 lifecycle both stay network-free while still exercising a
+// binary whose wire protocol is genuinely 5-only. Do not swap in a
+// different provider without re-verifying.
 const nullVersion = "3.3.0"
+const secretSentinelE2E = "tchori-e2e-super-secret-value" //nolint:gosec // fake credential sentinel must be absent from artifacts
 
 // lifecycleConfig is the fake-provider workspace: two tchoritest_thing
 // resources where b's tag references a's computed id — a real dependency
@@ -60,16 +70,33 @@ const lifecycleConfig = `{
 }
 `
 
-// protocol5Config declares the registry-installed null provider (protocol 5
-// only). Any provider-launching command against it must exit 1 with a
-// structured diagnostic. fmt.Sprintf arg: nullVersion.
+const sensitiveConfig = `{
+  "providers": {"tchoritest":{"source":"tchori-labs/tchoritest","version":"0.0.1","config":{"prefix":"e2e-"}}},
+  "resources": {
+    "tchoritest_secretful.a":{"config":{"name":"a"}},
+    "tchoritest_secretful.b":{"config":{"name":"b","token":"${tchoritest_secretful.a.client_secret}"}},
+    "tchoritest_secretful.c":{"config":{"name":"c","rules":[{"token":"literal-token-ok"},{"token":"${tchoritest_secretful.a.client_secret}"}]}}
+  }
+}`
+
+// protocol5Config declares the registry-installed, protocol-5-only
+// provider (the fixture-served testprovider5 binary, named "null" here
+// since it stands in for opentofu/null in the download/cache-layout
+// assertions — see fixtureregistry_test.go). The resource address uses
+// testprovider5's own resource type (tchoritest5_thing) since that is what
+// the fixture binary actually implements; "provider": "null" overrides the
+// type-prefix provider-inference convention (tchoritest5_thing would
+// otherwise resolve to a provider named "tchoritest5") so the resource
+// still resolves against the "null" provider block. fmt.Sprintf arg:
+// nullVersion.
 const protocol5Config = `{
   "providers": {
-    "null": { "source": "opentofu/null", "version": "%s", "config": {} }
+    "null": { "source": "opentofu/null", "version": "%s", "config": { "prefix": "e2e5-" } }
   },
   "resources": {
-    "null_resource.demo": {
-      "config": { "triggers": { "k": "v" } }
+    "tchoritest5_thing.demo": {
+      "provider": "null",
+      "config": { "name": "demo" }
     }
   }
 }
@@ -80,7 +107,12 @@ const protocol5Config = `{
 type stateDoc struct {
 	FormatVersion string `json:"format_version"`
 	Serial        uint64 `json:"serial"`
-	Resources     map[string]struct {
+	Incomplete    *struct {
+		FailedAddress string   `json:"failed_address"`
+		Applied       []string `json:"applied"`
+		Remaining     []string `json:"remaining"`
+	} `json:"incomplete_apply,omitempty"`
+	Resources map[string]struct {
 		Type       string          `json:"type"`
 		Provider   string          `json:"provider"`
 		Attributes json.RawMessage `json:"attributes"`
@@ -105,6 +137,7 @@ func TestEndToEnd(t *testing.T) {
 		{bin, "./cmd/tchori"},
 		{filepath.Join(pluginDir, "terraform-provider-tchoritest"),
 			"./internal/provider/testprovider"},
+		{fixtureProviderPath(binDir), "./internal/provider/testprovider5"},
 	}
 	for _, b := range builds {
 		cmd := exec.Command("go", "build", "-o", b.target, b.pkg)
@@ -114,11 +147,11 @@ func TestEndToEnd(t *testing.T) {
 		}
 	}
 
-	// Isolated HOME: the provider cache defaults to $HOME/.tchori/providers,
-	// so overriding HOME in the child process env keeps the registry
-	// download out of the developer's real home and makes the test hermetic
-	// and repeatable.
+	// Isolated HOME keeps the provider cache out of the developer's real
+	// home. TCHORI_REGISTRY_URL redirects every child to the local fixture,
+	// making accidental public-registry access impossible in this suite.
 	home := t.TempDir()
+	fixture := newFixtureRegistry(t, fixtureProviderPath(binDir))
 
 	// run executes the built binary in dir, asserts its exit code (dumping
 	// stdout/stderr on any mismatch), and returns stdout and stderr.
@@ -131,7 +164,7 @@ func TestEndToEnd(t *testing.T) {
 				cmd.Env = append(cmd.Env, kv)
 			}
 		}
-		cmd.Env = append(cmd.Env, "HOME="+home)
+		cmd.Env = append(cmd.Env, "HOME="+home, "TCHORI_REGISTRY_URL="+fixture.URL)
 		var outBuf, errBuf bytes.Buffer
 		cmd.Stdout = &outBuf
 		cmd.Stderr = &errBuf
@@ -188,6 +221,9 @@ func TestEndToEnd(t *testing.T) {
 		if st.FormatVersion != "1.0" {
 			t.Fatalf("state format_version = %q, want %q", st.FormatVersion, "1.0")
 		}
+		if st.Incomplete != nil {
+			t.Fatalf("successful end-to-end apply left incomplete marker: %+v", st.Incomplete)
+		}
 		if len(st.Resources) != 2 {
 			t.Fatalf("state has %d resources after apply, want 2: %v", len(st.Resources), addresses(st))
 		}
@@ -231,23 +267,49 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
-	// Track whether registry_install succeeded, so protocol5_graceful_failure
-	// can skip if the provider isn't available.
-	registrySuccess := false
+	t.Run("sensitive_artifacts", func(t *testing.T) {
+		work := t.TempDir()
+		if err := os.WriteFile(filepath.Join(work, "main.tchori.json"), []byte(sensitiveConfig), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		pd := "--plugin-dir=" + pluginDir
+		stdout, stderr := run(t, work, 2, "plan", pd, "-out", "plan.json")
+		if strings.Contains(stdout+stderr, secretSentinelE2E) {
+			t.Fatal("plan output emitted secret sentinel")
+		}
+		stdout, stderr = run(t, work, 0, "apply", pd, "plan.json")
+		if strings.Contains(stdout+stderr, secretSentinelE2E) {
+			t.Fatal("apply output emitted secret sentinel")
+		}
+		for _, name := range []string{"state.json", "state.json.backup", "plan.json"} {
+			data, err := os.ReadFile(filepath.Join(work, name)) //nolint:gosec // test-controlled workspace artifact
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bytes.Contains(data, []byte(secretSentinelE2E)) {
+				t.Fatalf("%s contains secret sentinel", name)
+			}
+			if name == "state.json" && !bytes.Contains(data, []byte("literal-token-ok")) {
+				t.Fatal("literal instance did not survive state save")
+			}
+		}
+		stdout, stderr = run(t, work, 0, "state", "show", "tchoritest_secretful.a")
+		if strings.Contains(stdout+stderr, secretSentinelE2E) {
+			t.Fatal("state show emitted secret sentinel")
+		}
+		stdout, stderr = run(t, work, 0, "plan", pd)
+		if strings.Contains(stdout+stderr, secretSentinelE2E) || !strings.Contains(stdout, "No changes") {
+			t.Fatalf("post-apply plan did not converge: stdout=%s stderr=%s", stdout, stderr)
+		}
+	})
 
 	t.Run("registry_install", func(t *testing.T) {
 		work := t.TempDir()
 
-		// Real download from registry.opentofu.org: version lookup, zip
-		// fetch, SHA256 verification against the SHA256SUMS document,
-		// extraction into the cache. install never launches the binary.
-		// Skip the subtest (and protocol5) on network failure; fail loudly on
-		// any other error (checksum mismatch, bad layout, etc).
-		installErr := tryInstallProvider(t, bin, work, home)
-		if installErr != nil {
-			t.Skipf("registry unreachable, skipping: %v", installErr)
-		}
-		registrySuccess = true
+		// Exercise version lookup, archive fetch, SHA256SUMS verification,
+		// and cache extraction against the in-process fixture. Any failure is
+		// a real regression; this required suite must never skip.
+		run(t, work, 0, "providers", "install", "opentofu/null", nullVersion)
 
 		// Cache layout asserted via providers list -json.
 		stdout, _ := run(t, work, 0, "-json", "providers", "list")
@@ -287,94 +349,65 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
-	t.Run("protocol5_graceful_failure", func(t *testing.T) {
-		// This test depends on the provider installed by registry_install.
-		// If that subtest was skipped due to network failure, skip this one too.
-		if !registrySuccess {
-			t.Skip("skipping because registry_install was skipped")
-		}
-
+	t.Run("protocol5_lifecycle", func(t *testing.T) {
 		work := t.TempDir()
 		cfg := fmt.Sprintf(protocol5Config, nullVersion)
 		if err := os.WriteFile(filepath.Join(work, "main.tchori.json"), []byte(cfg), 0o644); err != nil {
 			t.Fatal(err)
 		}
 
-		// plan discovers the null binary in the cache (installed by the
-		// registry_install subtest above), launches it, and must fail the
-		// protocol-6-only negotiation with exit 1 and a structured
-		// diagnostic naming the mismatch — not a hang, not a raw go-plugin
-		// stack trace. stderr is a pipe here, so diagnostics are JSON lines.
-		_, stderr := run(t, work, 1, "plan")
-		if !strings.Contains(stderr, `"severity":"error"`) {
-			t.Errorf("stderr carries no structured JSON error diagnostic: %q", stderr)
+		// 1. validate: launches the protocol-5-only binary (installed by the
+		//    registry_install subtest above) through the tfplugin5 adapter and
+		//    calls ValidateResourceConfig ⇒ exit 0 on a clean config.
+		run(t, work, 0, "validate")
+
+		// 2. plan -out: one pending create ⇒ exit 2, summary create=1.
+		run(t, work, 2, "plan", "-out", "plan.json")
+		var pl struct {
+			Summary struct {
+				Create  int `json:"create"`
+				Update  int `json:"update"`
+				Delete  int `json:"delete"`
+				Replace int `json:"replace"`
+			} `json:"summary"`
 		}
-		if !strings.Contains(stderr, "provider protocol unsupported") {
-			t.Errorf("stderr does not name the protocol mismatch: %q", stderr)
+		readJSON(t, filepath.Join(work, "plan.json"), &pl)
+		if pl.Summary.Create != 1 || pl.Summary.Update != 0 || pl.Summary.Delete != 0 || pl.Summary.Replace != 0 {
+			t.Fatalf("plan summary = %+v, want {Create:1 Update:0 Delete:0 Replace:0}", pl.Summary)
 		}
-		if !strings.Contains(stderr, "tfplugin6") {
-			t.Errorf("stderr does not say tchori speaks tfplugin6: %q", stderr)
+
+		// 3. apply the saved plan through the adapter.
+		run(t, work, 0, "apply", "plan.json")
+
+		// state.json holds the resource with a non-empty computed id. Legacy-
+		// SDK value quirks are tolerated: assert id is non-empty, not an exact
+		// value.
+		var st stateDoc
+		readJSON(t, filepath.Join(work, "state.json"), &st)
+		res, ok := st.Resources["tchoritest5_thing.demo"]
+		if !ok {
+			t.Fatalf("tchoritest5_thing.demo not in state after apply: %v", addresses(st))
+		}
+		var attrs struct {
+			ID string `json:"id"`
+		}
+		mustUnmarshal(t, res.Attributes, &attrs)
+		if attrs.ID == "" {
+			t.Fatal("tchoritest5_thing.demo id is empty after apply, want non-empty")
+		}
+
+		// 4. plan again: state matches config ⇒ no changes ⇒ exit 0 (idempotent).
+		run(t, work, 0, "plan")
+
+		// 5. destroy -out + apply: state ends empty.
+		run(t, work, 2, "destroy", "-out", "destroy.json")
+		run(t, work, 0, "apply", "destroy.json")
+		st = stateDoc{}
+		readJSON(t, filepath.Join(work, "state.json"), &st)
+		if len(st.Resources) != 0 {
+			t.Fatalf("state has %d resources after destroy, want 0: %v", len(st.Resources), addresses(st))
 		}
 	})
-}
-
-// tryInstallProvider attempts to install the null provider from the registry.
-// Returns an error (which may be a network error) if installation fails;
-// returns nil if installation succeeds. isNetworkError() can be used to
-// distinguish network failures from other errors.
-func tryInstallProvider(t *testing.T, bin, work, home string) error {
-	t.Helper()
-	cmd := exec.Command(bin, "providers", "install", "opentofu/null", nullVersion)
-	cmd.Dir = work
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "HOME=") {
-			cmd.Env = append(cmd.Env, kv)
-		}
-	}
-	cmd.Env = append(cmd.Env, "HOME="+home)
-	var outBuf, errBuf bytes.Buffer
-	cmd.Stdout = &outBuf
-	cmd.Stderr = &errBuf
-	runErr := cmd.Run()
-	exit := 0
-	if runErr != nil {
-		var ee *exec.ExitError
-		if !errors.As(runErr, &ee) {
-			return fmt.Errorf("unexpected error: %v", runErr)
-		}
-		exit = ee.ExitCode()
-	}
-
-	if exit != 0 {
-		stderr := errBuf.String()
-		if isNetworkError(stderr) {
-			return errors.New(stderr)
-		}
-		// Non-network error: fail loudly in the test.
-		t.Fatalf("providers install opentofu/null %s: exit %d (non-network error)\nstderr:\n%s",
-			nullVersion, exit, stderr)
-	}
-
-	return nil
-}
-
-// isNetworkError returns true if the error message indicates a network problem.
-func isNetworkError(msg string) bool {
-	networkPatterns := []string{
-		"no such host",
-		"connection refused",
-		"i/o timeout",
-		"TLS handshake timeout",
-		"temporary failure in name resolution",
-		"dial tcp",
-	}
-	msg = strings.ToLower(msg)
-	for _, pattern := range networkPatterns {
-		if strings.Contains(msg, pattern) {
-			return true
-		}
-	}
-	return false
 }
 
 func readJSON(t *testing.T, path string, v any) {

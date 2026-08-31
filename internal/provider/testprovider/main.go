@@ -7,6 +7,10 @@ package main
 import (
 	"context"
 	"log"
+	"os"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6/tf6server"
@@ -29,12 +33,23 @@ var providerSchema = &tfprotov6.Schema{
 }
 
 // thingType is the wire shape of the tchoritest_thing resource.
+// thingRuleType is the wire shape of one element of thingType's "rules"
+// list attribute: a single string leaf, token_id, mirroring the cloudflare
+// access-policy shape from issue #11 (policies[].include[].service_token.
+// token_id) closely enough to reproduce the bug at the fake-provider level.
+var thingRuleType = tftypes.Object{
+	AttributeTypes: map[string]tftypes.Type{
+		"token_id": tftypes.String,
+	},
+}
+
 var thingType = tftypes.Object{
 	AttributeTypes: map[string]tftypes.Type{
 		"echo":       tftypes.String,                           // Computed: always equals name
 		"id":         tftypes.String,                           // Computed: "<prefix>id-<name>" at apply
 		"name":       tftypes.String,                           // Required
 		"replace_me": tftypes.String,                           // Optional: change forces replacement
+		"rules":      tftypes.List{ElementType: thingRuleType}, // Optional: list-of-object, TC-033 fixture
 		"tags":       tftypes.Map{ElementType: tftypes.String}, // Optional
 	},
 }
@@ -47,6 +62,7 @@ var thingSchema = &tfprotov6.Schema{
 			{Name: "id", Type: tftypes.String, Computed: true},
 			{Name: "name", Type: tftypes.String, Required: true},
 			{Name: "replace_me", Type: tftypes.String, Optional: true},
+			{Name: "rules", Type: tftypes.List{ElementType: thingRuleType}, Optional: true},
 			{Name: "tags", Type: tftypes.Map{ElementType: tftypes.String}, Optional: true},
 		},
 	},
@@ -105,6 +121,62 @@ var nestedThingSchema = &tfprotov6.Schema{
 	},
 }
 
+// ingressThingType and ingressThingSchema reproduce issue #50 / TC-055: one
+// ingress list element may leave origin_request null while a sibling supplies
+// it. Plan and apply pass ingress through unchanged and mint only id.
+var ingressOriginRequestType = tftypes.Object{
+	AttributeTypes: map[string]tftypes.Type{
+		"connect_timeout": tftypes.String,
+		"no_tls_verify":   tftypes.Bool,
+	},
+}
+
+var ingressElementType = tftypes.Object{
+	AttributeTypes: map[string]tftypes.Type{
+		"service":        tftypes.String,
+		"origin_request": ingressOriginRequestType,
+	},
+}
+
+var ingressThingType = tftypes.Object{
+	AttributeTypes: map[string]tftypes.Type{
+		"id":      tftypes.String,
+		"name":    tftypes.String,
+		"ingress": tftypes.List{ElementType: ingressElementType},
+	},
+}
+
+var ingressThingSchema = &tfprotov6.Schema{
+	Version: 0,
+	Block: &tfprotov6.SchemaBlock{
+		Attributes: []*tfprotov6.SchemaAttribute{
+			{Name: "id", Type: tftypes.String, Computed: true},
+			{Name: "name", Type: tftypes.String, Required: true},
+			{
+				Name:     "ingress",
+				Optional: true,
+				NestedType: &tfprotov6.SchemaObject{
+					Nesting: tfprotov6.SchemaObjectNestingModeList,
+					Attributes: []*tfprotov6.SchemaAttribute{
+						{Name: "service", Type: tftypes.String, Optional: true},
+						{
+							Name:     "origin_request",
+							Optional: true,
+							NestedType: &tfprotov6.SchemaObject{
+								Nesting: tfprotov6.SchemaObjectNestingModeSingle,
+								Attributes: []*tfprotov6.SchemaAttribute{
+									{Name: "connect_timeout", Type: tftypes.String, Optional: true},
+									{Name: "no_tls_verify", Type: tftypes.Bool, Optional: true},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	},
+}
+
 // serverAssignedType is the wire shape of tchoritest_server_assigned.
 var serverAssignedType = tftypes.Object{
 	AttributeTypes: map[string]tftypes.Type{
@@ -142,6 +214,24 @@ var serverAssignedSchema = &tfprotov6.Schema{
 		},
 	},
 }
+
+const secretSentinel = "tchori-e2e-super-secret-value" //nolint:gosec // deliberate fake credential sentinel proving absence from artifacts
+
+var secretRuleType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{"token": tftypes.String}}
+var secretfulType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{
+	"name": tftypes.String, "id": tftypes.String, "client_secret": tftypes.String,
+	"write_only_secret": tftypes.String, "token": tftypes.String, "note": tftypes.String,
+	"rules": tftypes.List{ElementType: secretRuleType},
+}}
+var secretfulSchema = &tfprotov6.Schema{Version: 0, Block: &tfprotov6.SchemaBlock{
+	Attributes: []*tfprotov6.SchemaAttribute{
+		{Name: "name", Type: tftypes.String, Required: true}, {Name: "id", Type: tftypes.String, Computed: true},
+		{Name: "client_secret", Type: tftypes.String, Computed: true, Sensitive: true},
+		{Name: "write_only_secret", Type: tftypes.String, Computed: true, Sensitive: true},
+		{Name: "token", Type: tftypes.String, Optional: true, Sensitive: true}, {Name: "note", Type: tftypes.String, Optional: true},
+	},
+	BlockTypes: []*tfprotov6.SchemaNestedBlock{{TypeName: "rules", Nesting: tfprotov6.SchemaNestedBlockNestingModeList, Block: &tfprotov6.SchemaBlock{Attributes: []*tfprotov6.SchemaAttribute{{Name: "token", Type: tftypes.String, Optional: true, Sensitive: true}}}}},
+}}
 
 // brokenThingSchema declares tchoritest_broken_thing: a resource type whose
 // "settings" attribute is nested_type, but with a nesting mode
@@ -185,6 +275,19 @@ type server struct {
 
 var _ tfprotov6.ProviderServer = (*server)(nil)
 
+func knownResourceType(typeName string) bool {
+	switch typeName {
+	case "tchoritest_thing", "tchoritest_lossy", "tchoritest_nested_thing", "tchoritest_ingress_thing", "tchoritest_server_assigned", "tchoritest_secretful", "tchoritest_broken_thing":
+		return true
+	default:
+		return false
+	}
+}
+
+func unknownResourceTypeDiagnostic(typeName string) *tfprotov6.Diagnostic {
+	return &tfprotov6.Diagnostic{Severity: tfprotov6.DiagnosticSeverityError, Summary: "unknown resource type", Detail: "resource type " + typeName + " is not registered"}
+}
+
 // --- Provider-level RPCs ----------------------------------------------------
 
 func (s *server) GetMetadata(ctx context.Context, req *tfprotov6.GetMetadataRequest) (*tfprotov6.GetMetadataResponse, error) {
@@ -194,8 +297,11 @@ func (s *server) GetMetadata(ctx context.Context, req *tfprotov6.GetMetadataRequ
 		},
 		Resources: []tfprotov6.ResourceMetadata{
 			{TypeName: "tchoritest_thing"},
+			{TypeName: "tchoritest_lossy"},
 			{TypeName: "tchoritest_nested_thing"},
+			{TypeName: "tchoritest_ingress_thing"},
 			{TypeName: "tchoritest_server_assigned"},
+			{TypeName: "tchoritest_secretful"},
 			{TypeName: "tchoritest_broken_thing"},
 		},
 	}, nil
@@ -206,8 +312,11 @@ func (s *server) GetProviderSchema(ctx context.Context, req *tfprotov6.GetProvid
 		Provider: providerSchema,
 		ResourceSchemas: map[string]*tfprotov6.Schema{
 			"tchoritest_thing":           thingSchema,
+			"tchoritest_lossy":           lossySchema,
 			"tchoritest_nested_thing":    nestedThingSchema,
+			"tchoritest_ingress_thing":   ingressThingSchema,
 			"tchoritest_server_assigned": serverAssignedSchema,
+			"tchoritest_secretful":       secretfulSchema,
 			"tchoritest_broken_thing":    brokenThingSchema,
 		},
 		DataSourceSchemas: map[string]*tfprotov6.Schema{},
@@ -242,24 +351,57 @@ func (s *server) ConfigureProvider(ctx context.Context, req *tfprotov6.Configure
 			}
 		}
 	}
+	// TC-050 / issue #52 reproduction hook: emulate a provider decoding an
+	// identity-aware proxy's HTML response during configuration.
+	if s.prefix == "gateway_html" {
+		return &tfprotov6.ConfigureProviderResponse{Diagnostics: []*tfprotov6.Diagnostic{{
+			Severity: tfprotov6.DiagnosticSeverityError,
+			Summary:  "Error reading project",
+			Detail:   "decoding response: invalid character '<' looking for beginning of value",
+		}}}, nil
+	}
 	return &tfprotov6.ConfigureProviderResponse{}, nil
 }
 
 func (s *server) StopProvider(ctx context.Context, req *tfprotov6.StopProviderRequest) (*tfprotov6.StopProviderResponse, error) {
+	if os.Getenv("TCHORITEST_STALL_STOP") != "" {
+		time.Sleep(30 * time.Second)
+	}
 	return &tfprotov6.StopProviderResponse{}, nil
 }
 
 // --- ResourceServer ----------------------------------------------------------
 
 func (s *server) ValidateResourceConfig(ctx context.Context, req *tfprotov6.ValidateResourceConfigRequest) (*tfprotov6.ValidateResourceConfigResponse, error) {
+	if !knownResourceType(req.TypeName) {
+		return &tfprotov6.ValidateResourceConfigResponse{Diagnostics: []*tfprotov6.Diagnostic{unknownResourceTypeDiagnostic(req.TypeName)}}, nil
+	}
+	if req.TypeName == "tchoritest_lossy" {
+		if _, err := req.Config.Unmarshal(lossyType); err != nil {
+			return nil, err
+		}
+		return &tfprotov6.ValidateResourceConfigResponse{}, nil
+	}
 	if req.TypeName == "tchoritest_nested_thing" {
 		if _, err := req.Config.Unmarshal(nestedThingType); err != nil {
 			return nil, err
 		}
 		return &tfprotov6.ValidateResourceConfigResponse{}, nil
 	}
+	if req.TypeName == "tchoritest_ingress_thing" {
+		if _, err := req.Config.Unmarshal(ingressThingType); err != nil {
+			return nil, err
+		}
+		return &tfprotov6.ValidateResourceConfigResponse{}, nil
+	}
 	if req.TypeName == "tchoritest_server_assigned" {
 		if _, err := req.Config.Unmarshal(serverAssignedType); err != nil {
+			return nil, err
+		}
+		return &tfprotov6.ValidateResourceConfigResponse{}, nil
+	}
+	if req.TypeName == "tchoritest_secretful" {
+		if _, err := req.Config.Unmarshal(secretfulType); err != nil {
 			return nil, err
 		}
 		return &tfprotov6.ValidateResourceConfigResponse{}, nil
@@ -294,14 +436,23 @@ func (s *server) ValidateResourceConfig(ctx context.Context, req *tfprotov6.Vali
 }
 
 func (s *server) UpgradeResourceState(ctx context.Context, req *tfprotov6.UpgradeResourceStateRequest) (*tfprotov6.UpgradeResourceStateResponse, error) {
+	if !knownResourceType(req.TypeName) {
+		return &tfprotov6.UpgradeResourceStateResponse{Diagnostics: []*tfprotov6.Diagnostic{unknownResourceTypeDiagnostic(req.TypeName)}}, nil
+	}
 	// Schema version is 0 and never bumped for any resource type: reinterpret
 	// the raw state as-is, just against the requested type's own wire shape.
 	ty := thingType
 	switch req.TypeName {
+	case "tchoritest_lossy":
+		ty = lossyType
 	case "tchoritest_nested_thing":
 		ty = nestedThingType
+	case "tchoritest_ingress_thing":
+		ty = ingressThingType
 	case "tchoritest_server_assigned":
 		ty = serverAssignedType
+	case "tchoritest_secretful":
+		ty = secretfulType
 	}
 	val, err := req.RawState.Unmarshal(ty)
 	if err != nil {
@@ -315,6 +466,53 @@ func (s *server) UpgradeResourceState(ctx context.Context, req *tfprotov6.Upgrad
 }
 
 func (s *server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRequest) (*tfprotov6.ReadResourceResponse, error) {
+	if !knownResourceType(req.TypeName) {
+		return &tfprotov6.ReadResourceResponse{Diagnostics: []*tfprotov6.Diagnostic{unknownResourceTypeDiagnostic(req.TypeName)}}, nil
+	}
+	if req.TypeName == "tchoritest_thing" {
+		cur, err := req.CurrentState.Unmarshal(thingType)
+		if err != nil {
+			return nil, err
+		}
+		if !cur.IsNull() {
+			var attrs map[string]tftypes.Value
+			if err := cur.As(&attrs); err != nil {
+				return nil, err
+			}
+			var name string
+			if n := attrs["name"]; n.IsKnown() && !n.IsNull() {
+				if err := n.As(&name); err != nil {
+					return nil, err
+				}
+			}
+			// TC-050 / issue #52 reproduction hooks: gateway_html mirrors the
+			// Coolify provider's unpathed decode error byte-for-byte, while
+			// gateway_attr proves provider attribute paths are qualified.
+			switch name {
+			case "gateway_html":
+				return &tfprotov6.ReadResourceResponse{Diagnostics: []*tfprotov6.Diagnostic{{
+					Severity: tfprotov6.DiagnosticSeverityError,
+					Summary:  "Error reading project",
+					Detail:   "decoding response: invalid character '<' looking for beginning of value",
+				}}}, nil
+			case "gateway_attr":
+				return &tfprotov6.ReadResourceResponse{Diagnostics: []*tfprotov6.Diagnostic{{
+					Severity:  tfprotov6.DiagnosticSeverityError,
+					Summary:   "invalid remote name",
+					Detail:    "the remote API rejected this attribute",
+					Attribute: tftypes.NewAttributePath().WithAttributeName("name"),
+				}}}, nil
+			}
+			if strings.HasPrefix(name, "drift-") {
+				attrs["echo"] = tftypes.NewValue(tftypes.String, "degraded:unhealthy")
+				newState, err := tfprotov6.NewDynamicValue(thingType, tftypes.NewValue(thingType, attrs))
+				if err != nil {
+					return nil, err
+				}
+				return &tfprotov6.ReadResourceResponse{NewState: &newState, Private: req.Private}, nil
+			}
+		}
+	}
 	// No backing store: echo current state (and private) unchanged.
 	return &tfprotov6.ReadResourceResponse{
 		NewState: req.CurrentState,
@@ -323,11 +521,23 @@ func (s *server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 }
 
 func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
+	if !knownResourceType(req.TypeName) {
+		return &tfprotov6.PlanResourceChangeResponse{Diagnostics: []*tfprotov6.Diagnostic{unknownResourceTypeDiagnostic(req.TypeName)}}, nil
+	}
+	if req.TypeName == "tchoritest_lossy" {
+		return s.planLossy(req)
+	}
 	if req.TypeName == "tchoritest_nested_thing" {
 		return s.planNestedThing(req)
 	}
+	if req.TypeName == "tchoritest_ingress_thing" {
+		return s.planIngressThing(req)
+	}
 	if req.TypeName == "tchoritest_server_assigned" {
 		return s.planServerAssigned(req)
+	}
+	if req.TypeName == "tchoritest_secretful" {
+		return s.planSecretful(req)
 	}
 	proposed, err := req.ProposedNewState.Unmarshal(thingType)
 	if err != nil {
@@ -349,6 +559,21 @@ func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanReso
 	var attrs map[string]tftypes.Value
 	if err := proposed.As(&attrs); err != nil {
 		return nil, err
+	}
+	var name string
+	if n := attrs["name"]; n.IsKnown() && !n.IsNull() {
+		if err := n.As(&name); err != nil {
+			return nil, err
+		}
+	}
+	// TC-050 fixture for PlanResourceChange attribution, paired with the
+	// existing "invalid" ValidateResourceConfig hook.
+	if name == "invalid_plan" {
+		return &tfprotov6.PlanResourceChangeResponse{Diagnostics: []*tfprotov6.Diagnostic{{
+			Severity: tfprotov6.DiagnosticSeverityError,
+			Summary:  "invalid planned name",
+			Detail:   `the name "invalid_plan" cannot be planned`,
+		}}}, nil
 	}
 
 	var priorAttrs map[string]tftypes.Value
@@ -388,6 +613,66 @@ func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanReso
 		RequiresReplace: requiresReplace,
 		PlannedPrivate:  req.PriorPrivate,
 	}, nil
+}
+
+func (s *server) planSecretful(req *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
+	proposed, err := req.ProposedNewState.Unmarshal(secretfulType)
+	if err != nil {
+		return nil, err
+	}
+	if proposed.IsNull() {
+		return &tfprotov6.PlanResourceChangeResponse{PlannedState: req.ProposedNewState, PlannedPrivate: req.PriorPrivate}, nil
+	}
+	prior, err := req.PriorState.Unmarshal(secretfulType)
+	if err != nil {
+		return nil, err
+	}
+	var attrs map[string]tftypes.Value
+	if err := proposed.As(&attrs); err != nil {
+		return nil, err
+	}
+	if prior.IsNull() {
+		attrs["id"] = tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+	} else {
+		var p map[string]tftypes.Value
+		if err := prior.As(&p); err != nil {
+			return nil, err
+		}
+		attrs["id"] = p["id"]
+	}
+	attrs["client_secret"] = tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+	attrs["write_only_secret"] = tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+	dv, err := tfprotov6.NewDynamicValue(secretfulType, tftypes.NewValue(secretfulType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.PlanResourceChangeResponse{PlannedState: &dv, PlannedPrivate: req.PriorPrivate}, nil
+}
+
+func (s *server) applySecretful(req *tfprotov6.ApplyResourceChangeRequest) (*tfprotov6.ApplyResourceChangeResponse, error) {
+	planned, err := req.PlannedState.Unmarshal(secretfulType)
+	if err != nil {
+		return nil, err
+	}
+	if planned.IsNull() {
+		return &tfprotov6.ApplyResourceChangeResponse{NewState: req.PlannedState}, nil
+	}
+	var attrs map[string]tftypes.Value
+	if err := planned.As(&attrs); err != nil {
+		return nil, err
+	}
+	var name string
+	if err := attrs["name"].As(&name); err != nil {
+		return nil, err
+	}
+	attrs["id"] = tftypes.NewValue(tftypes.String, s.prefix+"secret-"+name)
+	attrs["client_secret"] = tftypes.NewValue(tftypes.String, secretSentinel)
+	attrs["write_only_secret"] = tftypes.NewValue(tftypes.String, nil)
+	dv, err := tfprotov6.NewDynamicValue(secretfulType, tftypes.NewValue(secretfulType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.ApplyResourceChangeResponse{NewState: &dv, Private: req.PlannedPrivate}, nil
 }
 
 // planNestedThing plans a tchoritest_nested_thing change. "settings" (the
@@ -441,18 +726,56 @@ func (s *server) planNestedThing(req *tfprotov6.PlanResourceChangeRequest) (*tfp
 }
 
 func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyResourceChangeRequest) (*tfprotov6.ApplyResourceChangeResponse, error) {
+	if !knownResourceType(req.TypeName) {
+		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: []*tfprotov6.Diagnostic{unknownResourceTypeDiagnostic(req.TypeName)}}, nil
+	}
+	if req.TypeName == "tchoritest_lossy" {
+		return s.applyLossy(req)
+	}
 	if req.TypeName == "tchoritest_nested_thing" {
 		return s.applyNestedThing(req)
 	}
+	if req.TypeName == "tchoritest_ingress_thing" {
+		return s.applyIngressThing(req)
+	}
 	if req.TypeName == "tchoritest_server_assigned" {
 		return s.applyServerAssigned(req)
+	}
+	if req.TypeName == "tchoritest_secretful" {
+		return s.applySecretful(req)
 	}
 	planned, err := req.PlannedState.Unmarshal(thingType)
 	if err != nil {
 		return nil, err
 	}
-	// Destroy: planned state is null; acknowledge the deletion.
+	// Destroy: planned state is null. The explode_destroy fixture returns a
+	// provider diagnostic so TC-050 can prove the destroy call-site context;
+	// all other resources acknowledge deletion unchanged.
 	if planned.IsNull() {
+		prior, err := req.PriorState.Unmarshal(thingType)
+		if err != nil {
+			return nil, err
+		}
+		if !prior.IsNull() {
+			var attrs map[string]tftypes.Value
+			if err := prior.As(&attrs); err != nil {
+				return nil, err
+			}
+			var name string
+			if err := attrs["name"].As(&name); err != nil {
+				return nil, err
+			}
+			if name == "explode_destroy" {
+				return &tfprotov6.ApplyResourceChangeResponse{
+					NewState: req.PriorState,
+					Diagnostics: []*tfprotov6.Diagnostic{{
+						Severity: tfprotov6.DiagnosticSeverityError,
+						Summary:  "destroy exploded",
+						Detail:   `the name "explode_destroy" always fails to destroy`,
+					}},
+				}, nil
+			}
+		}
 		return &tfprotov6.ApplyResourceChangeResponse{NewState: req.PlannedState}, nil
 	}
 	var attrs map[string]tftypes.Value
@@ -462,6 +785,18 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 	var name string
 	if err := attrs["name"].As(&name); err != nil {
 		return nil, err
+	}
+	// TC-052 / issue #53 reproduction hook: mirror Coolify's unpathed,
+	// bodyless API rejection byte-for-byte.
+	if name == "api_400" {
+		return &tfprotov6.ApplyResourceChangeResponse{
+			NewState: req.PriorState,
+			Diagnostics: []*tfprotov6.Diagnostic{{
+				Severity: tfprotov6.DiagnosticSeverityError,
+				Summary:  "Error updating service",
+				Detail:   "api error (status 400): Invalid request",
+			}},
+		}, nil
 	}
 	// Deliberate failure hook for apply-time error handling tests (Task 11):
 	// a "thing" named "explode" always fails to apply.
@@ -490,6 +825,39 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 		NewState: &newDV,
 		Private:  req.PlannedPrivate,
 	}, nil
+}
+
+// planIngressThing passes ingress through untouched and computes only id.
+func (s *server) planIngressThing(req *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
+	proposed, err := req.ProposedNewState.Unmarshal(ingressThingType)
+	if err != nil {
+		return nil, err
+	}
+	if proposed.IsNull() {
+		return &tfprotov6.PlanResourceChangeResponse{PlannedState: req.ProposedNewState, PlannedPrivate: req.PriorPrivate}, nil
+	}
+	prior, err := req.PriorState.Unmarshal(ingressThingType)
+	if err != nil {
+		return nil, err
+	}
+	var attrs map[string]tftypes.Value
+	if err := proposed.As(&attrs); err != nil {
+		return nil, err
+	}
+	if prior.IsNull() {
+		attrs["id"] = tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+	} else {
+		var priorAttrs map[string]tftypes.Value
+		if err := prior.As(&priorAttrs); err != nil {
+			return nil, err
+		}
+		attrs["id"] = priorAttrs["id"]
+	}
+	planned, err := tfprotov6.NewDynamicValue(ingressThingType, tftypes.NewValue(ingressThingType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.PlanResourceChangeResponse{PlannedState: &planned, PlannedPrivate: req.PriorPrivate}, nil
 }
 
 // planServerAssigned plans a tchoritest_server_assigned change the way an
@@ -608,8 +976,88 @@ func (s *server) applyNestedThing(req *tfprotov6.ApplyResourceChangeRequest) (*t
 	}, nil
 }
 
+// applyIngressThing passes ingress through untouched and mints only id.
+func (s *server) applyIngressThing(req *tfprotov6.ApplyResourceChangeRequest) (*tfprotov6.ApplyResourceChangeResponse, error) {
+	planned, err := req.PlannedState.Unmarshal(ingressThingType)
+	if err != nil {
+		return nil, err
+	}
+	if planned.IsNull() {
+		return &tfprotov6.ApplyResourceChangeResponse{NewState: req.PlannedState}, nil
+	}
+	var attrs map[string]tftypes.Value
+	if err := planned.As(&attrs); err != nil {
+		return nil, err
+	}
+	var name string
+	if err := attrs["name"].As(&name); err != nil {
+		return nil, err
+	}
+	if !attrs["id"].IsKnown() {
+		attrs["id"] = tftypes.NewValue(tftypes.String, s.prefix+"id-"+name)
+	}
+	newState, err := tfprotov6.NewDynamicValue(ingressThingType, tftypes.NewValue(ingressThingType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.ApplyResourceChangeResponse{NewState: &newState, Private: req.PlannedPrivate}, nil
+}
+
+// ImportResourceState adopts an existing tchoritest_thing by ID: it derives
+// name from the substring after the last "id-" marker, matching
+// ApplyResourceChange's id = "<prefix>id-<name>" convention, and returns a
+// fully populated state so import -> plan is a clean no-op. IDs without an
+// "id-" marker are rejected so the CLI's "resource does not exist" path is
+// testable.
 func (s *server) ImportResourceState(ctx context.Context, req *tfprotov6.ImportResourceStateRequest) (*tfprotov6.ImportResourceStateResponse, error) {
-	return &tfprotov6.ImportResourceStateResponse{}, nil
+	if req.TypeName != "tchoritest_thing" {
+		return &tfprotov6.ImportResourceStateResponse{
+			Diagnostics: []*tfprotov6.Diagnostic{{
+				Severity: tfprotov6.DiagnosticSeverityError,
+				Summary:  "import not supported",
+				Detail:   "resource type " + req.TypeName + " does not support import",
+			}},
+		}, nil
+	}
+	const marker = "id-"
+	idx := strings.LastIndex(req.ID, marker)
+	if idx < 0 {
+		return &tfprotov6.ImportResourceStateResponse{
+			Diagnostics: []*tfprotov6.Diagnostic{{
+				Severity: tfprotov6.DiagnosticSeverityError,
+				Summary:  "resource does not exist",
+				Detail:   `id "` + req.ID + `" has no "id-" marker`,
+			}},
+		}, nil
+	}
+	name := req.ID[idx+len(marker):]
+	if name == "" {
+		return &tfprotov6.ImportResourceStateResponse{
+			Diagnostics: []*tfprotov6.Diagnostic{{
+				Severity: tfprotov6.DiagnosticSeverityError,
+				Summary:  "resource does not exist",
+				Detail:   `id "` + req.ID + `" has an empty name after "id-"`,
+			}},
+		}, nil
+	}
+	attrs := map[string]tftypes.Value{
+		"id":         tftypes.NewValue(tftypes.String, req.ID),
+		"name":       tftypes.NewValue(tftypes.String, name),
+		"echo":       tftypes.NewValue(tftypes.String, name),
+		"replace_me": tftypes.NewValue(tftypes.String, nil),
+		"rules":      tftypes.NewValue(tftypes.List{ElementType: thingRuleType}, nil),
+		"tags":       tftypes.NewValue(tftypes.Map{ElementType: tftypes.String}, nil),
+	}
+	dv, err := tfprotov6.NewDynamicValue(thingType, tftypes.NewValue(thingType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.ImportResourceStateResponse{
+		ImportedResources: []*tfprotov6.ImportedResource{{
+			TypeName: req.TypeName,
+			State:    &dv,
+		}},
+	}, nil
 }
 
 func (s *server) MoveResourceState(ctx context.Context, req *tfprotov6.MoveResourceStateRequest) (*tfprotov6.MoveResourceStateResponse, error) {
@@ -665,6 +1113,15 @@ func (s *server) CloseEphemeralResource(ctx context.Context, req *tfprotov6.Clos
 }
 
 func main() {
+	if pidFile := os.Getenv("TCHORITEST_PID_FILE"); pidFile != "" {
+		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil { //nolint:gosec // G703: test-only path is explicitly provided by the lifecycle test
+			log.Fatal(err)
+		}
+	}
+	if os.Getenv("TCHORITEST_STALL_STARTUP") != "" {
+		time.Sleep(24 * time.Hour)
+	}
+
 	err := tf6server.Serve(
 		"registry.opentofu.org/tchori-labs/tchoritest",
 		func() tfprotov6.ProviderServer { return &server{} },

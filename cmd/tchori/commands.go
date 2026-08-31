@@ -11,10 +11,12 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/zclconf/go-cty/cty"
+	ctyjson "github.com/zclconf/go-cty/cty/json"
 	"golang.org/x/term"
 
 	"github.com/tchori-labs/tchori/internal/apply"
@@ -24,6 +26,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/plan"
 	"github.com/tchori-labs/tchori/internal/provider"
 	"github.com/tchori-labs/tchori/internal/registry"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 	"github.com/tchori-labs/tchori/internal/state"
 	"github.com/tchori-labs/tchori/internal/version"
 )
@@ -56,7 +59,8 @@ func runValidate(cmd *cobra.Command, _ []string) (int, error) {
 	}
 
 	// Before planning there are no resolved values, so references compose as
-	// unknowns — Compose converts them to the attribute's type, and providers
+	// unknowns. Unset env wrappers compose as unknown strings for the same
+	// reason; Compose converts references to the attribute's type, and providers
 	// must tolerate unknowns in ValidateResourceConfig.
 	unknownRef := func(config.Ref) (cty.Value, diag.Diagnostics) {
 		return cty.UnknownVal(cty.DynamicPseudoType), nil
@@ -78,13 +82,14 @@ func runValidate(cmd *cobra.Command, _ []string) (int, error) {
 			failed = true
 			continue
 		}
-		cv, cds := provider.Compose(r.Config, schema.Block.ImpliedType(), false, unknownRef)
+		cv, cds := provider.Compose(r.Config, schema.Block.ImpliedType(), provider.EnvUnknownIfUnset, unknownRef)
 		emitDiags(cds)
 		if cds.HasErrors() {
 			failed = true
 			continue
 		}
 		vds := rt.Providers[r.Provider].ValidateResource(ctx, r.Type, cv)
+		vds = provider.Context(addr, vds)
 		emitDiags(vds)
 		if vds.HasErrors() {
 			failed = true
@@ -129,6 +134,7 @@ func runPlan(cmd *cobra.Command, out string, refresh bool) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	emitIncompleteStateWarning(st)
 
 	planner := &plan.Planner{
 		Config:        rt.Config,
@@ -149,7 +155,7 @@ func runPlan(cmd *cobra.Command, out string, refresh bool) (int, error) {
 			return 1, fmt.Errorf("writing plan to %s: %s", out, err)
 		}
 	}
-	if err := writePlanOutput(cmd.OutOrStdout(), pl); err != nil {
+	if err := writePlanOutput(cmd.OutOrStdout(), pl, planSensitivePredicate(rt.Config, st, rt.Schemas)); err != nil {
 		return 1, err
 	}
 	if pl.HasChanges() {
@@ -158,9 +164,9 @@ func runPlan(cmd *cobra.Command, out string, refresh bool) (int, error) {
 	return 0, nil
 }
 
-// writePlanOutput prints the plan document as JSON when -json is set, else a
-// human summary: one line per non-no-op change and a totals line.
-func writePlanOutput(w io.Writer, pl *plan.Plan) error {
+// writePlanOutput prints the plan document as JSON when -json is set, else its
+// attribute-level human representation.
+func writePlanOutput(w io.Writer, pl *plan.Plan, sensitivePath func(address, path string) bool) error {
 	if flagJSON {
 		b, err := json.MarshalIndent(pl, "", "  ")
 		if err != nil {
@@ -170,35 +176,67 @@ func writePlanOutput(w io.Writer, pl *plan.Plan) error {
 		_, err = w.Write(b)
 		return err
 	}
-	if !pl.HasChanges() {
-		_, _ = fmt.Fprintln(w, "No changes. Configuration matches state.")
-		return nil
-	}
-	for _, c := range pl.Changes {
-		if c.Action == "no-op" {
-			continue
-		}
-		_, _ = fmt.Fprintf(w, "%s %s\n", actionSymbol(c.Action), c.Address)
-	}
-	s := pl.Summary
-	_, _ = fmt.Fprintf(w, "Plan: %d to create, %d to update, %d to delete, %d to replace.\n",
-		s.Create, s.Update, s.Delete, s.Replace)
-	return nil
+	return plan.RenderHuman(w, pl, sensitivePath)
 }
 
-func actionSymbol(action string) string {
-	switch action {
-	case "create":
-		return "+"
-	case "update":
-		return "~"
-	case "delete":
-		return "-"
-	case "replace":
-		return "-/+"
-	default:
-		return " "
+func planSensitivePredicate(cfg *config.Config, st *state.State, schemas map[string]*provider.ProviderSchemas) func(address, path string) bool {
+	type pathInfo struct {
+		paths    []string
+		resolved bool
 	}
+	cache := make(map[string]pathInfo)
+	return func(address, path string) bool {
+		info, ok := cache[address]
+		if !ok {
+			var providerName, typeName string
+			var declared []string
+			var raw map[string]any
+			if cfg != nil {
+				if res := cfg.Resources[address]; res != nil {
+					providerName, typeName = res.Provider, res.Type
+					declared, raw = res.SensitiveAttributes, res.Config
+				}
+			}
+			if typeName == "" && st != nil {
+				if rs := st.Resources[address]; rs != nil {
+					providerName, typeName = rs.Provider, rs.Type
+					declared = rs.SensitivePaths
+				}
+			}
+			if ps := schemas[providerName]; ps != nil && typeName != "" {
+				if schema, _, known := ps.LookupResourceType(typeName); known && schema != nil {
+					if spec, ds := sensitive.Resolve(schema.Block, declared, raw); !ds.HasErrors() {
+						info.paths, info.resolved = spec.Paths(), true
+					}
+				}
+			}
+			cache[address] = info
+		}
+		if !info.resolved {
+			return true // fail closed when an address cannot be tied to a schema
+		}
+		logical := logicalAttributePath(path)
+		for _, candidate := range info.paths {
+			candidate = logicalAttributePath(candidate)
+			if logical == candidate || strings.HasPrefix(logical, candidate+".") {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func logicalAttributePath(path string) string {
+	path = strings.NewReplacer("[", ".", "]", "").Replace(path)
+	parts := strings.FieldsFunc(path, func(r rune) bool { return r == '.' })
+	for i := range parts {
+		parts[i] = strings.Trim(parts[i], `"`)
+	}
+	parts = slices.DeleteFunc(parts, func(part string) bool {
+		_, err := strconv.Atoi(part)
+		return err == nil
+	})
+	return strings.Join(parts, ".")
 }
 
 // --- apply -------------------------------------------------------------------
@@ -231,16 +269,18 @@ func runApply(cmd *cobra.Command, args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	emitIncompleteStateWarning(st)
 
-	ads := apply.Apply(ctx, pl, rt.Config, rt.Providers, rt.Schemas, st, stateFileName)
+	result, ads := apply.Apply(ctx, pl, rt.Config, rt.Providers, rt.Schemas, st, stateFileName)
 	emitDiags(ads)
 	if ads.HasErrors() {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Apply incomplete: %d created, %d updated, %d deleted, %d replaced; %d changes not executed.\n",
+			result.Created, result.Updated, result.Deleted, result.Replaced, len(result.NotExecuted))
 		return 1, nil
 	}
 
-	s := pl.Summary
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Apply complete: %d created, %d updated, %d deleted, %d replaced.\n",
-		s.Create, s.Update, s.Delete, s.Replace)
+		result.Created, result.Updated, result.Deleted, result.Replaced)
 	return 0, nil
 }
 
@@ -274,6 +314,7 @@ func runDestroy(cmd *cobra.Command, out string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	emitIncompleteStateWarning(st)
 
 	planner := &plan.Planner{
 		Config:        rt.Config,
@@ -294,7 +335,7 @@ func runDestroy(cmd *cobra.Command, out string) (int, error) {
 		if err := plan.Write(pl, out); err != nil {
 			return 1, fmt.Errorf("writing plan to %s: %s", out, err)
 		}
-		if err := writePlanOutput(cmd.OutOrStdout(), pl); err != nil {
+		if err := writePlanOutput(cmd.OutOrStdout(), pl, planSensitivePredicate(rt.Config, st, rt.Schemas)); err != nil {
 			return 1, err
 		}
 		if pl.HasChanges() {
@@ -309,7 +350,7 @@ func runDestroy(cmd *cobra.Command, out string) (int, error) {
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No resources to destroy.")
 		return 0, nil
 	}
-	if err := writePlanOutput(cmd.OutOrStdout(), pl); err != nil {
+	if err := writePlanOutput(cmd.OutOrStdout(), pl, planSensitivePredicate(rt.Config, st, rt.Schemas)); err != nil {
 		return 1, err
 	}
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
@@ -324,16 +365,151 @@ func runDestroy(cmd *cobra.Command, out string) (int, error) {
 		return 1, errors.New(`destroy canceled: confirmation was not "yes"`)
 	}
 
-	ads := apply.Apply(ctx, pl, rt.Config, rt.Providers, rt.Schemas, st, stateFileName)
+	result, ads := apply.Apply(ctx, pl, rt.Config, rt.Providers, rt.Schemas, st, stateFileName)
 	emitDiags(ads)
 	if ads.HasErrors() {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Destroy incomplete: %d deleted; %d changes not executed.\n",
+			result.Deleted, len(result.NotExecuted))
 		return 1, nil
 	}
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Destroy complete: %d deleted.\n", pl.Summary.Delete)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Destroy complete: %d deleted.\n", result.Deleted)
+	return 0, nil
+}
+
+// --- import ------------------------------------------------------------------
+
+func newImportCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "import ADDRESS ID",
+		Short: "Adopt an existing real-world resource into state under a config-declared address",
+		Args:  cobra.ExactArgs(2),
+		RunE:  exitRun(runImport),
+	}
+}
+
+// runImport maps a real resource to a config-declared address: the address
+// must exist in config (so provider/type resolve, matching Terraform's
+// classic import requirement) and must not already exist in state (no
+// overwrite). It calls the provider's ImportResourceState, refreshes the
+// imported object via ReadResource, and persists the result on success. A
+// null refreshed value ("resource does not exist") errors without writing
+// state.
+func runImport(cmd *cobra.Command, args []string) (int, error) {
+	ctx := cmd.Context()
+	address, id := args[0], args[1]
+
+	rt, cleanup, ds := buildRuntime(ctx, flagPluginDir)
+	emitDiags(ds)
+	if ds.HasErrors() {
+		return 1, nil
+	}
+	defer cleanup()
+
+	res, ok := rt.Config.Resources[address]
+	if !ok {
+		return 1, fmt.Errorf("%s is not declared in configuration; import requires a matching resource block", address)
+	}
+
+	st, err := state.Load(stateFileName)
+	if err != nil {
+		return 1, err
+	}
+	if _, exists := st.Resources[address]; exists {
+		return 1, fmt.Errorf("%s already exists in state; import does not overwrite", address)
+	}
+	st.SetSensitiveResolver(func(addr string, rs *state.ResourceState) (state.Resolution, bool) {
+		r := rt.Config.Resources[addr]
+		if r == nil {
+			return state.Resolution{}, false
+		}
+		ps := rt.Schemas[r.Provider]
+		if ps == nil {
+			return state.Resolution{}, false
+		}
+		sch, _, known := ps.LookupResourceType(r.Type)
+		if !known || sch == nil {
+			return state.Resolution{}, false
+		}
+		spec, rds := sensitive.Resolve(sch.Block, r.SensitiveAttributes, r.Config)
+		if rds.HasErrors() {
+			return state.Resolution{}, false
+		}
+		return state.Resolution{Paths: spec.Paths(), ExemptInstances: spec.ExemptInstances()}, true
+	})
+
+	client, ok := rt.Providers[res.Provider]
+	if !ok {
+		return 1, fmt.Errorf("%s: provider %q is not configured", address, res.Provider)
+	}
+	ps, ok := rt.Schemas[res.Provider]
+	if !ok {
+		return 1, fmt.Errorf("%s: provider %q has no schemas loaded", address, res.Provider)
+	}
+	schema, unsupported, known := ps.LookupResourceType(res.Type)
+	if !known {
+		return 1, fmt.Errorf("%s: provider %q has no schema for resource type %q", address, res.Provider, res.Type)
+	}
+	if schema == nil {
+		return 1, fmt.Errorf("%s: unsupported schema for resource type %q: %s", address, res.Type, unsupported)
+	}
+	ty := schema.Block.ImpliedType()
+
+	imported, private, ds := client.ImportResource(ctx, res.Type, id, ty)
+	ds = provider.Context(address, ds)
+	emitDiags(ds)
+	if ds.HasErrors() {
+		return 1, nil
+	}
+
+	refreshed, refreshedPrivate, ds := client.ReadResource(ctx, res.Type, imported, private)
+	ds = provider.Context(address, ds)
+	emitDiags(ds)
+	if ds.HasErrors() {
+		return 1, nil
+	}
+	if refreshed.IsNull() {
+		return 1, fmt.Errorf("%s: resource %q does not exist", address, id)
+	}
+
+	spec, sds := sensitive.Resolve(schema.Block, res.SensitiveAttributes, res.Config)
+	emitDiags(sds)
+	if sds.HasErrors() {
+		return 1, nil
+	}
+	redacted, redactedPaths, err := spec.Redact(refreshed)
+	if err != nil {
+		return 1, fmt.Errorf("%s: redacting imported state: %w", address, err)
+	}
+	attrs, err := ctyjson.Marshal(redacted, ty)
+	if err != nil {
+		return 1, fmt.Errorf("%s: encoding imported state: %w", address, err)
+	}
+	st.NoteSensitive(address, spec.Paths())
+	st.Resources[address] = &state.ResourceState{
+		Type: res.Type, Provider: res.Provider, Attributes: attrs, Private: refreshedPrivate,
+		Redacted: redactedPaths, SensitivePaths: spec.Paths(), SensitiveScanned: true,
+	}
+	if len(redactedPaths) != 0 {
+		emitDiags(diag.Diagnostics{diag.Warnf(address, "sensitive attributes withheld from state", fmt.Sprintf("withheld paths: %s", strings.Join(redactedPaths, ", ")))})
+	}
+	if err := st.Save(stateFileName); err != nil {
+		return 1, err
+	}
+	for _, unresolved := range st.UnresolvedSensitiveAddresses() {
+		emitDiags(diag.Diagnostics{diag.Warnf(unresolved, "state entry could not be checked for sensitive values", "provider schema or live configuration was unavailable")})
+	}
+
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Imported %s (id=%s).\n", address, id)
 	return 0, nil
 }
 
 // --- state -------------------------------------------------------------------
+
+func emitIncompleteStateWarning(st *state.State) {
+	if warning, ok := st.IncompleteWarning(); ok {
+		emitDiags(diag.Diagnostics{warning})
+	}
+}
 
 func newStateCmd() *cobra.Command {
 	cmd := &cobra.Command{
@@ -353,6 +529,12 @@ func newStateCmd() *cobra.Command {
 			Args:  cobra.ExactArgs(1),
 			RunE:  exitRun(runStateShow),
 		},
+		&cobra.Command{
+			Use:   "status",
+			Short: "Report whether state was left by a completed apply",
+			Args:  cobra.NoArgs,
+			RunE:  exitRun(runStateStatus),
+		},
 	)
 	return cmd
 }
@@ -368,6 +550,41 @@ func runStateList(cmd *cobra.Command, _ []string) (int, error) {
 	return 0, nil
 }
 
+// runStateStatus is the CI convergence gate added for issue #56 / TC-049. It
+// reads state only and never launches providers; incomplete state exits 1.
+func runStateStatus(cmd *cobra.Command, _ []string) (int, error) {
+	st, err := state.Load(stateFileName)
+	if err != nil {
+		return 1, err
+	}
+	if flagJSON {
+		result := struct {
+			Converged       bool                   `json:"converged"`
+			IncompleteApply *state.IncompleteApply `json:"incomplete_apply,omitempty"`
+		}{Converged: st.Converged(), IncompleteApply: st.Incomplete}
+		body, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return 1, err
+		}
+		if _, err := fmt.Fprintln(cmd.OutOrStdout(), string(body)); err != nil {
+			return 1, err
+		}
+	} else if st.Converged() {
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "State is converged.")
+	} else {
+		failed := st.Incomplete.FailedAddress
+		if failed == "" {
+			failed = "unknown (apply may still have been in flight)"
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "State is incomplete. Failed address: %s\nApplied: %v\nRemaining: %v\n",
+			failed, st.Incomplete.Applied, st.Incomplete.Remaining)
+	}
+	if !st.Converged() {
+		return 1, nil
+	}
+	return 0, nil
+}
+
 func runStateShow(cmd *cobra.Command, args []string) (int, error) {
 	st, err := state.Load(stateFileName)
 	if err != nil {
@@ -377,12 +594,36 @@ func runStateShow(cmd *cobra.Command, args []string) (int, error) {
 	if !ok {
 		return 1, fmt.Errorf("no resource %q in state", args[0])
 	}
-	b, err := json.MarshalIndent(rs, "", "  ")
+	shown := *rs
+	if len(rs.SensitivePaths) != 0 {
+		// Provider-free read rendering is deliberately path-level: no raw config
+		// is available, and masking an authored literal in output is safer than
+		// echoing a credential. The on-disk state is never modified.
+		attrs, changed, err := sensitive.RedactJSON(rs.Attributes, rs.SensitivePaths, nil)
+		if err != nil {
+			return 1, err
+		}
+		shown.Attributes = attrs
+		shown.Redacted = mergePaths(rs.Redacted, changed)
+	} else if !rs.SensitiveScanned {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Note: this state entry was not checked for sensitive values and may contain unredacted values; it will be checked on the next save-producing apply.")
+	}
+	b, err := json.MarshalIndent(&shown, "", "  ")
 	if err != nil {
 		return 1, err
 	}
 	_, _ = fmt.Fprintln(cmd.OutOrStdout(), string(b))
 	return 0, nil
+}
+
+func mergePaths(groups ...[]string) []string {
+	set := map[string]bool{}
+	for _, group := range groups {
+		for _, path := range group {
+			set[path] = true
+		}
+	}
+	return slices.Sorted(maps.Keys(set))
 }
 
 // --- providers ---------------------------------------------------------------
@@ -414,9 +655,11 @@ func runProvidersInstall(cmd *cobra.Command, args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	// Empty baseURL selects registry.Install's default,
+	// TCHORI_REGISTRY_URL optionally redirects registry.Install to a mirror
+	// or test fixture. Empty/unset preserves the default
 	// https://registry.opentofu.org (per the internal/registry contract).
-	path, err := registry.Install(cmd.Context(), args[0], args[1], "", cacheDir)
+	baseURL := os.Getenv("TCHORI_REGISTRY_URL")
+	path, err := registry.Install(cmd.Context(), args[0], args[1], baseURL, cacheDir)
 	if err != nil {
 		return 1, fmt.Errorf("installing %s %s: %s", args[0], args[1], err)
 	}

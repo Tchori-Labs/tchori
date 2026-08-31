@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/zclconf/go-cty/cty"
@@ -15,6 +14,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/config"
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/provider"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 	"github.com/tchori-labs/tchori/internal/state"
 )
 
@@ -92,42 +92,77 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 			return nil, ds
 		}
 		ty := schema.Block.ImpliedType()
+		spec, specDs := sensitive.Resolve(schema.Block, res.SensitiveAttributes, res.Config)
+		ds = append(ds, specDs...)
+		if specDs.HasErrors() {
+			return nil, ds
+		}
 
 		// Prior value from state, decoded against the schema's implied type.
 		prior := cty.NullVal(ty)
 		var priorPrivate []byte
 		rs, hasPrior := p.State.Resources[addr]
 		if hasPrior {
-			pv, err := ctyjson.Unmarshal(rs.Attributes, ty)
+			pv, err := provider.DecodeJSON(rs.Attributes, ty)
 			if err != nil {
 				ds = append(ds, diag.Errorf(addr, "invalid state attributes", err.Error()))
 				return nil, ds
 			}
 			prior = pv
 			priorPrivate = rs.Private
+			_, legacyPaths, err := spec.Redact(prior)
+			if err != nil {
+				return nil, append(ds, diag.Errorf(addr, "cannot inspect sensitive state", err.Error()))
+			}
+			if len(legacyPaths) != 0 {
+				ds = append(ds, diag.Warnf(addr, "plaintext sensitive value already exists in state", fmt.Sprintf("rotate credentials at paths %s and purge state.json, state.json.backup, and git history; plan writes no state and a no-op apply saves nothing, so manual purge may be required", strings.Join(legacyPaths, ", "))))
+			}
 		}
 
 		// Refresh: re-read the real object, use the result as prior, and keep
-		// the in-memory state copy in sync.
+		// the in-memory state copy in sync. Preserve the persisted reporting
+		// value first so out-of-band changes can be recorded in the plan.
 		if p.Refresh && hasPrior {
+			recordedAttrs := append(json.RawMessage(nil), rs.Attributes...)
 			rv, rpriv, rds := client.ReadResource(ctx, res.Type, prior, priorPrivate)
+			rds = provider.Context(addr, rds)
 			ds = append(ds, rds...)
 			if rds.HasErrors() {
 				return nil, ds
 			}
 			if rv.IsNull() {
 				// The object vanished out of band: plan from a null prior.
+				pl.Drift = append(pl.Drift, &Drift{
+					Address: addr,
+					Before:  recordedAttrs,
+					After:   json.RawMessage("null"),
+				})
 				delete(p.State.Resources, addr)
 				prior = cty.NullVal(ty)
 				priorPrivate = nil
 			} else {
-				attrs, err := ctyjson.Marshal(rv, ty)
+				redactedRefresh, redactedPaths, err := spec.Redact(rv)
+				if err != nil {
+					return nil, append(ds, diag.Errorf(addr, "cannot redact refreshed state", err.Error()))
+				}
+				attrs, err := ctyjson.Marshal(redactedRefresh, ty)
 				if err != nil {
 					ds = append(ds, diag.Errorf(addr, "cannot encode refreshed state", err.Error()))
 					return nil, ds
 				}
+				drift, err := newDrift(addr, recordedAttrs, attrs)
+				if err != nil {
+					ds = append(ds, diag.Errorf(addr, "cannot compare refreshed state", err.Error()))
+					return nil, ds
+				}
+				if drift != nil {
+					pl.Drift = append(pl.Drift, drift)
+				}
 				rs.Attributes = attrs
 				rs.Private = rpriv
+				rs.Redacted = redactedPaths
+				rs.SensitivePaths = spec.Paths()
+				rs.SensitiveScanned = true
 				prior = rv
 				priorPrivate = rpriv
 			}
@@ -136,13 +171,14 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		// Config value from raw config; refs resolve to planned values. An
 		// attribute absent from config is null here, which is what "the
 		// author did not write this" means to a provider.
-		configVal, cds := provider.Compose(res.Config, ty, false, resolve)
+		configVal, cds := provider.Compose(res.Config, ty, provider.EnvResolve, resolve)
 		ds = append(ds, cds...)
 		if cds.HasErrors() {
 			return nil, ds
 		}
 
 		vds := client.ValidateResource(ctx, res.Type, configVal)
+		vds = provider.Context(addr, vds)
 		ds = append(ds, vds...)
 		if vds.HasErrors() {
 			return nil, ds
@@ -156,6 +192,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		proposed := provider.ProposedNew(schema.Block, prior, configVal)
 
 		pc, pds := client.PlanResource(ctx, res.Type, prior, proposed, configVal, priorPrivate)
+		pds = provider.Context(addr, pds)
 		ds = append(ds, pds...)
 		if pds.HasErrors() {
 			return nil, ds
@@ -163,7 +200,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		planned := pc.State
 		plannedValues[addr] = planned
 
-		ch, err := newChange(addr, prior, planned, ty, pc)
+		ch, err := newChange(addr, prior, planned, ty, pc, spec)
 		if err != nil {
 			ds = append(ds, diag.Errorf(addr, "cannot encode change", err.Error()))
 			return nil, ds
@@ -222,6 +259,19 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 		return nil, lds
 	}
 	ty := schema.Block.ImpliedType()
+	spec, sds := sensitive.Resolve(schema.Block, rs.SensitivePaths, nil)
+	lds = append(lds, sds...)
+	if sds.HasErrors() {
+		return nil, lds
+	}
+	paths := spec.Paths()
+	p.State.NoteSensitive(addr, paths)
+	// A state-only delete has no raw config and therefore no stable literal
+	// instance exemptions; its reporting copy is scrubbed path-level.
+	before, _, err := sensitive.RedactJSON(rs.Attributes, paths, nil)
+	if err != nil {
+		return nil, diag.Diagnostics{diag.Errorf(addr, "cannot sanitize delete state", err.Error())}
+	}
 	raw, err := msgpack.Marshal(cty.NullVal(ty), ty)
 	if err != nil {
 		return nil, diag.Diagnostics{diag.Errorf(addr, "cannot encode planned value", err.Error())}
@@ -229,7 +279,7 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 	return &Change{
 		Address:    addr,
 		Action:     "delete",
-		Before:     append(json.RawMessage(nil), rs.Attributes...),
+		Before:     before,
 		After:      json.RawMessage("null"),
 		PlannedRaw: raw,
 		Private:    rs.Private,
@@ -237,10 +287,14 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 }
 
 // newChange classifies and serializes one provider-planned resource change.
-func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.PlannedChange) (*Change, error) {
+func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.PlannedChange, spec *sensitive.Spec) (*Change, error) {
 	before := json.RawMessage("null") // JSON null for create
 	if !prior.IsNull() {
-		b, err := ctyjson.Marshal(prior, ty)
+		maskedPrior, _, err := spec.Redact(prior)
+		if err != nil {
+			return nil, fmt.Errorf("before redaction: %w", err)
+		}
+		b, err := ctyjson.Marshal(maskedPrior, ty)
 		if err != nil {
 			return nil, fmt.Errorf("before: %w", err)
 		}
@@ -249,8 +303,14 @@ func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.
 
 	after := json.RawMessage("null") // JSON null for delete
 	var unknownAfter []string
+	plannedForArtifact := planned
 	if !planned.IsNull() {
-		sanitized, paths, err := nullOutUnknowns(planned)
+		var err error
+		plannedForArtifact, err = spec.Unknown(planned)
+		if err != nil {
+			return nil, fmt.Errorf("sensitive unknowns: %w", err)
+		}
+		sanitized, paths, err := nullOutUnknowns(plannedForArtifact)
 		if err != nil {
 			return nil, fmt.Errorf("after: %w", err)
 		}
@@ -264,14 +324,14 @@ func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.
 
 	// PlannedRaw keeps the exact planned value, unknowns included, for the
 	// applier: cty/msgpack encodes unknowns as its extension type 0.
-	raw, err := msgpack.Marshal(planned, ty)
+	raw, err := msgpack.Marshal(plannedForArtifact, ty)
 	if err != nil {
 		return nil, fmt.Errorf("planned_raw: %w", err)
 	}
 
 	return &Change{
 		Address:         addr,
-		Action:          classify(prior, planned, pc.RequiresReplace),
+		Action:          classify(prior, planned, pc.RequiresReplace, spec),
 		Before:          before,
 		After:           after,
 		UnknownAfter:    unknownAfter,
@@ -285,15 +345,22 @@ func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.
 // create; prior and null planned => delete; RequiresReplace non-empty AND
 // planned differs on those paths => replace; planned == prior => no-op;
 // else update.
-func classify(prior, planned cty.Value, requiresReplace []string) string {
-	switch {
-	case prior.IsNull():
+func classify(prior, planned cty.Value, requiresReplace []string, spec *sensitive.Spec) string {
+	if prior.IsNull() {
 		return "create"
-	case planned.IsNull():
+	}
+	if planned.IsNull() {
 		return "delete"
-	case replaceRequired(prior, planned, requiresReplace):
+	}
+	maskedPrior, err1 := spec.Mask(prior)
+	maskedPlanned, err2 := spec.Mask(planned)
+	if err1 != nil || err2 != nil {
+		return "update"
+	}
+	switch {
+	case replaceRequired(maskedPrior, maskedPlanned, requiresReplace):
 		return "replace"
-	case planned.RawEquals(prior):
+	case maskedPlanned.RawEquals(maskedPrior):
 		return "no-op"
 	default:
 		return "update"
@@ -319,16 +386,8 @@ func replaceRequired(prior, planned cty.Value, paths []string) bool {
 	return false
 }
 
-// attrPath converts a dotted attribute path ("replace_me", "triggers.foo")
-// into a cty.Path of GetAttr steps.
-func attrPath(dotted string) cty.Path {
-	parts := strings.Split(dotted, ".")
-	path := cty.GetAttrPath(parts[0])
-	for _, part := range parts[1:] {
-		path = path.GetAttr(part)
-	}
-	return path
-}
+// attrPath retains the package-private call site while sharing one renderer/parser.
+func attrPath(dotted string) cty.Path { return sensitive.AttrPath(dotted) }
 
 // nullOutUnknowns is the research-digest workaround for ctyjson.Marshal
 // rejecting unknown values: replace every unknown with a typed null and
@@ -339,7 +398,7 @@ func nullOutUnknowns(v cty.Value) (cty.Value, []string, error) {
 	var paths []string
 	out, err := cty.Transform(v, func(p cty.Path, val cty.Value) (cty.Value, error) {
 		if !val.IsKnown() {
-			paths = append(paths, pathString(p))
+			paths = append(paths, PathString(p))
 			return cty.NullVal(val.Type()), nil
 		}
 		return val, nil
@@ -351,34 +410,8 @@ func nullOutUnknowns(v cty.Value) (cty.Value, []string, error) {
 	return out, paths, nil
 }
 
-// pathString renders a cty.Path as a dotted attribute path: "id",
-// "triggers.foo", `tags["env"]`, "items[0]". Adapted from the algorithm of
-// Terraform's internal tfdiags.FormatCtyPath (internal/tfdiags, BUSL-1.1,
-// not importable — reimplemented per research-cty.md §6), without the
-// leading dot.
-func pathString(path cty.Path) string {
-	var buf strings.Builder
-	for i, step := range path {
-		switch ts := step.(type) {
-		case cty.GetAttrStep:
-			if i > 0 {
-				buf.WriteByte('.')
-			}
-			buf.WriteString(ts.Name)
-		case cty.IndexStep:
-			key := ts.Key
-			switch {
-			case key.Type() == cty.Number && key.IsKnown() && !key.IsNull():
-				_, _ = fmt.Fprintf(&buf, "[%s]", key.AsBigFloat().Text('g', -1))
-			case key.Type() == cty.String && key.IsKnown() && !key.IsNull():
-				_, _ = fmt.Fprintf(&buf, "[%s]", strconv.Quote(key.AsString()))
-			default:
-				buf.WriteString("[...]")
-			}
-		}
-	}
-	return buf.String()
-}
+// PathString is retained for callers outside plan; implementation lives in the leaf package.
+func PathString(path cty.Path) string { return sensitive.PathString(path) }
 
 // sortedStateAddrs returns the state's resource addresses in sorted order.
 func sortedStateAddrs(st *state.State) []string {
@@ -390,10 +423,32 @@ func sortedStateAddrs(st *state.State) []string {
 	return addrs
 }
 
-// finalize sorts the changes by address (document determinism) and counts
-// the summary; no-op changes are listed but never counted.
+func newDrift(address string, before, after json.RawMessage) (*Drift, error) {
+	beforeValue, err := decodeJSON(before)
+	if err != nil {
+		return nil, fmt.Errorf("decode recorded value: %w", err)
+	}
+	afterValue, err := decodeJSON(after)
+	if err != nil {
+		return nil, fmt.Errorf("decode refreshed value: %w", err)
+	}
+	paths := changedPaths(beforeValue, afterValue)
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	return &Drift{
+		Address: address,
+		Before:  append(json.RawMessage(nil), before...),
+		After:   append(json.RawMessage(nil), after...),
+		Paths:   paths,
+	}, nil
+}
+
+// finalize sorts changes and drift by address (document determinism) and
+// counts the summary; no-op changes and drift are never counted.
 func finalize(pl *Plan) {
 	sort.Slice(pl.Changes, func(i, j int) bool { return pl.Changes[i].Address < pl.Changes[j].Address })
+	sort.Slice(pl.Drift, func(i, j int) bool { return pl.Drift[i].Address < pl.Drift[j].Address })
 	for _, ch := range pl.Changes {
 		switch ch.Action {
 		case "create":

@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/plan"
 	"github.com/tchori-labs/tchori/internal/provider"
 	"github.com/tchori-labs/tchori/internal/state"
+	ctymsgpack "github.com/zclconf/go-cty/cty/msgpack"
 )
 
 func TestHasChanges(t *testing.T) {
@@ -32,6 +35,169 @@ func TestHasChanges(t *testing.T) {
 	}
 }
 
+func TestWriteNewFileIsOwnerReadWriteOnly(t *testing.T) {
+	pl := &plan.Plan{FormatVersion: plan.FormatVersion}
+	path := filepath.Join(t.TempDir(), "plan.json")
+
+	if err := plan.Write(pl, path); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	assertPlanContent(t, path, pl)
+	assertOwnerReadWriteOnly(t, path)
+}
+
+func TestWriteOverwritePermissiveFileTightensMode(t *testing.T) {
+	pl := populatedPlan()
+	path := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(path, []byte("stale"), 0o644); err != nil { //nolint:gosec // G306: intentionally reproduce an existing permissive plan artifact
+		t.Fatalf("seed permissive plan: %v", err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil { //nolint:gosec // G302: explicitly defeat umask to reproduce the permissive overwrite
+		t.Fatalf("chmod permissive plan: %v", err)
+	}
+
+	if err := plan.Write(pl, path); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	first := assertPlanContent(t, path, pl)
+	assertOwnerReadWriteOnly(t, path)
+
+	if err := plan.Write(pl, path); err != nil {
+		t.Fatalf("second Write: %v", err)
+	}
+	second := assertPlanContent(t, path, pl)
+	if !bytes.Equal(first, second) {
+		t.Error("plan.json is not byte-identical across writes")
+	}
+	assertOwnerReadWriteOnly(t, path)
+
+	got, err := plan.Read(path)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if len(got.Changes) != 2 || !bytes.Equal(got.Changes[0].PlannedRaw, pl.Changes[0].PlannedRaw) ||
+		!bytes.Equal(got.Changes[1].Private, pl.Changes[1].Private) {
+		t.Errorf("Write/Read round-trip lost plan payloads: %+v", got.Changes)
+	}
+}
+
+func TestWriteSymlinkDestinationIsSafe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink behavior requires a permission-supporting platform")
+	}
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.json")
+	link := filepath.Join(dir, "plan.json")
+	sentinel := []byte("target must remain unchanged")
+	if err := os.WriteFile(target, sentinel, 0o600); err != nil {
+		t.Fatalf("write symlink target: %v", err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		if os.IsPermission(err) {
+			t.Skipf("symlink creation is not permitted: %v", err)
+		}
+		t.Fatalf("create symlink: %v", err)
+	}
+
+	pl := populatedPlan()
+	if err := plan.Write(pl, link); err != nil {
+		if targetContent, readErr := os.ReadFile(target); readErr != nil { //nolint:gosec // G304: target is inside t.TempDir()
+			t.Fatalf("read symlink target after rejected Write: %v", readErr)
+		} else if !bytes.Equal(targetContent, sentinel) {
+			t.Fatalf("rejected Write modified symlink target: got %q", targetContent)
+		}
+		return
+	}
+
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("Lstat replacement: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		t.Fatalf("destination mode = %v, want regular non-symlink file", info.Mode())
+	}
+	assertPlanContent(t, link, pl)
+	assertOwnerReadWriteOnly(t, link)
+	if targetContent, err := os.ReadFile(target); err != nil { //nolint:gosec // G304: target is inside t.TempDir()
+		t.Fatalf("read original symlink target: %v", err)
+	} else if !bytes.Equal(targetContent, sentinel) {
+		t.Fatalf("Write followed symlink: target got %q, want %q", targetContent, sentinel)
+	}
+}
+
+func TestWriteDirectoryDestinationReturnsWrappedError(t *testing.T) {
+	dir := t.TempDir()
+	if err := plan.Write(&plan.Plan{FormatVersion: plan.FormatVersion}, dir); err == nil {
+		t.Fatal("Write to directory succeeded, want error")
+	} else if !strings.Contains(err.Error(), "rename temp plan file") {
+		t.Fatalf("Write error = %q, want actionable rename context", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(dir), ".plan-*.tmp"))
+	if err != nil {
+		t.Fatalf("Glob temp plans: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Errorf("temporary plan files left behind after failure: %v", matches)
+	}
+}
+
+func populatedPlan() *plan.Plan {
+	return &plan.Plan{
+		FormatVersion: plan.FormatVersion,
+		EngineVersion: "0.1.0-dev",
+		StateSerial:   4,
+		Changes: []*plan.Change{
+			{
+				Address:    "tchoritest_thing.alpha",
+				Action:     "update",
+				Before:     json.RawMessage(`{"name":"before"}`),
+				After:      json.RawMessage(`{"name":"after"}`),
+				PlannedRaw: []byte{0x81, 0xa4, 'n', 'a', 'm', 'e'},
+			},
+			{
+				Address: "tchoritest_thing.beta",
+				Action:  "create",
+				Before:  json.RawMessage("null"),
+				After:   json.RawMessage(`{"token":null}`),
+				Private: []byte("provider-private-payload"),
+			},
+		},
+		Summary: plan.Summary{Create: 1, Update: 1},
+	}
+}
+
+func assertPlanContent(t *testing.T, path string, pl *plan.Plan) []byte {
+	t.Helper()
+	got, err := os.ReadFile(path) //nolint:gosec // G304: path is inside t.TempDir()
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	want, err := json.MarshalIndent(pl, "", "  ")
+	if err != nil {
+		t.Fatalf("MarshalIndent expected plan: %v", err)
+	}
+	want = append(want, '\n')
+	if !bytes.Equal(got, want) {
+		t.Errorf("plan content mismatch:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+	return got
+}
+
+func assertOwnerReadWriteOnly(t *testing.T, path string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("plan mode = %04o, want 0600", got)
+	}
+}
+
 func TestPlanWriteReadDeterminism(t *testing.T) {
 	pl := &plan.Plan{
 		FormatVersion: "1.0",
@@ -41,7 +207,7 @@ func TestPlanWriteReadDeterminism(t *testing.T) {
 			Address:      "tchoritest_thing.demo",
 			Action:       "create",
 			Before:       json.RawMessage("null"),
-			After:        json.RawMessage(`{"echo":null,"id":null,"name":"demo","replace_me":null,"tags":null}`),
+			After:        json.RawMessage(`{"echo":null,"id":null,"name":"demo","replace_me":null,"rules":null,"tags":null}`),
 			UnknownAfter: []string{"echo", "id"},
 		}},
 		Summary: plan.Summary{Create: 1},
@@ -182,7 +348,7 @@ func newPlanner(t *testing.T, cfg *config.Config, st *state.State) *plan.Planner
 	if ds.HasErrors() {
 		t.Fatalf("Schemas: %+v", ds)
 	}
-	provCfg, ds := provider.Compose(map[string]any{}, schemas.Provider.Block.ImpliedType(), true, nil)
+	provCfg, ds := provider.Compose(map[string]any{}, schemas.Provider.Block.ImpliedType(), provider.EnvResolve, nil)
 	if ds.HasErrors() {
 		t.Fatalf("compose provider config: %+v", ds)
 	}
@@ -201,8 +367,304 @@ func newPlanner(t *testing.T, cfg *config.Config, st *state.State) *plan.Planner
 
 // Apply-shaped state attributes, exactly as ctyjson.Marshal would emit them
 // (compact, attribute keys sorted).
-const demoApplied = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":null,"tags":null}`
-const demoAppliedOld = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"old","tags":null}`
+const demoApplied = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":null,"rules":null,"tags":null}`
+const demoAppliedOld = `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"old","rules":null,"tags":null}`
+
+func driftApplied(name, echo string) string {
+	return fmt.Sprintf(`{"echo":%q,"id":%q,"name":%q,"replace_me":null,"rules":null,"tags":null}`, echo, "id-"+name, name)
+}
+
+func TestPlanRecordsRefreshDriftWithoutChangingExitSemantics(t *testing.T) {
+	const addr = "tchoritest_thing.demo"
+	cfg := testConfig(t, map[string]map[string]any{addr: {"name": "drift-a"}})
+	p := newPlanner(t, cfg, stateWith(t, 3, map[string]string{addr: driftApplied("drift-a", "healthy")}))
+
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+	if pl.HasChanges() {
+		t.Fatal("drift-only plan must not report pending changes")
+	}
+	if len(pl.Drift) != 1 || pl.Drift[0].Address != addr || !slices.Equal(pl.Drift[0].Paths, []string{"echo"}) {
+		t.Fatalf("drift = %#v", pl.Drift)
+	}
+	if !bytes.Contains(pl.Drift[0].After, []byte(`"degraded:unhealthy"`)) {
+		t.Fatalf("drift after = %s", pl.Drift[0].After)
+	}
+}
+
+func TestPlanRefreshDriftDisabledAndMatching(t *testing.T) {
+	const addr = "tchoritest_thing.demo"
+	cfg := testConfig(t, map[string]map[string]any{addr: {"name": "drift-a"}})
+	for _, test := range []struct {
+		name    string
+		echo    string
+		refresh bool
+	}{
+		{name: "refresh disabled", echo: "healthy", refresh: false},
+		{name: "refresh matches", echo: "degraded:unhealthy", refresh: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p := newPlanner(t, cfg, stateWith(t, 1, map[string]string{addr: driftApplied("drift-a", test.echo)}))
+			p.Refresh = test.refresh
+			pl, ds := p.Plan(context.Background())
+			if ds.HasErrors() {
+				t.Fatalf("Plan diagnostics: %+v", ds)
+			}
+			if len(pl.Drift) != 0 {
+				t.Fatalf("unexpected drift: %#v", pl.Drift)
+			}
+		})
+	}
+}
+
+func TestPlanRefreshDriftSortedByAddress(t *testing.T) {
+	resources := map[string]map[string]any{
+		"tchoritest_thing.zed":   {"name": "drift-z"},
+		"tchoritest_thing.alpha": {"name": "drift-a"},
+	}
+	states := map[string]string{
+		"tchoritest_thing.zed":   driftApplied("drift-z", "healthy"),
+		"tchoritest_thing.alpha": driftApplied("drift-a", "healthy"),
+	}
+	pl, ds := newPlanner(t, testConfig(t, resources), stateWith(t, 1, states)).Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+	if len(pl.Drift) != 2 || pl.Drift[0].Address != "tchoritest_thing.alpha" || pl.Drift[1].Address != "tchoritest_thing.zed" {
+		t.Fatalf("drift order = %#v", pl.Drift)
+	}
+}
+
+func TestPlanGatewayHTMLRefreshDiagnostic(t *testing.T) {
+	const (
+		addr    = "tchoritest_thing.web"
+		summary = "Error reading project"
+		detail  = "decoding response: invalid character '<' looking for beginning of value"
+	)
+	cfg := testConfig(t, map[string]map[string]any{addr: {"name": "gateway_html"}})
+	st := stateWith(t, 1, map[string]string{addr: `{"echo":"gateway_html","id":"id-gateway_html","name":"gateway_html","replace_me":null,"rules":null,"tags":null}`})
+
+	pl, ds := newPlanner(t, cfg, st).Plan(context.Background())
+	if pl != nil {
+		t.Fatalf("Plan returned a plan despite refresh failure: %#v", pl)
+	}
+	if !ds.HasErrors() {
+		t.Fatalf("Plan diagnostics have no error: %#v", ds)
+	}
+	if len(ds) != 2 {
+		t.Fatalf("len(diagnostics) = %d, want provider error plus one hint: %#v", len(ds), ds)
+	}
+	if ds[0].Address != addr || ds[0].Summary != summary || ds[0].Detail != detail {
+		t.Fatalf("provider diagnostic was not attributed verbatim: %#v", ds[0])
+	}
+	if ds[1].Severity != "warning" || ds[1].Address != addr || ds[1].Summary != "provider received a non-JSON response (HTML)" || !strings.Contains(ds[1].Detail, "identity-aware proxy") {
+		t.Fatalf("advisory hint = %#v", ds[1])
+	}
+}
+
+func TestPlanGatewayAttributeRefreshDiagnostic(t *testing.T) {
+	const addr = "tchoritest_thing.web"
+	cfg := testConfig(t, map[string]map[string]any{addr: {"name": "gateway_attr"}})
+	st := stateWith(t, 1, map[string]string{addr: `{"echo":"gateway_attr","id":"id-gateway_attr","name":"gateway_attr","replace_me":null,"rules":null,"tags":null}`})
+	_, ds := newPlanner(t, cfg, st).Plan(context.Background())
+	if len(ds) != 1 || ds[0].Address != addr+".name" || ds[0].Summary != "invalid remote name" {
+		t.Fatalf("attribute diagnostic = %#v", ds)
+	}
+}
+
+func TestPlanValidateAndPlanDiagnosticsHaveResourceAddress(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		value   string
+		summary string
+	}{
+		{name: "validate RPC", value: "invalid", summary: "invalid name"},
+		{name: "plan RPC", value: "invalid_plan", summary: "invalid planned name"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			const addr = "tchoritest_thing.web"
+			cfg := testConfig(t, map[string]map[string]any{addr: {"name": test.value}})
+			p := newPlanner(t, cfg, stateWith(t, 0, nil))
+			p.Refresh = false
+			_, ds := p.Plan(context.Background())
+			if len(ds) != 1 || ds[0].Address != addr || ds[0].Summary != test.summary {
+				t.Fatalf("diagnostics = %#v", ds)
+			}
+		})
+	}
+}
+
+func TestPlanRedactsSensitiveArtifactsAndPlannedRaw(t *testing.T) {
+	const sentinel = "tchori-e2e-super-secret-value"
+	addr := "tchoritest_secretful.demo"
+	cfg := testConfig(t, map[string]map[string]any{addr: {"name": "demo"}})
+	attrs := `{"name":"demo","id":"secret-demo","client_secret":"` + sentinel + `","write_only_secret":null,"token":null,"note":null,"rules":null}`
+	st := stateWith(t, 1, map[string]string{addr: attrs})
+	p := newPlanner(t, cfg, st)
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan: %#v", ds)
+	}
+	if len(pl.Changes) != 1 {
+		t.Fatalf("changes=%d", len(pl.Changes))
+	}
+	ch := pl.Changes[0]
+	if bytes.Contains(ch.Before, []byte(sentinel)) || bytes.Contains(ch.After, []byte(sentinel)) || bytes.Contains(ch.PlannedRaw, []byte(sentinel)) {
+		t.Fatal("sentinel leaked into plan artifact")
+	}
+	sch, _, _ := p.Schemas["tchoritest"].LookupResourceType("tchoritest_secretful")
+	v, err := ctymsgpack.Unmarshal(ch.PlannedRaw, sch.Block.ImpliedType())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.GetAttr("client_secret").IsKnown() {
+		t.Fatal("planned_raw client_secret is not unknown")
+	}
+	if ch.Action != "no-op" {
+		t.Fatalf("action=%s, want no-op", ch.Action)
+	}
+	if !slices.Contains(ch.UnknownAfter, "client_secret") {
+		t.Fatalf("unknown_after=%v", ch.UnknownAfter)
+	}
+}
+
+func TestPlanStateOnlyDeleteUsesPersistedSensitivePaths(t *testing.T) {
+	addr := "tchoritest_secretful.gone"
+	st := stateWith(t, 1, map[string]string{addr: `{"name":"gone","id":"id","client_secret":null,"write_only_secret":null,"token":null,"note":"tchori-e2e-super-secret-value","rules":null}`})
+	st.Resources[addr].SensitivePaths = []string{"note"}
+	p := newPlanner(t, testConfig(t, nil), st)
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan: %#v", ds)
+	}
+	if bytes.Contains(pl.Changes[0].Before, []byte("tchori-e2e-super-secret-value")) {
+		t.Fatal("delete before leaked custom sensitive value")
+	}
+}
+
+func TestPlanRejectsEmbeddedReference(t *testing.T) {
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_thing.tunnel": {"name": "tunnel"},
+		"tchoritest_thing.wh": {
+			"name": "wh",
+			"tags": map[string]any{
+				"content": "${tchoritest_thing.tunnel.id}.cfargotunnel.com",
+			},
+		},
+	})
+	p := newPlanner(t, cfg, stateWith(t, 0, nil))
+
+	pl, ds := p.Plan(context.Background())
+	if pl != nil {
+		t.Fatalf("Plan = %+v, want nil for unresolved reference", pl)
+	}
+	found := false
+	for _, d := range ds {
+		if d.Summary == "unresolved reference" && strings.Contains(d.Detail, "tags.content") && strings.Contains(d.Detail, "${tchoritest_thing.tunnel.id}") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("diagnostics = %+v, want unresolved reference at tags.content", ds)
+	}
+}
+
+func TestPlanCreateWithResourceEnvWrapper(t *testing.T) {
+	t.Setenv("TCHORI_TEST_NAME", "alpha")
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_thing.demo": {"name": map[string]any{"env": "TCHORI_TEST_NAME"}},
+	})
+	p := newPlanner(t, cfg, stateWith(t, 0, nil))
+
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+	if pl == nil || len(pl.Changes) != 1 {
+		t.Fatalf("plan changes = %+v, want exactly one change", pl)
+	}
+	var after map[string]any
+	if err := json.Unmarshal(pl.Changes[0].After, &after); err != nil {
+		t.Fatalf("decode planned after: %v", err)
+	}
+	if got := after["name"]; got != "alpha" {
+		t.Errorf("planned name = %#v, want environment value %q", got, "alpha")
+	}
+	for _, path := range pl.Changes[0].UnknownAfter {
+		if path == "name" {
+			t.Errorf("unknown_after = %v, environment value must be concrete", pl.Changes[0].UnknownAfter)
+		}
+	}
+}
+
+func TestPlanResourceEnvWrappersNestedAndReferenced(t *testing.T) {
+	t.Setenv("TCHORI_TEST_NAME", "alpha")
+	t.Setenv("TCHORI_TEST_TAG", "secret-tag")
+	t.Setenv("TCHORI_TEST_LABEL", "secret-label")
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_thing.alpha": {
+			"name": map[string]any{"env": "TCHORI_TEST_NAME"},
+			"tags": map[string]any{"token": map[string]any{"env": "TCHORI_TEST_TAG"}},
+		},
+		"tchoritest_thing.beta": {
+			"name": "${tchoritest_thing.alpha.name}",
+		},
+		"tchoritest_nested_thing.nested": {
+			"name":     "nested",
+			"settings": map[string]any{"label": map[string]any{"env": "TCHORI_TEST_LABEL"}},
+		},
+	})
+	p := newPlanner(t, cfg, stateWith(t, 0, nil))
+
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+	changes := make(map[string]map[string]any, len(pl.Changes))
+	for _, change := range pl.Changes {
+		var after map[string]any
+		if err := json.Unmarshal(change.After, &after); err != nil {
+			t.Fatalf("decode %s after: %v", change.Address, err)
+		}
+		changes[change.Address] = after
+	}
+	alpha := changes["tchoritest_thing.alpha"]
+	if got := alpha["tags"].(map[string]any)["token"]; got != "secret-tag" {
+		t.Errorf("planned map env value = %#v, want secret-tag", got)
+	}
+	if got := changes["tchoritest_thing.beta"]["name"]; got != "alpha" {
+		t.Errorf("onward reference to env value = %#v, want alpha", got)
+	}
+	nested := changes["tchoritest_nested_thing.nested"]["settings"].(map[string]any)
+	if got := nested["label"]; got != "secret-label" {
+		t.Errorf("planned nested env value = %#v, want secret-label", got)
+	}
+}
+
+func TestPlanResourceEnvWrapperUnset(t *testing.T) {
+	const envName = "TCHORI_TEST_PLAN_UNSET"
+	t.Setenv(envName, "placeholder")
+	if err := os.Unsetenv(envName); err != nil {
+		t.Fatalf("Unsetenv: %v", err)
+	}
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_thing.demo": {"name": map[string]any{"env": envName}},
+	})
+	p := newPlanner(t, cfg, stateWith(t, 0, nil))
+
+	pl, ds := p.Plan(context.Background())
+	if pl != nil {
+		t.Errorf("plan = %+v, want no partial plan", pl)
+	}
+	if !ds.HasErrors() {
+		t.Fatal("Plan succeeded; want unset environment diagnostic")
+	}
+	if ds[0].Summary != "environment variable not set" || !strings.Contains(ds[0].Detail, envName) {
+		t.Errorf("diagnostics = %+v, want unset variable %q", ds, envName)
+	}
+}
 
 func TestPlanCreateWithReference(t *testing.T) {
 	cfg := testConfig(t, map[string]map[string]any{
@@ -249,11 +711,11 @@ func TestPlanCreateWithReference(t *testing.T) {
 	if got := fmt.Sprintf("%v", beta.UnknownAfter); got != "[echo id name]" {
 		t.Errorf("beta unknown_after = %v, want [echo id name]", beta.UnknownAfter)
 	}
-	wantAlphaAfter := `{"echo":null,"id":null,"name":"alpha","replace_me":null,"tags":null}`
+	wantAlphaAfter := `{"echo":null,"id":null,"name":"alpha","replace_me":null,"rules":null,"tags":null}`
 	if string(alpha.After) != wantAlphaAfter {
 		t.Errorf("alpha after = %s, want %s", alpha.After, wantAlphaAfter)
 	}
-	wantBetaAfter := `{"echo":null,"id":null,"name":null,"replace_me":null,"tags":null}`
+	wantBetaAfter := `{"echo":null,"id":null,"name":null,"replace_me":null,"rules":null,"tags":null}`
 	if string(beta.After) != wantBetaAfter {
 		t.Errorf("beta after = %s, want %s", beta.After, wantBetaAfter)
 	}
@@ -338,7 +800,7 @@ func TestPlanUpdateAndReplace(t *testing.T) {
 	if got := fmt.Sprintf("%v", ch.RequiresReplace); got != "[replace_me]" {
 		t.Errorf("requires_replace = %v, want [replace_me]", ch.RequiresReplace)
 	}
-	wantAfter := `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"new","tags":null}`
+	wantAfter := `{"echo":"demo","id":"id-demo","name":"demo","replace_me":"new","rules":null,"tags":null}`
 	if string(ch.After) != wantAfter {
 		t.Errorf("after = %s, want %s", ch.After, wantAfter)
 	}
@@ -414,8 +876,8 @@ func TestPlanDestroy(t *testing.T) {
 		"tchoritest_thing.beta":  {"name": "${tchoritest_thing.alpha.id}"},
 	})
 	st := stateWith(t, 7, map[string]string{
-		"tchoritest_thing.alpha": `{"echo":"alpha","id":"id-alpha","name":"alpha","replace_me":null,"tags":null}`,
-		"tchoritest_thing.beta":  `{"echo":"id-alpha","id":"id-id-alpha","name":"id-alpha","replace_me":null,"tags":null}`,
+		"tchoritest_thing.alpha": `{"echo":"alpha","id":"id-alpha","name":"alpha","replace_me":null,"rules":null,"tags":null}`,
+		"tchoritest_thing.beta":  `{"echo":"id-alpha","id":"id-id-alpha","name":"id-alpha","replace_me":null,"rules":null,"tags":null}`,
 	})
 	p := newPlanner(t, cfg, st)
 	p.Destroy = true
@@ -587,5 +1049,29 @@ func TestPlanServerAssignedUpdateKeepsComputedValues(t *testing.T) {
 		if after[attr] != want {
 			t.Errorf("after.%s = %v, want %v — a rename must not clear server-assigned fields", attr, after[attr], want)
 		}
+	}
+}
+
+func TestPlanRefreshMixedOptionalNestedObjects(t *testing.T) {
+	const attrs = `{"id":"id-demo","name":"demo","ingress":[{"service":"http://one","origin_request":null},{"service":"http://two","origin_request":{"connect_timeout":null,"no_tls_verify":null}}]}`
+	cfg := testConfig(t, map[string]map[string]any{
+		"tchoritest_ingress_thing.demo": {
+			"name": "demo",
+			"ingress": []any{
+				map[string]any{"service": "http://one"},
+				map[string]any{"service": "http://two", "origin_request": map[string]any{}},
+			},
+		},
+	})
+	st := stateWith(t, 1, map[string]string{"tchoritest_ingress_thing.demo": attrs})
+	p := newPlanner(t, cfg, st)
+	p.Refresh = true
+
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+	if pl == nil {
+		t.Fatal("Plan returned nil without diagnostics")
 	}
 }

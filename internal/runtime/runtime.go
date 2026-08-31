@@ -102,6 +102,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, diag.Diagnostics) {
 		rt.Providers[name] = client
 
 		ps, sds := client.Schemas(ctx)
+		sds = provider.Context("provider."+name, sds)
 		ds = append(ds, sds...)
 		if sds.HasErrors() {
 			rt.Close()
@@ -114,7 +115,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, diag.Diagnostics) {
 			return cty.NilVal, diag.Diagnostics{diag.Errorf(ref.Address, "reference in provider config",
 				fmt.Sprintf("provider %q configuration cannot reference resources (found ${%s.%s})", name, ref.Address, ref.Attr))}
 		}
-		composed, cds := provider.Compose(p.Config, ps.Provider.Block.ImpliedType(), true, refsForbidden)
+		composed, cds := provider.Compose(p.Config, ps.Provider.Block.ImpliedType(), provider.EnvResolve, refsForbidden)
 		ds = append(ds, cds...)
 		if cds.HasErrors() {
 			rt.Close()
@@ -122,6 +123,7 @@ func Build(ctx context.Context, opts Options) (*Runtime, diag.Diagnostics) {
 		}
 
 		confDs := client.Configure(ctx, composed)
+		confDs = provider.Context("provider."+name, confDs)
 		ds = append(ds, confDs...)
 		if confDs.HasErrors() {
 			rt.Close()

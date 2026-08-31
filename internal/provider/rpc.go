@@ -2,13 +2,12 @@
 // ValidateResource / PlanResource / ApplyResource / ReadResource) directly
 // over the generated tfplugin6 gRPC stubs.
 //
-// Encoding invariant: every cty.Value passed to these methods is already at
-// the relevant schema implied type (provider config at the provider block's
-// ImpliedType, resource values at the resource type's ImpliedType — composed
-// by Compose or decoded from state; create/delete nulls are
-// cty.NullVal(impliedType)). Therefore v.Type() IS that implied type and
-// EncodeDynamic(v, v.Type()) encodes at the schema type as the protocol
-// requires. Responses decode at the matching request types.
+// Encoding invariant: every request and response cty.Value is at the relevant
+// schema's deeply marker-free ImpliedType (provider config at the provider
+// block type; resource values at the resource type). Optional-attribute
+// markers remain schema conversion targets only and never enter RPC values
+// (issue #50). Therefore v.Type() is the protocol encoding type; all response
+// decoding goes through the guarded DecodeDynamic boundary.
 package provider
 
 import (
@@ -171,6 +170,42 @@ func (c *Client) ReadResource(ctx context.Context, typeName string, current cty.
 	return newState, resp.Private, ds
 }
 
+// ImportResource runs ImportResourceState for a real-world resource ID and
+// decodes the single returned imported object's state at ty (the resource
+// type's ImpliedType). MVP supports exactly one imported resource per call:
+// zero results is an error ("provider imported nothing"), and more than one
+// is an error ("multi-resource import not supported") — providers that
+// import into multiple resources per ID are out of scope for now. This layer
+// does not touch state; callers persist the returned value themselves.
+func (c *Client) ImportResource(ctx context.Context, typeName, id string, ty cty.Type) (cty.Value, []byte, diag.Diagnostics) {
+	resp, err := c.grpc.ImportResourceState(ctx, &tfplugin6.ImportResourceState_Request{
+		TypeName: typeName,
+		Id:       id,
+	})
+	if err != nil {
+		return cty.NilVal, nil, diag.Diagnostics{diag.Errorf("", "ImportResourceState RPC failed", err.Error())}
+	}
+	ds := rpcDiagnostics(resp.Diagnostics)
+	if ds.HasErrors() {
+		return cty.NilVal, nil, ds
+	}
+	switch len(resp.ImportedResources) {
+	case 0:
+		return cty.NilVal, nil, diag.Diagnostics{diag.Errorf("", "provider imported nothing", "")}
+	case 1:
+		// fall through
+	default:
+		return cty.NilVal, nil, diag.Diagnostics{diag.Errorf("", "multi-resource import not supported", "")}
+	}
+	imported := resp.ImportedResources[0]
+	state, moreDs := decodeRPCState(imported.State, ty, "imported state")
+	ds = append(ds, moreDs...)
+	if ds.HasErrors() {
+		return cty.NilVal, nil, ds
+	}
+	return state, imported.Private, ds
+}
+
 // --- helpers -----------------------------------------------------------------
 
 // encodeRPCValue wraps EncodeDynamic (typeconv.go) with a diagnostic error.
@@ -188,7 +223,7 @@ func encodeRPCValue(v cty.Value, what string) (*tfplugin6.DynamicValue, diag.Dia
 // (a provider omitting the field) decodes to a null value of ty.
 func decodeRPCState(dv *tfplugin6.DynamicValue, ty cty.Type, what string) (cty.Value, diag.Diagnostics) {
 	if dv == nil {
-		return cty.NullVal(ty), nil
+		return cty.NullVal(ty.WithoutOptionalAttributesDeep()), nil
 	}
 	v, err := DecodeDynamic(dv, ty)
 	if err != nil {

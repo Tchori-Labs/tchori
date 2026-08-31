@@ -2,16 +2,32 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 	"path/filepath"
 	"reflect"
 	"testing"
 
 	"github.com/zclconf/go-cty/cty"
+	"google.golang.org/grpc"
 
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/provider/proto/tfplugin6"
 )
+
+// fakeImportProviderClient embeds the (nil) generated interface so it only
+// needs to implement ImportResourceState for these unit tests; any other
+// method call would nil-panic, which is fine since ImportResource never
+// calls them.
+type fakeImportProviderClient struct {
+	tfplugin6.ProviderClient
+	resp *tfplugin6.ImportResourceState_Response
+	err  error
+}
+
+func (f *fakeImportProviderClient) ImportResourceState(_ context.Context, _ *tfplugin6.ImportResourceState_Request, _ ...grpc.CallOption) (*tfplugin6.ImportResourceState_Response, error) {
+	return f.resp, f.err
+}
 
 // buildFakeProviderForRPC compiles the Task 5 fake provider into a temp dir
 // and returns the binary path. Named distinctively so it cannot collide with
@@ -30,14 +46,16 @@ func buildFakeProviderForRPC(t *testing.T) string {
 	return bin
 }
 
-// thingVal builds a tchoritest_thing object value with all five attributes
-// present (tags always null here), matching the resource's implied type.
+// thingVal builds a tchoritest_thing object value with all six attributes
+// present (tags and rules always null here), matching the resource's
+// implied type.
 func thingVal(name, replaceMe, id, echo cty.Value) cty.Value {
 	return cty.ObjectVal(map[string]cty.Value{
 		"echo":       echo,
 		"id":         id,
 		"name":       name,
 		"replace_me": replaceMe,
+		"rules":      cty.NullVal(cty.List(cty.Object(map[string]cty.Type{"token_id": cty.String}))),
 		"tags":       cty.NullVal(cty.Map(cty.String)),
 	})
 }
@@ -198,5 +216,283 @@ func TestProviderRPCDialogue(t *testing.T) {
 	}
 	if got := pc2.State.GetAttr("id"); !got.RawEquals(cty.StringVal("Xid-foo")) {
 		t.Fatalf("PlanResource(replace): id = %#v, want prior %q kept", got, "Xid-foo")
+	}
+}
+
+// TestImportResource covers the ImportResource wrapper's success and error
+// paths against a fake ProviderClient (no real provider process needed).
+func TestImportResource(t *testing.T) {
+	ctx := context.Background()
+	ty := cty.Object(map[string]cty.Type{"id": cty.String, "name": cty.String})
+	stateVal := cty.ObjectVal(map[string]cty.Value{
+		"id":   cty.StringVal("Xid-foo"),
+		"name": cty.StringVal("foo"),
+	})
+	dv, err := EncodeDynamic(stateVal, ty)
+	if err != nil {
+		t.Fatalf("EncodeDynamic: %v", err)
+	}
+
+	t.Run("success", func(t *testing.T) {
+		c := &Client{grpc: &fakeImportProviderClient{resp: &tfplugin6.ImportResourceState_Response{
+			ImportedResources: []*tfplugin6.ImportResourceState_ImportedResource{
+				{TypeName: "tchoritest_thing", State: dv, Private: []byte("priv")},
+			},
+		}}}
+		got, priv, ds := c.ImportResource(ctx, "tchoritest_thing", "Xid-foo", ty)
+		if ds.HasErrors() {
+			t.Fatalf("ImportResource: unexpected diagnostics %v", ds)
+		}
+		if !got.RawEquals(stateVal) {
+			t.Fatalf("ImportResource: state = %#v, want %#v", got, stateVal)
+		}
+		if string(priv) != "priv" {
+			t.Fatalf("ImportResource: private = %q, want %q", priv, "priv")
+		}
+	})
+
+	t.Run("rpc error", func(t *testing.T) {
+		c := &Client{grpc: &fakeImportProviderClient{err: errors.New("dial failed")}}
+		_, _, ds := c.ImportResource(ctx, "tchoritest_thing", "Xid-foo", ty)
+		if !ds.HasErrors() {
+			t.Fatalf("ImportResource(rpc error): want error diagnostics, got %v", ds)
+		}
+	})
+
+	t.Run("provider diagnostic", func(t *testing.T) {
+		c := &Client{grpc: &fakeImportProviderClient{resp: &tfplugin6.ImportResourceState_Response{
+			Diagnostics: []*tfplugin6.Diagnostic{
+				{Severity: tfplugin6.Diagnostic_ERROR, Summary: "resource does not exist"},
+			},
+		}}}
+		_, _, ds := c.ImportResource(ctx, "tchoritest_thing", "bogus", ty)
+		if !ds.HasErrors() {
+			t.Fatalf("ImportResource(provider diagnostic): want error diagnostics, got %v", ds)
+		}
+		if ds[0].Summary != "resource does not exist" {
+			t.Fatalf("ImportResource(provider diagnostic): summary = %q, want %q", ds[0].Summary, "resource does not exist")
+		}
+	})
+
+	t.Run("zero results", func(t *testing.T) {
+		c := &Client{grpc: &fakeImportProviderClient{resp: &tfplugin6.ImportResourceState_Response{}}}
+		_, _, ds := c.ImportResource(ctx, "tchoritest_thing", "Xid-foo", ty)
+		if !ds.HasErrors() {
+			t.Fatalf("ImportResource(zero results): want error diagnostics, got %v", ds)
+		}
+		if ds[0].Summary != "provider imported nothing" {
+			t.Fatalf("ImportResource(zero results): summary = %q, want %q", ds[0].Summary, "provider imported nothing")
+		}
+	})
+
+	t.Run("multi results", func(t *testing.T) {
+		c := &Client{grpc: &fakeImportProviderClient{resp: &tfplugin6.ImportResourceState_Response{
+			ImportedResources: []*tfplugin6.ImportResourceState_ImportedResource{
+				{TypeName: "tchoritest_thing", State: dv},
+				{TypeName: "tchoritest_other", State: dv},
+			},
+		}}}
+		_, _, ds := c.ImportResource(ctx, "tchoritest_thing", "Xid-foo", ty)
+		if !ds.HasErrors() {
+			t.Fatalf("ImportResource(multi results): want error diagnostics, got %v", ds)
+		}
+		if ds[0].Summary != "multi-resource import not supported" {
+			t.Fatalf("ImportResource(multi results): summary = %q, want %q", ds[0].Summary, "multi-resource import not supported")
+		}
+	})
+}
+
+// TestProviderRPCImportResourceState drives ImportResource against the real
+// fake provider process: apply a thing, import its own id back, and assert
+// the imported state matches the applied state (import -> plan is a no-op).
+// Also covers the provider's "id-" marker rejection (does-not-exist path).
+func TestProviderRPCImportResourceState(t *testing.T) {
+	ctx := context.Background()
+	bin := buildFakeProviderForRPC(t)
+
+	c, err := Launch(ctx, bin)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Logf("Close: %v", err)
+		}
+	})
+
+	schemas, ds := c.Schemas(ctx)
+	if ds.HasErrors() {
+		t.Fatalf("Schemas: %v", ds)
+	}
+	thingTy := schemas.ResourceTypes["tchoritest_thing"].Block.ImpliedType()
+
+	provCfg := cty.ObjectVal(map[string]cty.Value{"prefix": cty.StringVal("X")})
+	if ds := c.Configure(ctx, provCfg); ds.HasErrors() {
+		t.Fatalf("Configure: %v", ds)
+	}
+
+	okCfg := thingVal(cty.StringVal("foo"), cty.NullVal(cty.String),
+		cty.NullVal(cty.String), cty.NullVal(cty.String))
+	prior := cty.NullVal(thingTy)
+	pc, ds := c.PlanResource(ctx, "tchoritest_thing", prior, okCfg, okCfg, nil)
+	if ds.HasErrors() {
+		t.Fatalf("PlanResource: %v", ds)
+	}
+	applied, _, ds := c.ApplyResource(ctx, "tchoritest_thing", prior, pc.State, okCfg, pc.Private)
+	if ds.HasErrors() {
+		t.Fatalf("ApplyResource: %v", ds)
+	}
+	id := applied.GetAttr("id")
+
+	imported, _, ds := c.ImportResource(ctx, "tchoritest_thing", id.AsString(), thingTy)
+	if ds.HasErrors() {
+		t.Fatalf("ImportResource: %v", ds)
+	}
+	if !imported.RawEquals(applied) {
+		t.Fatalf("ImportResource: state = %#v, want %#v (applied)", imported, applied)
+	}
+
+	_, _, ds = c.ImportResource(ctx, "tchoritest_thing", "no-marker-here", thingTy)
+	if !ds.HasErrors() {
+		t.Fatalf("ImportResource(no id- marker): want error diagnostics, got none")
+	}
+}
+
+// buildFakeProvider5ForRPC compiles the protocol-5 fake provider
+// (testprovider5) into a temp dir and returns the binary path.
+func buildFakeProvider5ForRPC(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "terraform-provider-tchoritest5")
+	//nolint:gosec // G204: fixed "go build" argv; only variable part is t.TempDir(), not external input.
+	cmd := exec.Command("go", "build", "-o", bin, "./internal/provider/testprovider5")
+	cmd.Dir = filepath.Join("..", "..")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("go build testprovider5: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// TestProviderRPCDialogueProtocol5 drives the full RPC dialogue through the
+// tfplugin5 adapter against testprovider5: Configure -> Validate (ok +
+// error) -> Plan create -> Apply (unknowns resolved) -> Read -> Import,
+// plus a diagnostics-carrying apply failure ("explode") proving
+// Diagnostic/AttributePath conversion on a real wire exchange.
+func TestProviderRPCDialogueProtocol5(t *testing.T) {
+	ctx := context.Background()
+	bin := buildFakeProvider5ForRPC(t)
+
+	c, err := Launch(ctx, bin)
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := c.Close(); err != nil {
+			t.Logf("Close: %v", err)
+		}
+	})
+
+	schemas, ds := c.Schemas(ctx)
+	if ds.HasErrors() {
+		t.Fatalf("Schemas: %v", ds)
+	}
+	thingSchema := schemas.ResourceTypes["tchoritest5_thing"]
+	if thingSchema == nil {
+		t.Fatalf("resource type tchoritest5_thing missing from schemas: %v", schemas.ResourceTypes)
+	}
+	thingTy := thingSchema.Block.ImpliedType()
+
+	// 1. Configure with prefix="X".
+	provCfg := cty.ObjectVal(map[string]cty.Value{"prefix": cty.StringVal("X")})
+	if ds := c.Configure(ctx, provCfg); ds.HasErrors() {
+		t.Fatalf("Configure: %v", ds)
+	}
+
+	// 2. Validate ok: no diagnostics.
+	okCfg := thingVal(cty.StringVal("foo"), cty.NullVal(cty.String),
+		cty.NullVal(cty.String), cty.NullVal(cty.String))
+	if ds := c.ValidateResource(ctx, "tchoritest5_thing", okCfg); len(ds) != 0 {
+		t.Fatalf("ValidateResource(ok): unexpected diagnostics %v", ds)
+	}
+
+	// 3. Validate name="invalid": error diagnostic converted through the
+	// adapter's Diagnostic/AttributePath translation.
+	badCfg := thingVal(cty.StringVal("invalid"), cty.NullVal(cty.String),
+		cty.NullVal(cty.String), cty.NullVal(cty.String))
+	ds = c.ValidateResource(ctx, "tchoritest5_thing", badCfg)
+	if !ds.HasErrors() {
+		t.Fatalf("ValidateResource(invalid): want error diagnostics, got %v", ds)
+	}
+	if ds[0].Summary != "invalid name" {
+		t.Fatalf("ValidateResource(invalid): summary = %q, want %q", ds[0].Summary, "invalid name")
+	}
+
+	// 4. Plan create: id and echo unknown.
+	prior := cty.NullVal(thingTy)
+	pc, ds := c.PlanResource(ctx, "tchoritest5_thing", prior, okCfg, okCfg, []byte("p1"))
+	if ds.HasErrors() {
+		t.Fatalf("PlanResource(create): %v", ds)
+	}
+	if pc.State.GetAttr("id").IsKnown() {
+		t.Fatalf("PlanResource(create): id known %#v, want unknown", pc.State.GetAttr("id"))
+	}
+	if string(pc.Private) != "p1" {
+		t.Fatalf("PlanResource(create): private = %q, want %q passed through", pc.Private, "p1")
+	}
+
+	// 5. Apply create: id = "Xid-foo".
+	applied, newPriv, ds := c.ApplyResource(ctx, "tchoritest5_thing", prior, pc.State, okCfg, pc.Private)
+	if ds.HasErrors() {
+		t.Fatalf("ApplyResource: %v", ds)
+	}
+	if got := applied.GetAttr("id"); !got.RawEquals(cty.StringVal("Xid-foo")) {
+		t.Fatalf("ApplyResource: id = %#v, want %q", got, "Xid-foo")
+	}
+	if string(newPriv) != "p1" {
+		t.Fatalf("ApplyResource: private = %q, want %q passed through", newPriv, "p1")
+	}
+
+	// 6. Read: fake provider echoes state and private unchanged.
+	readBack, readPriv, ds := c.ReadResource(ctx, "tchoritest5_thing", applied, newPriv)
+	if ds.HasErrors() {
+		t.Fatalf("ReadResource: %v", ds)
+	}
+	if !readBack.RawEquals(applied) {
+		t.Fatalf("ReadResource: state = %#v, want echo of %#v", readBack, applied)
+	}
+	if string(readPriv) != "p1" {
+		t.Fatalf("ReadResource: private = %q, want %q", readPriv, "p1")
+	}
+
+	// 7. Import: importing the applied id back yields the same state
+	// (import -> plan is a no-op).
+	imported, _, ds := c.ImportResource(ctx, "tchoritest5_thing", applied.GetAttr("id").AsString(), thingTy)
+	if ds.HasErrors() {
+		t.Fatalf("ImportResource: %v", ds)
+	}
+	if !imported.RawEquals(applied) {
+		t.Fatalf("ImportResource: state = %#v, want %#v (applied)", imported, applied)
+	}
+
+	// 8. Import "missing": not-found diagnostic, proving the adapter
+	// converts a real provider-side error diagnostic correctly.
+	_, _, ds = c.ImportResource(ctx, "tchoritest5_thing", "missing", thingTy)
+	if !ds.HasErrors() {
+		t.Fatalf("ImportResource(missing): want error diagnostics, got none")
+	}
+
+	// 9. Apply "explode": diagnostics-carrying apply failure, proving
+	// Diagnostic conversion on a real wire exchange that actually fails.
+	explodeCfg := thingVal(cty.StringVal("explode"), cty.NullVal(cty.String),
+		cty.NullVal(cty.String), cty.NullVal(cty.String))
+	pc2, ds := c.PlanResource(ctx, "tchoritest5_thing", prior, explodeCfg, explodeCfg, nil)
+	if ds.HasErrors() {
+		t.Fatalf("PlanResource(explode): %v", ds)
+	}
+	_, _, ds = c.ApplyResource(ctx, "tchoritest5_thing", prior, pc2.State, explodeCfg, pc2.Private)
+	if !ds.HasErrors() {
+		t.Fatalf("ApplyResource(explode): want error diagnostics, got none")
+	}
+	if ds[0].Summary != "apply exploded" {
+		t.Fatalf("ApplyResource(explode): summary = %q, want %q", ds[0].Summary, "apply exploded")
 	}
 }
