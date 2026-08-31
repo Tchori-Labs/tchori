@@ -1,0 +1,5 @@
+reviews:
+  auto_review:
+    # `main` is reviewed by default; keep the integration branch covered too.
+    base_branches:
+      - develop
