@@ -530,6 +530,212 @@ func TestJobsMissingTimeoutDetectsOmission(t *testing.T) {
 	}
 }
 
+func TestPRSourceGateGuardsMainLiveWorkflow(t *testing.T) {
+	if err := PRSourceGateGuardsMain(readLiveWorkflow(t)); err != nil {
+		t.Fatalf("check live pull-request source gate: %v", err)
+	}
+}
+
+func TestPRSourceGateGuardsMainFixtures(t *testing.T) {
+	const gateRun = `if [ "$EVENT_NAME" != "pull_request" ] || [ "$BASE_REF" != "main" ]; then
+  exit 0
+fi
+if [ "$HEAD_REF" != "develop" ]; then
+  echo "pull requests into main must originate from develop" >&2
+  exit 1
+fi
+`
+
+	gateJob := func(job string) string {
+		return "jobs:\n  pr-source:\n" + job + `    steps:
+      - name: only develop may target main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+` + indentLines(gateRun, "          ")
+	}
+
+	tests := []struct {
+		name         string
+		workflowYAML string
+		wantError    string
+	}{
+		{
+			name:         "unconditional env-driven gate passes",
+			workflowYAML: gateJob("    runs-on: ubuntu-latest\n    timeout-minutes: 5\n"),
+		},
+		{
+			name: "deleted gate job is rejected",
+			workflowYAML: `jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: go test -count=1 ./...
+`,
+			wantError: "declares no pr-source job",
+		},
+		{
+			name:         "job-level if is rejected",
+			workflowYAML: gateJob("    runs-on: ubuntu-latest\n    timeout-minutes: 5\n    if: github.base_ref == 'main'\n"),
+			wantError:    "job-level if condition",
+		},
+		{
+			name:         "needs is rejected",
+			workflowYAML: gateJob("    runs-on: ubuntu-latest\n    timeout-minutes: 5\n    needs: check\n"),
+			wantError:    "must not declare needs",
+		},
+		{
+			name:         "continue-on-error is rejected",
+			workflowYAML: gateJob("    runs-on: ubuntu-latest\n    timeout-minutes: 5\n    continue-on-error: true\n"),
+			wantError:    "continue-on-error",
+		},
+		{
+			name: "step-level if is rejected",
+			workflowYAML: `jobs:
+  pr-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: only develop may target main
+        if: github.head_ref != 'develop'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          test "$HEAD_REF" = develop || exit 1
+`,
+			wantError: "must not declare an if condition",
+		},
+		{
+			name: "gate that never fails is rejected",
+			workflowYAML: `jobs:
+  pr-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: only develop may target main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD_REF" != "develop" ]; then
+            echo "warning: head is $HEAD_REF"
+          fi
+`,
+			wantError: "non-zero exit",
+		},
+		{
+			name: "gate allowing a head ref other than develop is rejected",
+			workflowYAML: `jobs:
+  pr-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: only develop may target main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD_REF" != "release" ]; then
+            exit 1
+          fi
+`,
+			wantError: "must compare the head ref to develop",
+		},
+		{
+			name: "gate that ignores the guarded base is rejected",
+			workflowYAML: `jobs:
+  pr-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: only develop may target main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD_REF" != "develop" ]; then
+            exit 1
+          fi
+`,
+			wantError: "must scope the gate to base ref main",
+		},
+		{
+			name: "missing env mapping is rejected",
+			workflowYAML: `jobs:
+  pr-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: only develop may target main
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ] || [ "$BASE_REF" != "main" ]; then
+            exit 0
+          fi
+          if [ "$HEAD_REF" != "develop" ]; then
+            exit 1
+          fi
+`,
+			wantError: "must map BASE_REF",
+		},
+		{
+			name: "ref interpolated into the run script is rejected",
+			workflowYAML: `jobs:
+  pr-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: only develop may target main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ] || [ "$BASE_REF" != "main" ]; then
+            exit 0
+          fi
+          if [ "${{ github.head_ref }}" != "develop" ]; then
+            exit 1
+          fi
+`,
+			wantError: "must not interpolate",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := PRSourceGateGuardsMain([]byte(tt.workflowYAML))
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("PRSourceGateGuardsMain() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("PRSourceGateGuardsMain() error = %v, want error containing %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func indentLines(script, indent string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(strings.TrimRight(script, "\n"), "\n") {
+		b.WriteString(indent)
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 func readLiveWorkflow(t *testing.T) []byte {
 	t.Helper()
 

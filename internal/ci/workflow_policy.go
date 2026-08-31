@@ -292,6 +292,96 @@ func CheckJobRunsWorkflowLint(workflowYAML []byte) error {
 	return nil
 }
 
+// Pull requests may only reach main from the integration branch. GitHub
+// rulesets can only condition on the base ref, so the source-branch
+// restriction is carried by a required status context instead.
+const (
+	prSourceGateJob     = "pr-source"
+	prSourceAllowedHead = "develop"
+	prSourceGuardedBase = "main"
+)
+
+// prSourceGateEnv maps the shell variables the gate script reads to the
+// workflow expressions that must supply them. Reading refs through env keeps
+// attacker-chosen branch names out of the script body.
+var prSourceGateEnv = map[string]string{
+	"EVENT_NAME": "${{ github.event_name }}",
+	"BASE_REF":   "${{ github.base_ref }}",
+	"HEAD_REF":   "${{ github.head_ref }}",
+}
+
+// nonZeroExit matches a shell exit with a failing status.
+var nonZeroExit = regexp.MustCompile(`\bexit\s+[1-9][0-9]*\b`)
+
+// PRSourceGateGuardsMain verifies that the workflow declares an
+// unconditional pr-source job whose script rejects a pull request into main
+// that does not originate from develop. The job declares no dependency and no
+// condition, so GitHub always reports the required status context instead of
+// reporting it skipped.
+func PRSourceGateGuardsMain(workflowYAML []byte) error {
+	doc, err := parseWorkflow(workflowYAML)
+	if err != nil {
+		return err
+	}
+
+	gate, ok := doc.Jobs[prSourceGateJob]
+	if !ok {
+		return fmt.Errorf("workflow declares no %s job", prSourceGateJob)
+	}
+	if gate.Needs != nil {
+		return fmt.Errorf("%s job must not declare needs; dependencies can skip the required context", prSourceGateJob)
+	}
+	if strings.TrimSpace(gate.If) != "" {
+		return fmt.Errorf("%s job must not declare a job-level if condition", prSourceGateJob)
+	}
+	if gate.ContinueOnError {
+		return fmt.Errorf("%s job must not allow failures with continue-on-error", prSourceGateJob)
+	}
+
+	for _, step := range gate.Steps {
+		_, declaresHeadRef := step.Env["HEAD_REF"]
+		if !declaresHeadRef && !strings.Contains(step.Run, "$HEAD_REF") {
+			continue
+		}
+		return prSourceGateStepIsSound(step)
+	}
+	return fmt.Errorf("%s job must run a gate step that reads the head ref from env", prSourceGateJob)
+}
+
+func prSourceGateStepIsSound(step workflowStep) error {
+	if step.ContinueOnError {
+		return fmt.Errorf("%s gate step must not allow failures with continue-on-error", prSourceGateJob)
+	}
+	if strings.TrimSpace(step.If) != "" {
+		return fmt.Errorf("%s gate step must not declare an if condition", prSourceGateJob)
+	}
+	if strings.Contains(step.Run, "${{") {
+		return fmt.Errorf("%s gate step must not interpolate workflow expressions into the script; read refs from env", prSourceGateJob)
+	}
+
+	names := make([]string, 0, len(prSourceGateEnv))
+	for name := range prSourceGateEnv {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if step.Env[name] != prSourceGateEnv[name] {
+			return fmt.Errorf("%s gate step must map %s to %s", prSourceGateJob, name, prSourceGateEnv[name])
+		}
+	}
+
+	if !strings.Contains(step.Run, prSourceAllowedHead) {
+		return fmt.Errorf("%s gate step must compare the head ref to %s", prSourceGateJob, prSourceAllowedHead)
+	}
+	if !nonZeroExit.MatchString(step.Run) {
+		return fmt.Errorf("%s gate step must reject a disallowed head ref with a non-zero exit", prSourceGateJob)
+	}
+	if !strings.Contains(step.Run, "$BASE_REF") || !strings.Contains(step.Run, prSourceGuardedBase) {
+		return fmt.Errorf("%s gate step must scope the gate to base ref %s", prSourceGateJob, prSourceGuardedBase)
+	}
+	return nil
+}
+
 // ActionlintPinConsistency checks that CI, the verification script, and the
 // contributor documentation all name the same exact actionlint release.
 func ActionlintPinConsistency(workflowYAML, script, readme []byte) error {

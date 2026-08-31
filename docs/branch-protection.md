@@ -17,6 +17,7 @@ the JSON in Git does not apply it by itself.
 | Force pushes and deletion of `main` are blocked. | `non_fast_forward` and `deletion` rules are present. |
 | No bot, App, deploy key, role, team, or agent has standing bypass. | `bypass_actors` is empty. This is stricter than a repository-wide Admin-role exception and prevents a present or future admin bot from inheriting bypass. |
 | Tchorizo cannot push directly to `main`. | The pull-request rule is active and Tchorizo has no bypass. The operator proof below must also record an actually rejected direct-push attempt; the committed payload alone is not evidence of live enforcement. |
+| Pull requests into `main` originate only from `develop`. | Rulesets cannot condition on a pull request's head ref, so this is carried by the required `pr-source` status context instead — see [Develop-only source gate](#develop-only-source-gate). |
 
 There is no standing break-glass bypass. In an emergency, a repository admin
 must obtain the same recorded human authorization used for other apply
@@ -24,6 +25,45 @@ changes, preserve the pre-change ruleset response, make the smallest temporary
 ruleset edit, record the actor and reason, and restore and re-verify this
 payload immediately afterward. Giving the entire Admin repository role a
 bypass is prohibited because automated identities may acquire that role.
+
+## Develop-only source gate
+
+`main` is release-only: work integrates on `develop` and reaches `main` through
+a single `develop` → `main` pull request. GitHub rulesets cannot express that
+rule — every ruleset condition applies to the *base* ref, and no rule inspects
+the head ref. The restriction is therefore carried by a required status
+context:
+
+- `.github/workflows/ci.yml` declares the `pr-source` job. It has no `needs`
+  and no job-level `if`, so GitHub always reports the context instead of
+  reporting it skipped, and it reads `github.event_name`, `github.base_ref`
+  and `github.head_ref` through `env` rather than interpolating them into the
+  script. On a pull request whose base is `main` and whose head is not
+  `develop`, the job exits non-zero; otherwise it exits zero.
+- `.github/rulesets/main-protection.json` lists both `check` and `pr-source`
+  as required contexts under a strict policy, so a blocked gate blocks merge.
+- `internal/ci` regression-tests the gate: `PRSourceGateGuardsMain` fails if
+  the job is deleted, given a `needs` or `if` that could make GitHub skip the
+  context, weakened to never exit non-zero, pointed at a head ref other than
+  `develop`, or rewritten to interpolate a branch name into the shell script.
+
+The gate is only as strong as the ruleset that requires it: until a repository
+admin adds the `pr-source` context to the live ruleset, the workflow reports a
+failure that nothing enforces.
+
+`develop` must also be the repository's default branch. With `main` as default,
+Dependabot opens its pull requests against `main` from `dependabot/**` heads,
+which the gate rejects by design. Switching the default makes Dependabot and
+newly opened pull requests target `develop`:
+
+```sh
+gh api --method PATCH repos/Tchori-Labs/tchori -f default_branch=develop
+gh api repos/Tchori-Labs/tchori --cache 0 --jq .default_branch
+```
+
+This is a repository-admin step. Ruleset conditions name refs explicitly
+(`refs/heads/main`, `refs/heads/develop`), so changing the default branch does
+not move any protection.
 
 ## Apply or update (repository admin only)
 
@@ -136,7 +176,21 @@ approve it with the author identity, and do not weaken the ruleset.
    Capture the remote rejection text. If the push unexpectedly succeeds,
    stop: protection is not proven and the repository admin must remediate the
    unexpected `main` change through the normal reviewed process.
-5. Close the unmerged PR, delete the remote branch, and return to the prior
+5. Confirm the develop-only source gate on that same pull request: its head is
+   the throwaway branch, not `develop`, so `pr-source` must be reported and
+   must have failed, and the pull request must stay blocked even if `check`
+   passes and a CODEOWNER approves:
+
+   ```sh
+   gh pr view "$pr_url" --json statusCheckRollup \
+     --jq '.statusCheckRollup[] | select(.name == "pr-source") | {name, conclusion}'
+   ```
+
+   Expected: `"conclusion": "FAILURE"`. A `SKIPPED` or absent `pr-source`
+   means the job acquired a condition or was removed, and the gate is not
+   enforced. Repeat the check on a real `develop` → `main` pull request, where
+   `pr-source` must report `SUCCESS`.
+6. Close the unmerged PR, delete the remote branch, and return to the prior
    local branch:
 
    ```sh
@@ -148,8 +202,9 @@ approve it with the author identity, and do not weaken the ruleset.
 
 Evidence is complete only when it contains the admin-visible API readback, an
 all-PASS verifier run, the unapproved PR's blocked state with `check`, the
-rejected direct-push output, the unchanged `main` SHA, and cleanup of the PR
-and branch.
+failed `pr-source` conclusion for a non-`develop` head, the rejected
+direct-push output, the unchanged `main` SHA, and cleanup of the PR and
+branch.
 
 ## Current application status
 
@@ -170,6 +225,15 @@ by Tchorizo was rejected with `GH013`, the `main` SHA remained
 were closed and deleted without merging. These observations prove the gate for
 the Tchorizo identity; future audits should still run the verifier and repeat
 the procedure after material ruleset changes.
+
+The develop-only source gate (`pr-source` context plus `default_branch:
+develop`) is **prepared but not yet applied**: `.github/rulesets/main-protection.json`
+and `.github/workflows/ci.yml` carry it, the live ruleset `19127009` still
+requires only `check`, and the live `default_branch` is still `main`. Until a
+repository admin runs the PUT above and the `default_branch` PATCH, only the
+workflow reports the violation; nothing blocks the merge, and
+`scripts/verify-branch-protection.sh` fails the
+"required check and pr-source contexts" criterion by design.
 
 ## Preserved human gates
 

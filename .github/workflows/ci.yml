@@ -171,3 +171,27 @@ jobs:
           sbom="$(find dist -maxdepth 1 -type f -name '*.sbom.json' -print -quit)"
           test -n "$sbom"
           ls dist/*.sbom.json
+
+  # GitHub rulesets can only condition on the base ref, so the "only develop
+  # may target main" rule is carried by this required status context. The job
+  # declares no needs and no condition: a skipped context is not a proof.
+  pr-source:
+    name: pr-source
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: only develop may target main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ] || [ "$BASE_REF" != "main" ]; then
+            printf 'gate not applicable (event=%s base=%s)\n' "$EVENT_NAME" "$BASE_REF"
+            exit 0
+          fi
+          if [ "$HEAD_REF" != "develop" ]; then
+            printf '::error::pull requests into main must originate from develop (head=%s)\n' "$HEAD_REF"
+            exit 1
+          fi
+          printf 'head=develop may target main\n'
