@@ -226,14 +226,28 @@ were closed and deleted without merging. These observations prove the gate for
 the Tchorizo identity; future audits should still run the verifier and repeat
 the procedure after material ruleset changes.
 
-The develop-only source gate (`pr-source` context plus `default_branch:
-develop`) is **prepared but not yet applied**: `.github/rulesets/main-protection.json`
-and `.github/workflows/ci.yml` carry it, the live ruleset `19127009` still
-requires only `check`, and the live `default_branch` is still `main`. Until a
-repository admin runs the PUT above and the `default_branch` PATCH, only the
-workflow reports the violation; nothing blocks the merge, and
-`scripts/verify-branch-protection.sh` fails the
-"required check and pr-source contexts" criterion by design.
+The develop-only source gate is **half applied**.
+
+Applied: repository admin `@VictorCano` set `default_branch` to `develop` on
+2026-09-01; `gh api repos/Tchori-Labs/tchori --cache 0 --jq .default_branch`
+reads back `develop`. Dependabot and newly opened pull requests now target
+`develop`. Any pull request into `main` that was opened while `main` was the
+default keeps its original base and is not retargeted by GitHub.
+
+Not applied: live ruleset `19127009` still requires only the `check` context,
+so `scripts/verify-branch-protection.sh` fails the "required check and
+pr-source contexts" criterion by design, and a pull request into `main` from a
+branch other than `develop` reports a red `pr-source` that nothing enforces.
+
+The remaining PUT is deliberately ordered **after** the `pr-source` job reaches
+`develop`. A required context that no workflow on the base branch can produce
+is reported as expected-and-missing, which blocks every open `develop` → `main`
+pull request until the workflow lands. Once `.github/workflows/ci.yml` on
+`develop` declares the job, run the PUT from
+[Apply or update](#apply-or-update-repository-admin-only) and then
+`scripts/verify-branch-protection.sh`. Note that the committed payload is named
+`main-protection`, so the PUT also renames live ruleset `19127009` from
+`protect-main-releases-only`.
 
 ## Preserved human gates
 
