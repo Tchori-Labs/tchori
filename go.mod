@@ -2,7 +2,7 @@ module github.com/tchori-labs/tchori
 
 go 1.26
 
-toolchain go1.26.5
+toolchain go1.26.6
 
 require (
 	github.com/ProtonMail/go-crypto v1.4.1
