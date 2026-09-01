@@ -15,7 +15,12 @@ concurrency:
 jobs:
   check:
     name: check
-    runs-on: ubuntu-latest
+    # Organization self-hosted runners (tchori-runner-1/2) advertise
+    # [self-hosted Linux X64 docker]. GitHub matches runs-on labels exactly
+    # and never falls back to a hosted runner, so these labels are the whole
+    # scheduling decision; internal/ci.JobsOffSelfHostedRunners fails if any
+    # job drifts back to ubuntu-latest.
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 15 # Lint, tests, and the ~1-minute race run finish in 5–8 minutes; ~2x headroom bounds hangs.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -67,7 +72,7 @@ jobs:
 
   vulncheck:
     name: vulncheck
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -86,7 +91,7 @@ jobs:
 
   secretscan:
     name: secretscan
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -119,7 +124,7 @@ jobs:
   e2e:
     name: e2e
     needs: check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 20 # Registry and provider lifecycle typically finish under 10 minutes; ~2x headroom bounds hangs.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -142,7 +147,7 @@ jobs:
   goreleaser:
     name: goreleaser
     needs: check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 30 # Snapshot cross-builds typically finish under 15 minutes; ~2x headroom bounds stalls.
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -183,7 +188,7 @@ jobs:
   # declares no needs and no condition: a skipped context is not a proof.
   pr-source:
     name: pr-source
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 5
     steps:
       - name: only develop may target main

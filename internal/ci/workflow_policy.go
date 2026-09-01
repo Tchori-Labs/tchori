@@ -18,6 +18,7 @@ type workflowDoc struct {
 
 type workflowJob struct {
 	TimeoutMinutes  *int                `yaml:"timeout-minutes"`
+	RunsOn          any                 `yaml:"runs-on"`
 	Needs           any                 `yaml:"needs"`
 	If              string              `yaml:"if"`
 	ContinueOnError bool                `yaml:"continue-on-error"`
@@ -124,6 +125,68 @@ func JobsMissingTimeout(workflowYAML []byte) ([]string, error) {
 	}
 	sort.Strings(missing)
 	return missing, nil
+}
+
+// selfHostedRunnerLabels are the labels every CI job must request. The
+// organization's runners advertise [self-hosted Linux X64 docker]; requiring
+// the first three pins the jobs to those machines without demanding the
+// docker label a future runner might not carry. GitHub matches runner labels
+// exactly and never falls back, so a job that omits them silently runs on
+// paid GitHub-hosted infrastructure instead.
+var selfHostedRunnerLabels = []string{"self-hosted", "Linux", "X64"}
+
+// JobsOffSelfHostedRunners returns the sorted names of jobs whose runs-on
+// does not request every label in selfHostedRunnerLabels. A job with no
+// runs-on, or one that resolves its runner through a workflow expression the
+// repository cannot audit statically, counts as off the self-hosted runners.
+func JobsOffSelfHostedRunners(workflowYAML []byte) ([]string, error) {
+	doc, err := parseWorkflow(workflowYAML)
+	if err != nil {
+		return nil, err
+	}
+
+	var off []string
+	for name, job := range doc.Jobs {
+		if !requestsSelfHostedRunner(job.RunsOn) {
+			off = append(off, name)
+		}
+	}
+	sort.Strings(off)
+	return off, nil
+}
+
+func requestsSelfHostedRunner(runsOn any) bool {
+	var labels []string
+	switch value := runsOn.(type) {
+	case string:
+		labels = []string{value}
+	case []any:
+		for _, item := range value {
+			label, ok := item.(string)
+			if !ok {
+				return false
+			}
+			labels = append(labels, label)
+		}
+	default:
+		return false
+	}
+
+	for _, required := range selfHostedRunnerLabels {
+		found := false
+		for _, label := range labels {
+			if strings.Contains(label, "${{") {
+				return false
+			}
+			if label == required {
+				found = true
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // unpinnedActionRefSHA matches a full 40-hex-character lowercase commit SHA,
