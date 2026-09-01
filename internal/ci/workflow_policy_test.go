@@ -803,6 +803,110 @@ fi
 	}
 }
 
+func TestCodeQLAnalysisIsCapabilityGatedLiveWorkflow(t *testing.T) {
+	if err := CodeQLAnalysisIsCapabilityGated(readLiveCodeQLWorkflow(t)); err != nil {
+		t.Fatalf("check live CodeQL capability gate: %v", err)
+	}
+}
+
+func TestCodeQLAnalysisIsCapabilityGatedFixtures(t *testing.T) {
+	const probe = `      - name: probe code scanning availability
+        id: capability
+        run: |
+          echo "available=false" >>"$GITHUB_OUTPUT"
+`
+	const gated = `      - uses: github/codeql-action/init@0123456789012345678901234567890123456789
+        if: steps.capability.outputs.available == 'true'
+      - uses: github/codeql-action/autobuild@0123456789012345678901234567890123456789
+        if: steps.capability.outputs.available == 'true'
+      - uses: github/codeql-action/analyze@0123456789012345678901234567890123456789
+        if: steps.capability.outputs.available == 'true'
+`
+
+	tests := []struct {
+		name         string
+		workflowYAML string
+		wantError    string
+	}{
+		{
+			name:         "probe plus fully gated codeql steps passes",
+			workflowYAML: "jobs:\n  analyze:\n    steps:\n" + probe + gated,
+		},
+		{
+			name:         "missing probe step is rejected",
+			workflowYAML: "jobs:\n  analyze:\n    steps:\n" + gated,
+			wantError:    "must declare a step with id capability",
+		},
+		{
+			name: "conditioned probe step is rejected",
+			workflowYAML: `jobs:
+  analyze:
+    steps:
+      - name: probe code scanning availability
+        id: capability
+        if: github.event_name == 'push'
+        run: echo "available=false" >>"$GITHUB_OUTPUT"
+` + gated,
+			wantError: "capability probe must not declare an if condition",
+		},
+		{
+			name: "ungated analyze step is rejected",
+			workflowYAML: "jobs:\n  analyze:\n    steps:\n" + probe + `      - uses: github/codeql-action/init@0123456789012345678901234567890123456789
+        if: steps.capability.outputs.available == 'true'
+      - uses: github/codeql-action/analyze@0123456789012345678901234567890123456789
+`,
+			wantError: "github/codeql-action/analyze must run only when steps.capability.outputs.available",
+		},
+		{
+			name: "continue-on-error instead of a gate is rejected",
+			workflowYAML: "jobs:\n  analyze:\n    steps:\n" + probe + `      - uses: github/codeql-action/analyze@0123456789012345678901234567890123456789
+        if: steps.capability.outputs.available == 'true'
+        continue-on-error: true
+`,
+			wantError: "must not allow failures with continue-on-error",
+		},
+		{
+			name: "probe that swallows an unexpected status is rejected",
+			workflowYAML: `jobs:
+  analyze:
+    steps:
+      - name: probe code scanning availability
+        id: capability
+        continue-on-error: true
+        run: echo "available=false" >>"$GITHUB_OUTPUT"
+` + gated,
+			wantError: "capability probe must not allow failures with continue-on-error",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := CodeQLAnalysisIsCapabilityGated([]byte(tt.workflowYAML))
+			if tt.wantError == "" {
+				if err != nil {
+					t.Fatalf("CodeQLAnalysisIsCapabilityGated() error = %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("CodeQLAnalysisIsCapabilityGated() error = %v, want error containing %q", err, tt.wantError)
+			}
+		})
+	}
+}
+
+func readLiveCodeQLWorkflow(t *testing.T) []byte {
+	t.Helper()
+
+	root := repositoryRoot(t)
+	workflowPath := filepath.Clean(filepath.Join(root, ".github", "workflows", "codeql.yml"))
+	workflowYAML, err := os.ReadFile(workflowPath) //nolint:gosec // G304: test reads the fixed in-repo CodeQL workflow.
+	if err != nil {
+		t.Fatalf("read live CodeQL workflow: %v", err)
+	}
+	return workflowYAML
+}
+
 func indentLines(script, indent string) string {
 	var b strings.Builder
 	for _, line := range strings.Split(strings.TrimRight(script, "\n"), "\n") {

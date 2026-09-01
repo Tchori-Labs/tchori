@@ -54,6 +54,7 @@ func (e *workflowEnvironment) UnmarshalYAML(node *yaml.Node) error {
 type workflowStep struct {
 	Run             string            `yaml:"run"`
 	Uses            string            `yaml:"uses"`
+	ID              string            `yaml:"id"`
 	If              string            `yaml:"if"`
 	ContinueOnError bool              `yaml:"continue-on-error"`
 	Env             map[string]string `yaml:"env"`
@@ -187,6 +188,111 @@ func requestsSelfHostedRunner(runsOn any) bool {
 		}
 	}
 	return true
+}
+
+// codeQLCapabilityStepID is the id of the step that probes whether code
+// scanning is available, and codeQLGateCondition is the exact condition every
+// CodeQL step must carry so the job reports success — with an explanation —
+// instead of a permanent red check on a plan where GitHub Advanced Security
+// is unavailable.
+const (
+	codeQLCapabilityStepID = "capability"
+	codeQLGateCondition    = "steps.capability.outputs.available == 'true'"
+)
+
+// codeQLGatedActions are the CodeQL actions that fail without code scanning.
+var codeQLGatedActions = []string{
+	"github/codeql-action/init",
+	"github/codeql-action/autobuild",
+	"github/codeql-action/analyze",
+}
+
+// CodeQLAnalysisIsCapabilityGated verifies that the CodeQL workflow probes
+// code-scanning availability in an unconditional step and runs every CodeQL
+// action only when that probe reported availability. The probe itself must
+// still fail the job on any status it does not recognise, and no step may
+// hide a real failure behind continue-on-error.
+func CodeQLAnalysisIsCapabilityGated(workflowYAML []byte) error {
+	doc, err := parseWorkflow(workflowYAML)
+	if err != nil {
+		return err
+	}
+
+	for _, name := range sortedJobNames(doc) {
+		job := doc.Jobs[name]
+		if !declaresCodeQLAction(job) {
+			continue
+		}
+		if err := codeQLJobIsGated(job); err != nil {
+			return fmt.Errorf("job %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func sortedJobNames(doc workflowDoc) []string {
+	names := make([]string, 0, len(doc.Jobs))
+	for name := range doc.Jobs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func declaresCodeQLAction(job workflowJob) bool {
+	for _, step := range job.Steps {
+		for _, action := range codeQLGatedActions {
+			if strings.HasPrefix(step.Uses, action+"@") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func codeQLJobIsGated(job workflowJob) error {
+	probe, ok := findStepByID(job, codeQLCapabilityStepID)
+	if !ok {
+		return fmt.Errorf("must declare a step with id %s that probes code-scanning availability", codeQLCapabilityStepID)
+	}
+	if strings.TrimSpace(probe.If) != "" {
+		return fmt.Errorf("capability probe must not declare an if condition; it decides for every event")
+	}
+	if probe.ContinueOnError {
+		return fmt.Errorf("capability probe must not allow failures with continue-on-error; an unrecognised status has to fail the job")
+	}
+
+	for _, step := range job.Steps {
+		action, gated := codeQLGatedAction(step.Uses)
+		if !gated {
+			continue
+		}
+		if step.ContinueOnError {
+			return fmt.Errorf("%s must not allow failures with continue-on-error", action)
+		}
+		if strings.TrimSpace(step.If) != codeQLGateCondition {
+			return fmt.Errorf("%s must run only when %s", action, codeQLGateCondition)
+		}
+	}
+	return nil
+}
+
+func codeQLGatedAction(uses string) (string, bool) {
+	for _, action := range codeQLGatedActions {
+		if strings.HasPrefix(uses, action+"@") {
+			return action, true
+		}
+	}
+	return "", false
+}
+
+func findStepByID(job workflowJob, id string) (workflowStep, bool) {
+	for _, step := range job.Steps {
+		if step.ID == id {
+			return step, true
+		}
+	}
+	return workflowStep{}, false
 }
 
 // unpinnedActionRefSHA matches a full 40-hex-character lowercase commit SHA,

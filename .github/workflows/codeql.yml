@@ -30,22 +30,80 @@ jobs:
         with:
           persist-credentials: false
 
+      # Code scanning needs GitHub Advanced Security, which the free
+      # organization plan does not include for a private repository. Without
+      # it github/codeql-action/analyze fails with "Advanced Security must be
+      # enabled for this repository to use code scanning" on every run, so the
+      # check is permanently red and reviewers learn to ignore it. This step
+      # asks the API whether code scanning is available and lets the job
+      # report that fact instead. Any status it does not recognise still fails
+      # the job: this gate reports a missing capability, it never swallows a
+      # real CodeQL failure. Once Advanced Security is enabled the probe
+      # reports available=true and the analysis below runs unchanged.
+      - name: probe code scanning availability
+        id: capability
+        env:
+          GH_API: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ github.token }}
+        run: |
+          response=$(curl --silent --show-error --write-out '\n%{http_code}' \
+            --header "Authorization: Bearer $TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GH_API/repos/$REPO/code-scanning/alerts?per_page=1")
+          status=${response##*$'\n'}
+          payload=${response%$'\n'*}
+
+          case "$status" in
+            200 | 404)
+              # 200: alerts readable. 404: enabled, nothing analysed yet.
+              echo 'available=true' >>"$GITHUB_OUTPUT"
+              ;;
+            403)
+              case "$payload" in
+                *'Advanced Security'*)
+                  echo 'available=false' >>"$GITHUB_OUTPUT"
+                  {
+                    echo '### CodeQL skipped'
+                    echo
+                    echo 'Code scanning is unavailable: GitHub Advanced Security is not'
+                    echo 'enabled for this private repository, so no Go analysis ran.'
+                    echo 'See docs/code-scanning.md.'
+                  } >>"$GITHUB_STEP_SUMMARY"
+                  ;;
+                *)
+                  printf '::error::code scanning probe was forbidden for an unexpected reason: %s\n' "$payload" >&2
+                  exit 1
+                  ;;
+              esac
+              ;;
+            *)
+              printf '::error::unexpected code scanning probe status %s: %s\n' "$status" "$payload" >&2
+              exit 1
+              ;;
+          esac
+
       - name: Set up Go
+        if: steps.capability.outputs.available == 'true'
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: 'go.mod'
           cache: true
 
       - name: Initialize CodeQL
+        if: steps.capability.outputs.available == 'true'
         uses: github/codeql-action/init@b7351df727350dca84cb9d725d57dcf5bc82ba26 # v3.37.1
         with:
           languages: go
           queries: security-extended
 
       - name: Autobuild
+        if: steps.capability.outputs.available == 'true'
         uses: github/codeql-action/autobuild@b7351df727350dca84cb9d725d57dcf5bc82ba26 # v3.37.1
 
       - name: Analyze
+        if: steps.capability.outputs.available == 'true'
         uses: github/codeql-action/analyze@b7351df727350dca84cb9d725d57dcf5bc82ba26 # v3.37.1
         with:
           category: '/language:go'
