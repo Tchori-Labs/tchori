@@ -58,7 +58,7 @@ func TestResolvePlannedUnknowns(t *testing.T) {
 			want:    cty.MapValEmpty(cty.String),
 		},
 		{
-			// TC-033 / Tchori-Labs/tchori#11 regression: lists now recurse
+			// TC-033 / Tchori-Labs/tchori-internal#11 regression: lists now recurse
 			// per-index, so an unknown element resolves to the corresponding
 			// concrete cfg element while a known planned element is left
 			// untouched even though cfgVal differs there.

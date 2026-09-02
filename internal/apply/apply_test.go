@@ -1605,7 +1605,7 @@ func stateRulesTokenID(t *testing.T, path, addr string) string {
 }
 
 // TestApplySingleApplyResolvesListNestedRefCreateUpdate is the exact
-// create+update reproduction of Tchori-Labs/tchori#11 (TC-033): resource
+// create+update reproduction of Tchori-Labs/tchori-internal#11 (TC-033): resource
 // "b" already exists in state (applied in a prior run with no rules), then
 // a single plan+apply both creates resource "a" and updates "b" so that
 // b's "rules" list holds a reference to a's (not-yet-applied-at-plan-time)

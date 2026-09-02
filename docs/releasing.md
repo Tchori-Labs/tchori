@@ -87,18 +87,19 @@ does not create or protect the Environment.
 
 ### Current application status
 
-**PENDING as of 2026-08-03.** The live list response is
-`{"total_count":0,"environments":[]}`, and the detail and deployment-policy
-endpoints return HTTP 404. The non-admin Tchorizo token cannot apply the
-payload. The administrator handoff is recorded in
-[issue #77](https://github.com/Tchori-Labs/tchori/issues/77#issuecomment-5165580020),
-where eventual admin-visible readback and all-PASS evidence must also be
-recorded. Until that evidence exists,
-[TC-059](https://github.com/Tchori-Labs/tchori/issues/66)
-remains blocked together with its separate TC-068 board-decision gate.
+**Applied as of 2026-09-02.** Repository admin `@VictorCano` applied the
+`release` Environment to the live repository and created its two custom
+deployment-branch policies. `scripts/verify-release-environment.sh` returned
+all PASS: the required reviewer is `@VictorCano`, `prevent_self_review` is
+`true`, and the declared policies are exactly branch `main` and tag pattern
+`v*`. The administrator handoff that led to this application is recorded in
+[issue #77](https://github.com/Tchori-Labs/tchori-internal/issues/77#issuecomment-5165580020).
+[TC-059](https://github.com/Tchori-Labs/tchori-internal/issues/66) is
+unblocked on this Environment control, but a release still also requires the
+separate TC-068 board-decision gate before any tag is created.
 
-Both release jobs reference this Environment, so once it is correctly applied
-GitHub pauses the selected job for required human review. The `dry-run` job
+Both release jobs reference this Environment, so GitHub pauses the selected
+job for required human review. The `dry-run` job
 cannot create or modify a GitHub Release; the `publish` job alone receives
 job-scoped `contents: write`. No other workflow or job receives publish
 permissions.

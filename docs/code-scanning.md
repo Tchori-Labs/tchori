@@ -4,16 +4,13 @@ This repository runs CodeQL for Go from [`.github/workflows/codeql.yml`](../.git
 
 ## Capability gate
 
-Code scanning requires GitHub Advanced Security. The `Tchori-Labs`
-organization is on the free plan (`advanced_security_enabled_for_new_repositories: false`)
-and this repository is private, so `repos/Tchori-Labs/tchori.security_and_analysis`
-is `null` and `github/codeql-action/analyze` fails with `Advanced Security must
-be enabled for this repository to use code scanning`. Left alone, the check is
-red on every pull request and reviewers stop reading it.
-
-The workflow therefore starts with an unconditional `capability` step that asks
-`GET /repos/{owner}/{repo}/code-scanning/alerts` whether code scanning is
-available:
+Code scanning requires GitHub Advanced Security, which is free for public
+repositories. `Tchori-Labs/tchori` is public, so
+`repos/Tchori-Labs/tchori.security_and_analysis` reports code scanning as
+available, and the workflow's unconditional `capability` step — which asks
+`GET /repos/{owner}/{repo}/code-scanning/alerts` — resolves `available=true`
+on every run: Go setup, init, autobuild, and analyze all execute, and CodeQL
+performs real analysis on every pull request, push to `main`, and weekly run.
 
 | Probe result | Outcome |
 | --- | --- |
@@ -27,10 +24,11 @@ no `continue-on-error` anywhere in the workflow, and
 the probe is removed, given a condition, or if any CodeQL step loses the gate or
 gains `continue-on-error`.
 
-**A green `Analyze Go` while Advanced Security is off means no code was
-scanned.** Getting real analysis requires one of: enabling Advanced Security on
-a plan that includes it, or making the repository public (code scanning is free
-for public repositories). Both are board decisions.
+The `available=false` branch remains only as a safeguard: it is not expected
+to trigger while this repository stays public, but it protects against a
+future state where Advanced Security becomes unavailable here (for example if
+the repository were ever made private again), producing a clear job-summary
+message instead of a red, unexplained `Analyze Go` check.
 
 ## Required repository setting
 
