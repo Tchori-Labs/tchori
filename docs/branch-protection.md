@@ -222,14 +222,14 @@ branch.
 Repository admin `@VictorCano` applied the TC-013 controls to live ruleset
 `19127009` (`protect-main-releases-only`) on 2026-07-19. The admin handoff and
 application readback are recorded on
-[issue #21](https://github.com/Tchori-Labs/tchori/issues/21#issuecomment-5017039145).
+[issue #21](https://github.com/Tchori-Labs/tchori-internal/issues/21#issuecomment-5017039145).
 The live API response shows active enforcement on `refs/heads/main`, all pull
 request review controls, strict required `check`, deletion and non-fast-forward
 rules, and `current_user_can_bypass: "never"`; the administrator recorded no
 bypass actors.
 
 The non-destructive behavioral check used unmerged
-[PR #42](https://github.com/Tchori-Labs/tchori/pull/42). After `check` passed,
+[PR #42](https://github.com/Tchori-Labs/tchori-internal/pull/42). After `check` passed,
 the PR remained `BLOCKED` with `reviewDecision: REVIEW_REQUIRED`. A direct push
 by Tchorizo was rejected with `GH013`, the `main` SHA remained
 `e408ca5a98ce721b43943304c583145072d39964`, and the PR and throwaway branch
@@ -237,7 +237,7 @@ were closed and deleted without merging. These observations prove the gate for
 the Tchorizo identity; future audits should still run the verifier and repeat
 the procedure after material ruleset changes.
 
-The develop-only source gate is **half applied**.
+The develop-only source gate is **fully applied**.
 
 Applied: repository admin `@VictorCano` set `default_branch` to `develop` on
 2026-09-01; `gh api repos/Tchori-Labs/tchori --cache 0 --jq .default_branch`
@@ -245,20 +245,22 @@ reads back `develop`. Dependabot and newly opened pull requests now target
 `develop`. Any pull request into `main` that was opened while `main` was the
 default keeps its original base and is not retargeted by GitHub.
 
-Not applied: live ruleset `19127009` still requires only the `check` context,
-so `scripts/verify-branch-protection.sh` fails the "required check and
-pr-source contexts" criterion by design, and a pull request into `main` from a
-branch other than `develop` reports a red `pr-source` that nothing enforces.
+The `pr-source` PUT described above has been applied, not pending: live
+ruleset `main-protection` (id `22116672`) requires both the `check` and
+`pr-source` contexts under a strict policy, so
+`scripts/verify-branch-protection.sh` passes the "required check and
+pr-source contexts" criterion, and a pull request into `main` from a branch
+other than `develop` is genuinely blocked by `pr-source`.
 
-The remaining PUT is deliberately ordered **after** the `pr-source` job reaches
-`develop`. A required context that no workflow on the base branch can produce
-is reported as expected-and-missing, which blocks every open `develop` → `main`
-pull request until the workflow lands. Once `.github/workflows/pr-source.yml` on
-`develop` declares the job, run the PUT from
-[Apply or update](#apply-or-update-repository-admin-only) and then
-`scripts/verify-branch-protection.sh`. Note that the committed payload is named
-`main-protection`, so the PUT also renames live ruleset `19127009` from
-`protect-main-releases-only`.
+**2026-09-02 — repository recreated public.** `Tchori-Labs/tchori` was
+recreated as a public repository from filtered history; the previous private
+repository was renamed `Tchori-Labs/tchori-internal`. Repository admin
+`@VictorCano` applied ruleset `main-protection` (id `22116672`) and a new
+`guard-develop` ruleset (id `22116673`) to the recreated repository, and
+`scripts/verify-branch-protection.sh` returned all PASS against the live
+state. The status recorded earlier in this section — ruleset `19127009` and
+PR #42 — refers to the archived `Tchori-Labs/tchori-internal` repository and
+its ruleset IDs no longer apply here.
 
 ## Preserved human gates
 

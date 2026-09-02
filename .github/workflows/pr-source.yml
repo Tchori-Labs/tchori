@@ -21,7 +21,7 @@ concurrency:
 jobs:
   pr-source:
     name: pr-source
-    runs-on: [self-hosted, Linux, X64]
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: only develop in this repository may target main

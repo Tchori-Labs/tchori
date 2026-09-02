@@ -224,7 +224,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		// guess at the post-apply object, so Computed attributes the author
 		// left unset keep the value the provider assigned last run instead of
 		// reverting to null. Sending config for both makes every plan read as
-		// "clear all server-assigned fields" (Tchori-Labs/tchori#59).
+		// "clear all server-assigned fields" (Tchori-Labs/tchori-internal#59).
 		proposed := provider.ProposedNew(schema.Block, prior, configVal)
 
 		pc, pds := client.PlanResource(ctx, res.Type, prior, proposed, configVal, priorPrivate)

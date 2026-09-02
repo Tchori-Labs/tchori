@@ -5,28 +5,29 @@ This runbook is the repository-admin and board procedure for making
 this runbook changes no GitHub setting and designates no contact. The human gates
 in [`AGENTS.md`](../AGENTS.md) remain authoritative.
 
-## Current state (2026-07-17)
+## Current state (2026-09-02)
 
 A read-only audit observed:
 
 - `gh api repos/Tchori-Labs/tchori/private-vulnerability-reporting` returned
-  `{"enabled":false}`: GitHub private vulnerability reporting (PVR) is not
+  `{"enabled":true}`: GitHub private vulnerability reporting (PVR) is now
   enabled.
-- `gh api repos/Tchori-Labs/tchori --jq .permissions` reported `admin:false`.
-  The Tchorizo agent cannot enable PVR.
 - `gh api repos/Tchori-Labs/main --jq '[.full_name, .default_branch] | @tsv'`
   proved the state repository readable. One Git Trees request for
   `main:decisions?recursive=1` returned `truncated:false`, but local `jq` was
   unavailable. The single snapshot therefore could not be parsed without a
-  forbidden second request. The fallback verdict is **NOT AUDITABLE
-  (`listing-tool-unavailable`)**, verdict rule V1; no candidate was classified.
+  forbidden second request. The fallback verdict remains **NOT AUDITABLE
+  (`listing-tool-unavailable`)**, verdict rule V1; no Option B candidate was
+  classified.
 
-Neither option is proven operative, so the policy remains in the pending state.
-An unverified option never downgrades an independently proven option, but an
-unproven option never earns a marker. Within Option B, one ambiguous candidate
-makes the entire fallback verdict unauditable (V2 before V3). Ambiguity means
-*unverified*, never *absent*. An approved designation that is not authorized and
-extractable for publication is *not yet publishable*, not an operative channel.
+Option A is now proven operative: live PVR agreement (C3) passes against the
+`{"enabled":true}` readback. Option B remains unaudited rather than proven or
+disproven; an unverified option never downgrades an independently proven
+option, and V3 (`APPROVED`) wins once at least one option is operative.
+`SECURITY.md` still carries whichever marker state was current when it was
+last edited; re-run [`verify-security-contact.sh`](../scripts/verify-security-contact.sh)
+and update the document's marker and published region (C1/C2) before treating
+the channel as fully closed out end to end.
 
 ## Option A: enable GitHub PVR (repository admin only)
 

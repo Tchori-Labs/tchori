@@ -801,7 +801,7 @@ func mustSymlink(t *testing.T, oldname, newname string) {
 }
 
 // TestSaveBackupReplacesPlantedSymlinkWithoutClobbering reproduces the
-// arbitrary-file truncation reported in Tchori-Labs/tchori#34.
+// arbitrary-file truncation reported in Tchori-Labs/tchori-internal#34.
 func TestSaveBackupReplacesPlantedSymlinkWithoutClobbering(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")

@@ -1,6 +1,6 @@
 package main
 
-// TC-046 / Tchori-Labs/tchori#47 fixture. The create/update asymmetry is
+// TC-046 / Tchori-Labs/tchori-internal#47 fixture. The create/update asymmetry is
 // deliberate: create mimics a provider POST payload silently dropping authored
 // fields, while update mimics the corresponding PATCH honouring them.
 

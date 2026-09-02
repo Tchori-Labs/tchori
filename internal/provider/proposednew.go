@@ -20,7 +20,7 @@ import (
 // arrives as null, so the provider sees the operator asking to clear
 // server-assigned fields on every single plan. The resource can then never
 // converge — it plans as an update forever, and providers that turn a diff
-// into a PATCH send a body full of nulls (Tchori-Labs/tchori#59, where the
+// into a PATCH send a body full of nulls (Tchori-Labs/tchori-internal#59, where the
 // resulting PATCH against a Cloudflare tunnel returns 404).
 //
 // Note also that plan-modifier helpers providers rely on, such as the
