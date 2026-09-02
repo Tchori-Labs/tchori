@@ -34,18 +34,29 @@ rule — every ruleset condition applies to the *base* ref, and no rule inspects
 the head ref. The restriction is therefore carried by a required status
 context:
 
-- `.github/workflows/ci.yml` declares the `pr-source` job. It has no `needs`
-  and no job-level `if`, so GitHub always reports the context instead of
-  reporting it skipped, and it reads `github.event_name`, `github.base_ref`
-  and `github.head_ref` through `env` rather than interpolating them into the
-  script. On a pull request whose base is `main` and whose head is not
-  `develop`, the job exits non-zero; otherwise it exits zero.
+- `.github/workflows/pr-source.yml` declares the `pr-source` job in its own
+  workflow, separate from `ci.yml`. It has no `needs` and no job-level `if`,
+  so GitHub always reports the context instead of reporting it skipped, and it
+  reads `github.event_name`, `github.base_ref`, `github.head_ref`,
+  `github.event.pull_request.head.repo.full_name`, and `github.repository`
+  through `env` rather than interpolating them into the script. Its trigger
+  covers `opened`, `synchronize`, `reopened`, and `edited`: retargeting an
+  open pull request's base branch to `main` changes `base_ref` without a new
+  commit, and without the `edited` type the check run already attached to the
+  head SHA from the pull request's earlier base would keep satisfying the
+  ruleset. On a pull request whose base is `main`, the job also rejects a
+  head repository that differs from the base repository — a fork whose
+  branch happens to be named `develop` does not pass — and otherwise requires
+  the head ref to be `develop`; it exits non-zero on either rejection and
+  zero when the gate does not apply.
 - `.github/rulesets/main-protection.json` lists both `check` and `pr-source`
   as required contexts under a strict policy, so a blocked gate blocks merge.
 - `internal/ci` regression-tests the gate: `PRSourceGateGuardsMain` fails if
   the job is deleted, given a `needs` or `if` that could make GitHub skip the
   context, weakened to never exit non-zero, pointed at a head ref other than
-  `develop`, or rewritten to interpolate a branch name into the shell script.
+  `develop`, rewritten to interpolate a branch name into the shell script,
+  missing the `edited` trigger type, or missing the head-repository equality
+  check.
 
 The gate is only as strong as the ruleset that requires it: until a repository
 admin adds the `pr-source` context to the live ruleset, the workflow reports a
@@ -242,7 +253,7 @@ branch other than `develop` reports a red `pr-source` that nothing enforces.
 The remaining PUT is deliberately ordered **after** the `pr-source` job reaches
 `develop`. A required context that no workflow on the base branch can produce
 is reported as expected-and-missing, which blocks every open `develop` → `main`
-pull request until the workflow lands. Once `.github/workflows/ci.yml` on
+pull request until the workflow lands. Once `.github/workflows/pr-source.yml` on
 `develop` declares the job, run the PUT from
 [Apply or update](#apply-or-update-repository-admin-only) and then
 `scripts/verify-branch-protection.sh`. Note that the committed payload is named

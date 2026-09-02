@@ -14,6 +14,15 @@ import (
 
 type workflowDoc struct {
 	Jobs map[string]workflowJob `yaml:"jobs"`
+	On   workflowTriggers       `yaml:"on"`
+}
+
+type workflowTriggers struct {
+	PullRequest *workflowPullRequestTrigger `yaml:"pull_request"`
+}
+
+type workflowPullRequestTrigger struct {
+	Types []string `yaml:"types"`
 }
 
 type workflowJob struct {
@@ -470,23 +479,42 @@ const (
 	prSourceGuardedBase = "main"
 )
 
+// prSourceGateRequiredTypes are the pull_request activity types the gate's
+// on.pull_request trigger must declare. `edited` is required because
+// retargeting an open pull request's base branch to main changes base_ref
+// without a new commit: without that trigger type, a check run already
+// attached to the head SHA from the pull request's earlier base would keep
+// satisfying the required status context after the retarget.
+var prSourceGateRequiredTypes = []string{"opened", "synchronize", "reopened", "edited"}
+
 // prSourceGateEnv maps the shell variables the gate script reads to the
 // workflow expressions that must supply them. Reading refs through env keeps
-// attacker-chosen branch names out of the script body.
+// attacker-chosen branch and repository names out of the script body.
+// HEAD_REPO and BASE_REPO close the fork bypass where github.head_ref is a
+// bare branch name: a fork whose branch happens to be named develop must
+// still be rejected, because its head repository differs from the base.
 var prSourceGateEnv = map[string]string{
 	"EVENT_NAME": "${{ github.event_name }}",
 	"BASE_REF":   "${{ github.base_ref }}",
 	"HEAD_REF":   "${{ github.head_ref }}",
+	"HEAD_REPO":  "${{ github.event.pull_request.head.repo.full_name }}",
+	"BASE_REPO":  "${{ github.repository }}",
 }
+
+// headRepoEqualityCheck is the exact shell comparison the gate script must
+// contain to reject a pull request whose head repository differs from the
+// base repository.
+const headRepoEqualityCheck = `"$HEAD_REPO" != "$BASE_REPO"`
 
 // nonZeroExit matches a shell exit with a failing status.
 var nonZeroExit = regexp.MustCompile(`\bexit\s+[1-9][0-9]*\b`)
 
 // PRSourceGateGuardsMain verifies that the workflow declares an
 // unconditional pr-source job whose script rejects a pull request into main
-// that does not originate from develop. The job declares no dependency and no
-// condition, so GitHub always reports the required status context instead of
-// reporting it skipped.
+// that does not originate from develop in the base repository itself. The
+// job declares no dependency and no condition, so GitHub always reports the
+// required status context instead of reporting it skipped, and its trigger
+// re-runs the gate when a pull request is retargeted.
 func PRSourceGateGuardsMain(workflowYAML []byte) error {
 	doc, err := parseWorkflow(workflowYAML)
 	if err != nil {
@@ -496,6 +524,9 @@ func PRSourceGateGuardsMain(workflowYAML []byte) error {
 	gate, ok := doc.Jobs[prSourceGateJob]
 	if !ok {
 		return fmt.Errorf("workflow declares no %s job", prSourceGateJob)
+	}
+	if err := prSourceGateTriggerIsSound(doc.On); err != nil {
+		return err
 	}
 	if gate.Needs != nil {
 		return fmt.Errorf("%s job must not declare needs; dependencies can skip the required context", prSourceGateJob)
@@ -515,6 +546,28 @@ func PRSourceGateGuardsMain(workflowYAML []byte) error {
 		return prSourceGateStepIsSound(step)
 	}
 	return fmt.Errorf("%s job must run a gate step that reads the head ref from env", prSourceGateJob)
+}
+
+// prSourceGateTriggerIsSound verifies that the workflow's on.pull_request
+// trigger declares every activity type the gate depends on to re-run after a
+// pull request is retargeted at main without a new commit.
+func prSourceGateTriggerIsSound(on workflowTriggers) error {
+	if on.PullRequest == nil {
+		return fmt.Errorf("workflow must declare an on.pull_request trigger so the %s job re-runs on retarget", prSourceGateJob)
+	}
+	if len(on.PullRequest.Types) == 0 {
+		return fmt.Errorf("%s workflow's pull_request trigger must declare explicit types; the default types omit edited", prSourceGateJob)
+	}
+	declared := make(map[string]bool, len(on.PullRequest.Types))
+	for _, t := range on.PullRequest.Types {
+		declared[t] = true
+	}
+	for _, want := range prSourceGateRequiredTypes {
+		if !declared[want] {
+			return fmt.Errorf("%s workflow's pull_request trigger must include type %q", prSourceGateJob, want)
+		}
+	}
+	return nil
 }
 
 func prSourceGateStepIsSound(step workflowStep) error {
@@ -547,6 +600,9 @@ func prSourceGateStepIsSound(step workflowStep) error {
 	}
 	if !strings.Contains(step.Run, "$BASE_REF") || !strings.Contains(step.Run, prSourceGuardedBase) {
 		return fmt.Errorf("%s gate step must scope the gate to base ref %s", prSourceGateJob, prSourceGuardedBase)
+	}
+	if !strings.Contains(step.Run, headRepoEqualityCheck) {
+		return fmt.Errorf("%s gate step must reject pull requests whose head repository differs from the base repository (expected %s)", prSourceGateJob, headRepoEqualityCheck)
 	}
 	return nil
 }

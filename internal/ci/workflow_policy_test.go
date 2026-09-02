@@ -608,14 +608,23 @@ func TestJobsOffSelfHostedRunnersFixtures(t *testing.T) {
 }
 
 func TestPRSourceGateGuardsMainLiveWorkflow(t *testing.T) {
-	if err := PRSourceGateGuardsMain(readLiveWorkflow(t)); err != nil {
+	if err := PRSourceGateGuardsMain(readLivePRSourceWorkflow(t)); err != nil {
 		t.Fatalf("check live pull-request source gate: %v", err)
 	}
 }
 
 func TestPRSourceGateGuardsMainFixtures(t *testing.T) {
+	const gateOn = `on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+`
+
 	const gateRun = `if [ "$EVENT_NAME" != "pull_request" ] || [ "$BASE_REF" != "main" ]; then
   exit 0
+fi
+if [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+  echo "pull requests into main must come from this repository" >&2
+  exit 1
 fi
 if [ "$HEAD_REF" != "develop" ]; then
   echo "pull requests into main must originate from develop" >&2
@@ -623,15 +632,20 @@ if [ "$HEAD_REF" != "develop" ]; then
 fi
 `
 
-	gateJob := func(job string) string {
+	gateJobBody := func(job string) string {
 		return "jobs:\n  pr-source:\n" + job + `    steps:
-      - name: only develop may target main
+      - name: only develop in this repository may target main
         env:
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
         run: |
 ` + indentLines(gateRun, "          ")
+	}
+	gateJob := func(job string) string {
+		return gateOn + gateJobBody(job)
 	}
 
 	tests := []struct {
@@ -654,6 +668,26 @@ fi
 			wantError: "declares no pr-source job",
 		},
 		{
+			name:         "missing pull_request trigger",
+			workflowYAML: gateJobBody("    runs-on: ubuntu-latest\n    timeout-minutes: 5\n"),
+			wantError:    "on.pull_request trigger",
+		},
+		{
+			name: "pull_request without explicit types",
+			workflowYAML: `on:
+  pull_request: {}
+` + gateJobBody("    runs-on: ubuntu-latest\n    timeout-minutes: 5\n"),
+			wantError: "must declare explicit types",
+		},
+		{
+			name: "pull_request types omit edited",
+			workflowYAML: `on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+` + gateJobBody("    runs-on: ubuntu-latest\n    timeout-minutes: 5\n"),
+			wantError: `must include type "edited"`,
+		},
+		{
 			name:         "job-level if is rejected",
 			workflowYAML: gateJob("    runs-on: ubuntu-latest\n    timeout-minutes: 5\n    if: github.base_ref == 'main'\n"),
 			wantError:    "job-level if condition",
@@ -670,7 +704,7 @@ fi
 		},
 		{
 			name: "step-level if is rejected",
-			workflowYAML: `jobs:
+			workflowYAML: gateOn + `jobs:
   pr-source:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -688,7 +722,7 @@ fi
 		},
 		{
 			name: "gate that never fails is rejected",
-			workflowYAML: `jobs:
+			workflowYAML: gateOn + `jobs:
   pr-source:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -698,6 +732,8 @@ fi
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
         run: |
           if [ "$HEAD_REF" != "develop" ]; then
             echo "warning: head is $HEAD_REF"
@@ -707,7 +743,7 @@ fi
 		},
 		{
 			name: "gate allowing a head ref other than develop is rejected",
-			workflowYAML: `jobs:
+			workflowYAML: gateOn + `jobs:
   pr-source:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -717,6 +753,8 @@ fi
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
         run: |
           if [ "$HEAD_REF" != "release" ]; then
             exit 1
@@ -726,7 +764,7 @@ fi
 		},
 		{
 			name: "gate that ignores the guarded base is rejected",
-			workflowYAML: `jobs:
+			workflowYAML: gateOn + `jobs:
   pr-source:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -736,6 +774,8 @@ fi
           EVENT_NAME: ${{ github.event_name }}
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
         run: |
           if [ "$HEAD_REF" != "develop" ]; then
             exit 1
@@ -745,7 +785,7 @@ fi
 		},
 		{
 			name: "missing env mapping is rejected",
-			workflowYAML: `jobs:
+			workflowYAML: gateOn + `jobs:
   pr-source:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -764,8 +804,49 @@ fi
 			wantError: "must map BASE_REF",
 		},
 		{
+			name: "HEAD_REPO env missing",
+			workflowYAML: gateOn + `jobs:
+  pr-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: only develop may target main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REPO: ${{ github.repository }}
+        run: |
+` + indentLines(gateRun, "          "),
+			wantError: "must map HEAD_REPO",
+		},
+		{
+			name: "head repository check removed",
+			workflowYAML: gateOn + `jobs:
+  pr-source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: only develop may target main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ] || [ "$BASE_REF" != "main" ]; then
+            exit 0
+          fi
+          if [ "$HEAD_REF" != "develop" ]; then
+            exit 1
+          fi
+`,
+			wantError: "must reject pull requests whose head repository",
+		},
+		{
 			name: "ref interpolated into the run script is rejected",
-			workflowYAML: `jobs:
+			workflowYAML: gateOn + `jobs:
   pr-source:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -903,6 +984,18 @@ func readLiveCodeQLWorkflow(t *testing.T) []byte {
 	workflowYAML, err := os.ReadFile(workflowPath) //nolint:gosec // G304: test reads the fixed in-repo CodeQL workflow.
 	if err != nil {
 		t.Fatalf("read live CodeQL workflow: %v", err)
+	}
+	return workflowYAML
+}
+
+func readLivePRSourceWorkflow(t *testing.T) []byte {
+	t.Helper()
+
+	root := repositoryRoot(t)
+	workflowPath := filepath.Clean(filepath.Join(root, ".github", "workflows", "pr-source.yml"))
+	workflowYAML, err := os.ReadFile(workflowPath) //nolint:gosec // G304: test reads the fixed in-repo pr-source workflow.
+	if err != nil {
+		t.Fatalf("read live pr-source workflow: %v", err)
 	}
 	return workflowYAML
 }
