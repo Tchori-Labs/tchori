@@ -5,37 +5,11 @@ local protocol tests from the live public-registry smoke.
 
 ## Runners
 
-Every job in `.github/workflows/ci.yml` requests
-`runs-on: [self-hosted, Linux, X64]`, which schedules it on the
-organization's runners (`tchori-runner-1`, `tchori-runner-2`, advertising
-`[self-hosted Linux X64 docker]`). `runs-on` is an exact label match with no
-fallback: a job labelled `ubuntu-latest` runs on paid GitHub-hosted
-infrastructure even when self-hosted runners are idle, which is why
-`internal/ci.JobsOffSelfHostedRunners` fails the required `check` job if any
-job in that workflow drifts back to a hosted label, omits `runs-on`, or hides
-the runner behind a workflow expression that cannot be audited statically.
-
-The other workflows stay GitHub-hosted on purpose. `release.yml` builds and
-publishes signed release artifacts, `codeql.yml` runs code scanning, and
-`registry-smoke.yml` is the one intentionally online lane; none of them should
-depend on the availability or the local state of a self-hosted machine.
-
-Untrusted code cannot reach these runners: the repository is private and both
-`repos/Tchori-Labs/tchori/actions/permissions/fork-pr-workflows-private-repos`
-and its organization-level counterpart report
-`run_workflows_from_fork_pull_requests: false`, so a fork pull request runs no
-workflow at all. That is strictly stronger than requiring approval, and
-GitHub rejects the fork-PR approval API for private repositories (HTTP 422).
-If fork pull-request workflows are ever enabled, set
-`require_approval_for_fork_pr_workflows` in the same call.
-
-Both runners being offline blocks merges, because `check` and `pr-source` are
-required contexts. Check liveness with:
-
-```sh
-gh api orgs/Tchori-Labs/actions/runners \
-  --jq '.runners[] | {name, status, busy, labels: [.labels[].name]}'
-```
+Every job in `.github/workflows/ci.yml` and `.github/workflows/pr-source.yml`
+runs on GitHub-hosted `ubuntu-latest` runners. Self-hosted runners
+(`tchori-runner-1`, `tchori-runner-2`) are reserved for the organization's
+private repositories: the runner group does not admit public repositories,
+and fork pull-request code must never reach those machines.
 
 ## Required PR suites
 
