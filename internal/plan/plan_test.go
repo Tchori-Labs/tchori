@@ -437,6 +437,86 @@ func TestPlanRefreshDriftSortedByAddress(t *testing.T) {
 	}
 }
 
+// TestPlanRefreshDriftRedactsLegacyPlaintextSecret guards against
+// Tchori-Labs/tchori's high-severity drift-leak bug: a resource's state may
+// still hold a plaintext value at a path this run considers sensitive (a
+// legacy write predating the sensitivity declaration). Drift.Before must
+// carry the same spec.Redact treatment as every other reporting artifact
+// instead of replaying the recorded state's raw bytes.
+func TestPlanRefreshDriftRedactsLegacyPlaintextSecret(t *testing.T) {
+	const (
+		addr     = "tchoritest_thing.demo"
+		sentinel = "sekret-placeholder"
+	)
+	cfg := testConfig(t, map[string]map[string]any{addr: {"name": "drift-secret"}})
+	cfg.Resources[addr].SensitiveAttributes = []string{"replace_me"}
+	attrs := fmt.Sprintf(`{"echo":"healthy","id":"id-drift-secret","name":"drift-secret","replace_me":%q,"rules":null,"tags":null}`, sentinel)
+	p := newPlanner(t, cfg, stateWith(t, 1, map[string]string{addr: attrs}))
+
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+	if len(pl.Drift) != 1 || pl.Drift[0].Address != addr {
+		t.Fatalf("drift = %#v, want one entry for %s", pl.Drift, addr)
+	}
+	if bytes.Contains(pl.Drift[0].Before, []byte(sentinel)) {
+		t.Fatalf("drift before leaked legacy plaintext secret: %s", pl.Drift[0].Before)
+	}
+	if !bytes.Contains(pl.Drift[0].Before, []byte(`"replace_me":null`)) {
+		t.Fatalf("drift before missing redaction placeholder: %s", pl.Drift[0].Before)
+	}
+}
+
+// TestPlanSensitivePathsUnionAcrossConfigAndState guards against
+// Tchori-Labs/tchori's high-severity sensitive-path bug: removing a
+// resource's sensitive_attributes declaration from config must not make the
+// planner forget that state already recorded that path as sensitive on a
+// prior run, and it must not let the resource's still-remembered secret
+// print in plaintext in either the plan document or the re-persisted state.
+// spec must be built from the union of config-declared and state-recorded
+// sensitive paths, and the write-back to rs.SensitivePaths must never drop a
+// path state already recalled.
+func TestPlanSensitivePathsUnionAcrossConfigAndState(t *testing.T) {
+	const (
+		addr     = "tchoritest_thing.demo"
+		sentinel = "sekret-placeholder"
+	)
+	// Config no longer declares "replace_me" sensitive at all.
+	cfg := testConfig(t, map[string]map[string]any{addr: {"name": "drift-secret"}})
+	attrs := fmt.Sprintf(`{"echo":"healthy","id":"id-drift-secret","name":"drift-secret","replace_me":%q,"rules":null,"tags":null}`, sentinel)
+	st := stateWith(t, 1, map[string]string{addr: attrs})
+	// State recalls "replace_me" as sensitive from a prior run.
+	st.Resources[addr].SensitivePaths = []string{"replace_me"}
+	p := newPlanner(t, cfg, st)
+
+	pl, ds := p.Plan(context.Background())
+	if ds.HasErrors() {
+		t.Fatalf("Plan diagnostics: %+v", ds)
+	}
+
+	if len(pl.Changes) != 1 {
+		t.Fatalf("changes=%d, want 1", len(pl.Changes))
+	}
+	if bytes.Contains(pl.Changes[0].Before, []byte(sentinel)) {
+		t.Fatalf("change before leaked a secret config stopped declaring sensitive: %s", pl.Changes[0].Before)
+	}
+	if !bytes.Contains(pl.Changes[0].Before, []byte(`"replace_me":null`)) {
+		t.Fatalf("change before missing redaction placeholder: %s", pl.Changes[0].Before)
+	}
+
+	if len(pl.Drift) != 1 || pl.Drift[0].Address != addr {
+		t.Fatalf("drift = %#v, want one entry for %s", pl.Drift, addr)
+	}
+	if bytes.Contains(pl.Drift[0].Before, []byte(sentinel)) {
+		t.Fatalf("drift before leaked a secret config stopped declaring sensitive: %s", pl.Drift[0].Before)
+	}
+
+	if !slices.Contains(st.Resources[addr].SensitivePaths, "replace_me") {
+		t.Fatalf("state SensitivePaths after Plan = %v, want it to still recall \"replace_me\"", st.Resources[addr].SensitivePaths)
+	}
+}
+
 func TestPlanGatewayHTMLRefreshDiagnostic(t *testing.T) {
 	const (
 		addr    = "tchoritest_thing.web"

@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-var inlineLinkPattern = regexp.MustCompile(`\[[^\]\n]*\]\(([^)\s]+)(?:\s+[^)]*)?\)`)
+var inlineLinkPattern = regexp.MustCompile(`\[[^\]\n]*\]\((<[^<>\n]*>|[^)\s]+)(?:\s+[^)]*)?\)`)
 
 // DanglingLinks returns Markdown links whose repository targets do not exist.
 // File names and exists entries must be slash-separated, repo-relative paths.
@@ -50,10 +50,13 @@ func ignoredTarget(target string) bool {
 }
 
 func targetExists(file, target string, exists map[string]struct{}) bool {
-	rootRelative := path.Clean(strings.TrimPrefix(target, "/"))
-	fileRelative := path.Clean(path.Join(path.Dir(file), target))
+	if strings.HasPrefix(target, "/") {
+		rootRelative := path.Clean(strings.TrimPrefix(target, "/"))
+		_, rootFound := exists[rootRelative]
+		return rootFound
+	}
 
-	_, rootFound := exists[rootRelative]
+	fileRelative := path.Clean(path.Join(path.Dir(file), target))
 	_, fileFound := exists[fileRelative]
-	return rootFound || fileFound
+	return fileFound
 }

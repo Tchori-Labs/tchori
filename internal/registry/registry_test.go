@@ -972,6 +972,7 @@ func TestInstall_SignatureAndChecksumMetadataFailures(t *testing.T) {
 		{
 			name: "unadvertised signing key",
 			mutate: func(t *testing.T, fr *fakeRegistry) {
+				t.Helper()
 				fr.signature = newTestSigner(t).detachSign(t, fr.sumsBytes)
 			},
 			wantErr: "signature verification failed",
@@ -1021,6 +1022,7 @@ func TestInstall_SignatureAndChecksumMetadataFailures(t *testing.T) {
 		{
 			name: "short SHA256SUMS hash",
 			mutate: func(t *testing.T, fr *fakeRegistry) {
+				t.Helper()
 				fr.setSignedSums(t, []byte(fmt.Sprintf("abc  %s\n", fr.filename)))
 			},
 			wantErr: "want 64 hexadecimal characters",
@@ -1028,6 +1030,7 @@ func TestInstall_SignatureAndChecksumMetadataFailures(t *testing.T) {
 		{
 			name: "non-hex SHA256SUMS hash",
 			mutate: func(t *testing.T, fr *fakeRegistry) {
+				t.Helper()
 				fr.setSignedSums(t, []byte(fmt.Sprintf("%s  %s\n", strings.Repeat("g", 64), fr.filename)))
 			},
 			wantErr: "invalid byte",
@@ -1049,6 +1052,7 @@ func TestInstall_SignatureAndChecksumMetadataFailures(t *testing.T) {
 		{
 			name: "duplicate equal entries",
 			mutate: func(t *testing.T, fr *fakeRegistry) {
+				t.Helper()
 				line := fmt.Sprintf("%s  %s\n", fr.descriptorShasum, fr.filename)
 				fr.setSignedSums(t, []byte(line+line))
 			},
@@ -1057,6 +1061,7 @@ func TestInstall_SignatureAndChecksumMetadataFailures(t *testing.T) {
 		{
 			name: "duplicate conflicting entries",
 			mutate: func(t *testing.T, fr *fakeRegistry) {
+				t.Helper()
 				fr.setSignedSums(t, []byte(fmt.Sprintf(
 					"%s  %s\n%s  %s\n",
 					fr.descriptorShasum,

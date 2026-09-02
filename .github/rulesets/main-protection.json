@@ -38,6 +38,9 @@
         "required_status_checks": [
           {
             "context": "check"
+          },
+          {
+            "context": "pr-source"
           }
         ],
         "strict_required_status_checks_policy": true

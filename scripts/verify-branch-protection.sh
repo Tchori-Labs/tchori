@@ -141,12 +141,16 @@ for key, label in (
 status_rules = by_type.get("required_status_checks", [])
 report(len(status_rules) == 1, "required status checks rule", f"rule count={len(status_rules)}")
 status = status_rules[0].get("parameters", {}) if len(status_rules) == 1 else {}
-contexts = [
-    item.get("context")
+contexts = sorted(
+    str(item.get("context"))
     for item in status.get("required_status_checks", [])
     if isinstance(item, dict)
-]
-report(contexts == ["check"], "only required check context", f"contexts={contexts!r}")
+)
+report(
+    contexts == ["check", "pr-source"],
+    "required check and pr-source contexts",
+    f"contexts={contexts!r}; pr-source carries the develop-only source rule that rulesets cannot express",
+)
 strict = status.get("strict_required_status_checks_policy")
 report(strict is True, "up-to-date branch", f"strict_required_status_checks_policy={strict!r}")
 

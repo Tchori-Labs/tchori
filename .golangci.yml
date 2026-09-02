@@ -8,6 +8,12 @@ linters:
     - staticcheck
     - unused
     - gosec
+    # Test-hygiene linters: they defend conventions the suite already follows
+    # by hand (t.Helper() in helpers, t.TempDir()/t.Setenv() over os-level
+    # equivalents, correct t.Parallel() placement).
+    - thelper
+    - tparallel
+    - usetesting
 
 formatters:
   enable:

@@ -20,7 +20,9 @@ import (
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/rogpeppe/go-internal/testscript"
 
+	tchoricli "github.com/tchori-labs/tchori/cmd/tchori"
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/plan"
 )
@@ -34,9 +36,24 @@ var (
 	pluginDir string // directory containing terraform-provider-tchoritest
 )
 
+// TestMain both registers the CLI as testscript's "tchori" command (the txtar
+// scripts in testdata/script re-exec this binary under that name; see
+// script_test.go) and runs the suite through testMain, which builds the real
+// binary and the provider fixtures the subprocess tests need.
+// testscript.Main dispatches on argv[0] and always exits, so a re-exec as
+// "tchori" never pays for the fixture builds.
 func TestMain(m *testing.M) {
-	os.Exit(testMain(m))
+	testscript.Main(fixtureM{m}, map[string]func(){
+		"tchori": tchoricli.ScriptCmdMain,
+	})
 }
+
+// fixtureM adapts *testing.M to testscript.TestingM so that testscript runs
+// the suite through testMain's fixture builds rather than calling m.Run
+// directly.
+type fixtureM struct{ m *testing.M }
+
+func (f fixtureM) Run() int { return testMain(f.m) }
 
 // testMain exists so deferred cleanup runs before os.Exit. TestMain has no
 // *testing.T, hence os.MkdirTemp instead of t.TempDir.

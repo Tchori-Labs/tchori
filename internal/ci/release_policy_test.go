@@ -50,6 +50,10 @@ func TestReleaseWorkflowMatchesPolicyFixtures(t *testing.T) {
 		{name: "dry-run contents write", workflow: strings.Replace(valid, "contents: read", "contents: write", 1), wantError: "want read"},
 		{name: "publish contents read", workflow: strings.Replace(valid, "contents: write", "contents: read", 1), wantError: "want write"},
 		{name: "another job may not write", workflow: valid + "  helper:\n    permissions:\n      contents: write\n", wantError: "only publish may write"},
+		{name: "job without job-level permissions inherits workflow write", workflow: "permissions:\n  contents: write\n" + valid + "  helper:\n    runs-on: ubuntu-latest\n", wantError: "only publish may write"},
+		{name: "workflow-level read-all string form is accepted", workflow: "permissions: read-all\njobs:\n  dry-run:\n    environment:\n      name: release\n  publish:\n    environment: release\n    permissions:\n      contents: write\n"},
+		{name: "workflow-level write-all inherited by non-publish job is rejected", workflow: "permissions: write-all\n" + valid + "  helper:\n    runs-on: ubuntu-latest\n", wantError: "only publish may write"},
+		{name: "job-level write-all string form on non-publish job is rejected", workflow: valid + "  helper:\n    permissions: write-all\n", wantError: "only publish may write"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -122,6 +126,7 @@ func TestValidateLiveReleaseEnvironmentStates(t *testing.T) {
 		{name: "g missing main", list: correctEnvironmentList, environment: correctEnvironmentDetail, policies: `{"total_count":1,"branch_policies":[{"name":"v*","type":"tag"}]}`, want: "exactly"},
 		{name: "g missing v tag", list: correctEnvironmentList, environment: correctEnvironmentDetail, policies: `{"total_count":1,"branch_policies":[{"name":"main","type":"branch"}]}`, want: "exactly"},
 		{name: "g extra permissive policy", list: correctEnvironmentList, environment: correctEnvironmentDetail, policies: `{"total_count":3,"branch_policies":[{"name":"main","type":"branch"},{"name":"v*","type":"tag"},{"name":"*","type":"branch"}]}`, want: "exactly"},
+		{name: "i truncated branch policy page", list: correctEnvironmentList, environment: correctEnvironmentDetail, policies: `{"total_count":5,"branch_policies":[{"name":"main","type":"branch"},{"name":"v*","type":"tag"}]}`, want: "total_count"},
 		{name: "h fully correct", list: correctEnvironmentList, environment: correctEnvironmentDetail, policies: correctBranchPolicies},
 	}
 	for _, tt := range tests {

@@ -39,7 +39,6 @@ func TestDanglingLinks(t *testing.T) {
 					"[email](mailto:security@example.com)",
 					"[parent](../AGENTS.md)",
 					"[non-Markdown](../.github/CODEOWNERS)",
-					"[repo root relative](docs/releasing.md)",
 					"[slash root relative](/docs/releasing.md)",
 				}, "\n")),
 			},
@@ -53,6 +52,24 @@ func TestDanglingLinks(t *testing.T) {
 			want: []string{
 				"docs/example.md: does-not-exist.md",
 				"docs/zeta.md: z-missing.md",
+			},
+		},
+		{
+			name: "angle-bracket destination with a space is checked",
+			files: map[string][]byte{
+				"docs/example.md": []byte("[guide](<missing guide.md>)"),
+			},
+			want: []string{
+				"docs/example.md: <missing guide.md>",
+			},
+		},
+		{
+			name: "relative target is not resolved against the repo root",
+			files: map[string][]byte{
+				"docs/example.md": []byte("[broken](docs/releasing.md)"),
+			},
+			want: []string{
+				"docs/example.md: docs/releasing.md",
 			},
 		},
 	}
