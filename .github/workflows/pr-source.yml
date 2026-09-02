@@ -1,0 +1,47 @@
+name: pr-source
+
+# GitHub rulesets can only condition on the base ref, so the "only develop
+# may target main" rule is carried by this required status context. It lives
+# in its own workflow because it must also run on `edited`: retargeting an
+# open pull request changes base_ref without a new commit, and the check run
+# already attached to the head SHA would otherwise keep satisfying the
+# ruleset. The job declares no needs and no condition: a skipped context is
+# not a proof.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-source-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-source:
+    name: pr-source
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 5
+    steps:
+      - name: only develop in this repository may target main
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ] || [ "$BASE_REF" != "main" ]; then
+            printf 'gate not applicable (event=%s base=%s)\n' "$EVENT_NAME" "$BASE_REF"
+            exit 0
+          fi
+          if [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+            printf '::error::pull requests into main must come from this repository, not a fork (head repo=%s)\n' "$HEAD_REPO"
+            exit 1
+          fi
+          if [ "$HEAD_REF" != "develop" ]; then
+            printf '::error::pull requests into main must originate from develop (head=%s)\n' "$HEAD_REF"
+            exit 1
+          fi
+          printf 'head=develop of %s may target main\n' "$BASE_REPO"

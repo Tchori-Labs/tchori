@@ -14,10 +14,20 @@ import (
 
 type workflowDoc struct {
 	Jobs map[string]workflowJob `yaml:"jobs"`
+	On   workflowTriggers       `yaml:"on"`
+}
+
+type workflowTriggers struct {
+	PullRequest *workflowPullRequestTrigger `yaml:"pull_request"`
+}
+
+type workflowPullRequestTrigger struct {
+	Types []string `yaml:"types"`
 }
 
 type workflowJob struct {
 	TimeoutMinutes  *int                `yaml:"timeout-minutes"`
+	RunsOn          any                 `yaml:"runs-on"`
 	Needs           any                 `yaml:"needs"`
 	If              string              `yaml:"if"`
 	ContinueOnError bool                `yaml:"continue-on-error"`
@@ -84,6 +94,7 @@ func (p *workflowPermissions) UnmarshalYAML(node *yaml.Node) error {
 type workflowStep struct {
 	Run             string            `yaml:"run"`
 	Uses            string            `yaml:"uses"`
+	ID              string            `yaml:"id"`
 	If              string            `yaml:"if"`
 	ContinueOnError bool              `yaml:"continue-on-error"`
 	Env             map[string]string `yaml:"env"`
@@ -155,6 +166,173 @@ func JobsMissingTimeout(workflowYAML []byte) ([]string, error) {
 	}
 	sort.Strings(missing)
 	return missing, nil
+}
+
+// selfHostedRunnerLabels are the labels every CI job must request. The
+// organization's runners advertise [self-hosted Linux X64 docker]; requiring
+// the first three pins the jobs to those machines without demanding the
+// docker label a future runner might not carry. GitHub matches runner labels
+// exactly and never falls back, so a job that omits them silently runs on
+// paid GitHub-hosted infrastructure instead.
+var selfHostedRunnerLabels = []string{"self-hosted", "Linux", "X64"}
+
+// JobsOffSelfHostedRunners returns the sorted names of jobs whose runs-on
+// does not request every label in selfHostedRunnerLabels. A job with no
+// runs-on, or one that resolves its runner through a workflow expression the
+// repository cannot audit statically, counts as off the self-hosted runners.
+func JobsOffSelfHostedRunners(workflowYAML []byte) ([]string, error) {
+	doc, err := parseWorkflow(workflowYAML)
+	if err != nil {
+		return nil, err
+	}
+
+	var off []string
+	for name, job := range doc.Jobs {
+		if !requestsSelfHostedRunner(job.RunsOn) {
+			off = append(off, name)
+		}
+	}
+	sort.Strings(off)
+	return off, nil
+}
+
+func requestsSelfHostedRunner(runsOn any) bool {
+	var labels []string
+	switch value := runsOn.(type) {
+	case string:
+		labels = []string{value}
+	case []any:
+		for _, item := range value {
+			label, ok := item.(string)
+			if !ok {
+				return false
+			}
+			labels = append(labels, label)
+		}
+	default:
+		return false
+	}
+
+	for _, required := range selfHostedRunnerLabels {
+		found := false
+		for _, label := range labels {
+			if strings.Contains(label, "${{") {
+				return false
+			}
+			if label == required {
+				found = true
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// codeQLCapabilityStepID is the id of the step that probes whether code
+// scanning is available, and codeQLGateCondition is the exact condition every
+// CodeQL step must carry so the job reports success — with an explanation —
+// instead of a permanent red check on a plan where GitHub Advanced Security
+// is unavailable.
+const (
+	codeQLCapabilityStepID = "capability"
+	codeQLGateCondition    = "steps.capability.outputs.available == 'true'"
+)
+
+// codeQLGatedActions are the CodeQL actions that fail without code scanning.
+var codeQLGatedActions = []string{
+	"github/codeql-action/init",
+	"github/codeql-action/autobuild",
+	"github/codeql-action/analyze",
+}
+
+// CodeQLAnalysisIsCapabilityGated verifies that the CodeQL workflow probes
+// code-scanning availability in an unconditional step and runs every CodeQL
+// action only when that probe reported availability. The probe itself must
+// still fail the job on any status it does not recognise, and no step may
+// hide a real failure behind continue-on-error.
+func CodeQLAnalysisIsCapabilityGated(workflowYAML []byte) error {
+	doc, err := parseWorkflow(workflowYAML)
+	if err != nil {
+		return err
+	}
+
+	for _, name := range sortedJobNames(doc) {
+		job := doc.Jobs[name]
+		if !declaresCodeQLAction(job) {
+			continue
+		}
+		if err := codeQLJobIsGated(job); err != nil {
+			return fmt.Errorf("job %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func sortedJobNames(doc workflowDoc) []string {
+	names := make([]string, 0, len(doc.Jobs))
+	for name := range doc.Jobs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func declaresCodeQLAction(job workflowJob) bool {
+	for _, step := range job.Steps {
+		for _, action := range codeQLGatedActions {
+			if strings.HasPrefix(step.Uses, action+"@") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func codeQLJobIsGated(job workflowJob) error {
+	probe, ok := findStepByID(job, codeQLCapabilityStepID)
+	if !ok {
+		return fmt.Errorf("must declare a step with id %s that probes code-scanning availability", codeQLCapabilityStepID)
+	}
+	if strings.TrimSpace(probe.If) != "" {
+		return fmt.Errorf("capability probe must not declare an if condition; it decides for every event")
+	}
+	if probe.ContinueOnError {
+		return fmt.Errorf("capability probe must not allow failures with continue-on-error; an unrecognised status has to fail the job")
+	}
+
+	for _, step := range job.Steps {
+		action, gated := codeQLGatedAction(step.Uses)
+		if !gated {
+			continue
+		}
+		if step.ContinueOnError {
+			return fmt.Errorf("%s must not allow failures with continue-on-error", action)
+		}
+		if strings.TrimSpace(step.If) != codeQLGateCondition {
+			return fmt.Errorf("%s must run only when %s", action, codeQLGateCondition)
+		}
+	}
+	return nil
+}
+
+func codeQLGatedAction(uses string) (string, bool) {
+	for _, action := range codeQLGatedActions {
+		if strings.HasPrefix(uses, action+"@") {
+			return action, true
+		}
+	}
+	return "", false
+}
+
+func findStepByID(job workflowJob, id string) (workflowStep, bool) {
+	for _, step := range job.Steps {
+		if step.ID == id {
+			return step, true
+		}
+	}
+	return workflowStep{}, false
 }
 
 // unpinnedActionRefSHA matches a full 40-hex-character lowercase commit SHA,
@@ -319,6 +497,143 @@ func CheckJobRunsWorkflowLint(workflowYAML []byte) error {
 			return fmt.Errorf("actionlint install step must pin an explicit semver version")
 		}
 		return fmt.Errorf("actionlint install step must pin an explicit semver version, found @%s", installRef)
+	}
+	return nil
+}
+
+// Pull requests may only reach main from the integration branch. GitHub
+// rulesets can only condition on the base ref, so the source-branch
+// restriction is carried by a required status context instead.
+const (
+	prSourceGateJob     = "pr-source"
+	prSourceAllowedHead = "develop"
+	prSourceGuardedBase = "main"
+)
+
+// prSourceGateRequiredTypes are the pull_request activity types the gate's
+// on.pull_request trigger must declare. `edited` is required because
+// retargeting an open pull request's base branch to main changes base_ref
+// without a new commit: without that trigger type, a check run already
+// attached to the head SHA from the pull request's earlier base would keep
+// satisfying the required status context after the retarget.
+var prSourceGateRequiredTypes = []string{"opened", "synchronize", "reopened", "edited"}
+
+// prSourceGateEnv maps the shell variables the gate script reads to the
+// workflow expressions that must supply them. Reading refs through env keeps
+// attacker-chosen branch and repository names out of the script body.
+// HEAD_REPO and BASE_REPO close the fork bypass where github.head_ref is a
+// bare branch name: a fork whose branch happens to be named develop must
+// still be rejected, because its head repository differs from the base.
+var prSourceGateEnv = map[string]string{
+	"EVENT_NAME": "${{ github.event_name }}",
+	"BASE_REF":   "${{ github.base_ref }}",
+	"HEAD_REF":   "${{ github.head_ref }}",
+	"HEAD_REPO":  "${{ github.event.pull_request.head.repo.full_name }}",
+	"BASE_REPO":  "${{ github.repository }}",
+}
+
+// headRepoEqualityCheck is the exact shell comparison the gate script must
+// contain to reject a pull request whose head repository differs from the
+// base repository.
+const headRepoEqualityCheck = `"$HEAD_REPO" != "$BASE_REPO"`
+
+// nonZeroExit matches a shell exit with a failing status.
+var nonZeroExit = regexp.MustCompile(`\bexit\s+[1-9][0-9]*\b`)
+
+// PRSourceGateGuardsMain verifies that the workflow declares an
+// unconditional pr-source job whose script rejects a pull request into main
+// that does not originate from develop in the base repository itself. The
+// job declares no dependency and no condition, so GitHub always reports the
+// required status context instead of reporting it skipped, and its trigger
+// re-runs the gate when a pull request is retargeted.
+func PRSourceGateGuardsMain(workflowYAML []byte) error {
+	doc, err := parseWorkflow(workflowYAML)
+	if err != nil {
+		return err
+	}
+
+	gate, ok := doc.Jobs[prSourceGateJob]
+	if !ok {
+		return fmt.Errorf("workflow declares no %s job", prSourceGateJob)
+	}
+	if err := prSourceGateTriggerIsSound(doc.On); err != nil {
+		return err
+	}
+	if gate.Needs != nil {
+		return fmt.Errorf("%s job must not declare needs; dependencies can skip the required context", prSourceGateJob)
+	}
+	if strings.TrimSpace(gate.If) != "" {
+		return fmt.Errorf("%s job must not declare a job-level if condition", prSourceGateJob)
+	}
+	if gate.ContinueOnError {
+		return fmt.Errorf("%s job must not allow failures with continue-on-error", prSourceGateJob)
+	}
+
+	for _, step := range gate.Steps {
+		_, declaresHeadRef := step.Env["HEAD_REF"]
+		if !declaresHeadRef && !strings.Contains(step.Run, "$HEAD_REF") {
+			continue
+		}
+		return prSourceGateStepIsSound(step)
+	}
+	return fmt.Errorf("%s job must run a gate step that reads the head ref from env", prSourceGateJob)
+}
+
+// prSourceGateTriggerIsSound verifies that the workflow's on.pull_request
+// trigger declares every activity type the gate depends on to re-run after a
+// pull request is retargeted at main without a new commit.
+func prSourceGateTriggerIsSound(on workflowTriggers) error {
+	if on.PullRequest == nil {
+		return fmt.Errorf("workflow must declare an on.pull_request trigger so the %s job re-runs on retarget", prSourceGateJob)
+	}
+	if len(on.PullRequest.Types) == 0 {
+		return fmt.Errorf("%s workflow's pull_request trigger must declare explicit types; the default types omit edited", prSourceGateJob)
+	}
+	declared := make(map[string]bool, len(on.PullRequest.Types))
+	for _, t := range on.PullRequest.Types {
+		declared[t] = true
+	}
+	for _, want := range prSourceGateRequiredTypes {
+		if !declared[want] {
+			return fmt.Errorf("%s workflow's pull_request trigger must include type %q", prSourceGateJob, want)
+		}
+	}
+	return nil
+}
+
+func prSourceGateStepIsSound(step workflowStep) error {
+	if step.ContinueOnError {
+		return fmt.Errorf("%s gate step must not allow failures with continue-on-error", prSourceGateJob)
+	}
+	if strings.TrimSpace(step.If) != "" {
+		return fmt.Errorf("%s gate step must not declare an if condition", prSourceGateJob)
+	}
+	if strings.Contains(step.Run, "${{") {
+		return fmt.Errorf("%s gate step must not interpolate workflow expressions into the script; read refs from env", prSourceGateJob)
+	}
+
+	names := make([]string, 0, len(prSourceGateEnv))
+	for name := range prSourceGateEnv {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if step.Env[name] != prSourceGateEnv[name] {
+			return fmt.Errorf("%s gate step must map %s to %s", prSourceGateJob, name, prSourceGateEnv[name])
+		}
+	}
+
+	if !strings.Contains(step.Run, prSourceAllowedHead) {
+		return fmt.Errorf("%s gate step must compare the head ref to %s", prSourceGateJob, prSourceAllowedHead)
+	}
+	if !nonZeroExit.MatchString(step.Run) {
+		return fmt.Errorf("%s gate step must reject a disallowed head ref with a non-zero exit", prSourceGateJob)
+	}
+	if !strings.Contains(step.Run, "$BASE_REF") || !strings.Contains(step.Run, prSourceGuardedBase) {
+		return fmt.Errorf("%s gate step must scope the gate to base ref %s", prSourceGateJob, prSourceGuardedBase)
+	}
+	if !strings.Contains(step.Run, headRepoEqualityCheck) {
+		return fmt.Errorf("%s gate step must reject pull requests whose head repository differs from the base repository (expected %s)", prSourceGateJob, headRepoEqualityCheck)
 	}
 	return nil
 }

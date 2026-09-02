@@ -1,0 +1,15 @@
+# A config file that is not valid JSON is an error path: tchori validate exits
+# non-zero, writes nothing to stdout, and reports one structured diagnostic per
+# line on stderr (JSON, because stderr is a pipe and not a TTY). Config parsing
+# fails before any provider is resolved, so this needs no provider binary and
+# no network. The detail is asserted only as far as the offending file name;
+# the text after it comes from encoding/json and is not tchori's contract.
+
+! exec tchori validate
+! stdout .
+stderr '"severity":"error"'
+stderr '"summary":"invalid JSON in config file"'
+stderr '"detail":"main\.tchori\.json: '
+
+-- main.tchori.json --
+{ not json

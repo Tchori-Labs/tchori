@@ -36,12 +36,19 @@ This is the `tchori` engine repo — the product, not the company state root
 
 ## Tests are required
 
-- Every behavior change adds or extends tests; `go test ./...` must exercise
-  the new behavior. Bug fixes start from a failing test that reproduces the
-  bug.
+- Every behavior change adds or extends tests; `go test -count=1 ./...` must
+  exercise the new behavior. Bug fixes start from a failing test that
+  reproduces the bug: run it, observe the failure, then fix. `-count=1` is not
+  optional — a cached PASS is not evidence that the suite ran.
 - Tests are deterministic and offline — no network, no wall-clock or locale
   dependence.
-- Prefer package-level tests for logic; `e2e/` covers the CLI surface.
+- Prefer package-level tests for logic. CLI behavior belongs in
+  `cmd/tchori/testdata/script/*.txtar` (testscript: argv, stdout, stderr, exit
+  code); `e2e/` covers the built-binary lifecycle.
+- The red/green loop is `scripts/check.sh fast` (tests only). Coverage is
+  measured by the full gate and reported in the CI job summary; it is not a
+  merge gate, and coverage is never a substitute for having watched the test
+  fail first.
 
 ## Releases
 
@@ -52,19 +59,24 @@ This is the `tchori` engine repo — the product, not the company state root
 
 ## Before opening a PR
 
-Run, from the repo root. Install the pinned actionlint version documented in
-`README.md` before running workflow validation:
+Run the whole gate from the repo root with one command. Install the pinned
+actionlint and golangci-lint versions documented in `README.md` first:
 ```bash
-gofmt -l .
-go vet ./...
-GOOS=windows go vet ./...
-golangci-lint run
-bash scripts/actionlint-verify.sh
-go test ./...
+scripts/check.sh
 ```
-CI's `check` job (`.github/workflows/ci.yml`) re-runs all six checks, validates
-GitHub Actions workflows, and runs the bounded full-suite race detector. It is
-a required status check and must be green before merge.
+It runs, in CI order: `gofmt -l .`, `go vet ./...`,
+`GOOS=windows go vet ./...`, `golangci-lint run`,
+`bash scripts/actionlint-verify.sh`,
+`go test -count=1 -covermode=atomic -coverprofile=cover.out ./...`, and
+`go test -count=1 -race -timeout=2m ./...`.
+
+CI's `check` job (`.github/workflows/ci.yml`) re-runs the same checks,
+validates GitHub Actions workflows, and runs the bounded full-suite race
+detector. It is a required status check and must be green before merge.
+
+Pull requests into `main` must come from `develop`; the required `pr-source`
+context rejects any other head ref. Target `develop` unless the task is the
+`develop` → `main` integration itself.
 
 ## Branch protection
 
