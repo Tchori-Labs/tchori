@@ -8,13 +8,13 @@ import (
 	"context"
 	"log"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6/tf6server"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
+	"github.com/tchori-labs/tchori/internal/provider/testprovider/pidfile"
 )
 
 // providerType is the wire shape of the provider configuration block.
@@ -1114,7 +1114,7 @@ func (s *server) CloseEphemeralResource(ctx context.Context, req *tfprotov6.Clos
 
 func main() {
 	if pidFile := os.Getenv("TCHORITEST_PID_FILE"); pidFile != "" {
-		if err := os.WriteFile(pidFile, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil { //nolint:gosec // G703: test-only path is explicitly provided by the lifecycle test
+		if err := pidfile.Write(pidFile, os.Getpid()); err != nil {
 			log.Fatal(err)
 		}
 	}

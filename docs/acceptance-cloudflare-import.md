@@ -1,7 +1,7 @@
 # Acceptance checklist: existing Cloudflare DNS import
 
 Procedure and evidence template for the adoption criterion in
-[Tchori-Labs/tchori issue #4](https://github.com/Tchori-Labs/tchori/issues/4).
+[Tchori-Labs/tchori-internal issue #4](https://github.com/Tchori-Labs/tchori-internal/issues/4).
 A credentialed operator runs it in the Tchori-Labs infra repository against
 `infra/cloudflare`. It remains manual until it can be automated. This criterion
 is satisfied only after an operator completes the procedure, merges the config

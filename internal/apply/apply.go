@@ -639,7 +639,7 @@ func unresolvedWarnings(st *state.State) diag.Diagnostics {
 // corresponding value from cfgVal, provided cfgVal actually has a concrete
 // (known, non-null) value there. Composite values recurse per-element:
 // objects and maps per-attribute/per-key (as before), and — fixing
-// Tchori-Labs/tchori#11 (TC-033) — lists and tuples per-index, plus a
+// Tchori-Labs/tchori-internal#11 (TC-033) — lists and tuples per-index, plus a
 // wholesale substitution rule for sets. Before this fix, a ${...} reference
 // nested inside a list (e.g. cloudflare's policies[].include[].
 // service_token.token_id) stayed unknown at apply and was sent to the

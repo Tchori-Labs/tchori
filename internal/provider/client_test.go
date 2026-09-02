@@ -440,13 +440,19 @@ func waitForProviderPID(t *testing.T, path string, timeout time.Duration) int {
 	for {
 		raw, err := os.ReadFile(path) //nolint:gosec // G304: path is the t.TempDir PID artifact supplied by this test
 		if err == nil {
-			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(raw)))
-			if parseErr != nil {
-				t.Fatalf("parsing provider PID %q: %v", raw, parseErr)
+			trimmed := strings.TrimSpace(string(raw))
+			// An empty file is not yet a written PID: the provider's
+			// pidfile.Write stages content on a sibling path and renames it
+			// into place, so this should not happen in practice, but treat
+			// it as "not yet written" defensively rather than failing.
+			if trimmed != "" {
+				pid, parseErr := strconv.Atoi(trimmed)
+				if parseErr != nil {
+					t.Fatalf("parsing provider PID %q: %v", raw, parseErr)
+				}
+				return pid
 			}
-			return pid
-		}
-		if !errors.Is(err, os.ErrNotExist) {
+		} else if !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("reading provider PID file: %v", err)
 		}
 		if time.Now().After(deadline) {

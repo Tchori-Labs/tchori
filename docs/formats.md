@@ -152,7 +152,7 @@ provider is called — this covers references nested arbitrarily deep inside
 lists, sets, tuples, objects, and maps (e.g. a policy list whose element
 holds a reference inside a further-nested object), not just top-level or
 object/map-nested attributes, so a single `tchori apply` suffices even when
-the reference is nested inside an ordered collection (Tchori-Labs/tchori#11).
+the reference is nested inside an ordered collection (Tchori-Labs/tchori-internal#11).
 
 ### Exit-code contract
 
