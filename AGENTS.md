@@ -8,6 +8,19 @@ This is the `tchori` engine repo — the product, not the company state root
 - All agent work is authored by the **Tchorizo** GitHub account.
 - Always self-identify as an automated agent in any external interaction.
 
+## Public surface
+
+- This repository is public. Issues, pull requests, and comments on them are
+  visible to everyone, not just Tchori Labs.
+- Agents open pull requests and write their own PR description, and do not
+  post comments on issues or pull requests in this repository. Triage,
+  replies to external contributors, and reviews are done by humans.
+- Internal process tracking — task IDs, board decisions, runbooks — lives in
+  `Tchori-Labs/main` or the private `Tchori-Labs/tchori-internal`, never
+  here.
+- Commit messages and PR bodies must not carry task IDs or internal
+  trailers.
+
 ## Layout
 
 | Path | What it is |
