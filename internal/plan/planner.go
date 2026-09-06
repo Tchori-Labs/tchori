@@ -86,6 +86,20 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 
 	for _, addr := range order {
 		res := p.Config.Resources[addr]
+		rs, hasPrior := p.State.Resources[addr]
+		providerConfig := p.Config.Providers[res.Provider]
+		if providerConfig == nil || providerConfig.Source == "" {
+			ds = append(ds, diag.Errorf(addr, "provider source unavailable",
+				fmt.Sprintf("provider %q has no canonical source in configuration", res.Provider)))
+			return nil, ds
+		}
+		if hasPrior {
+			ids := validateStateIdentity(addr, rs, res.Type, res.Provider, providerConfig.Source)
+			ds = append(ds, ids...)
+			if ids.HasErrors() {
+				return nil, ds
+			}
+		}
 		client, schema, lds := p.lookup(addr, res.Provider, res.Type)
 		ds = append(ds, lds...)
 		if lds.HasErrors() {
@@ -105,7 +119,6 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		// (the provider dropped or renamed the attribute), so it is filtered
 		// out here rather than handed to sensitive.Resolve, which would
 		// reject an unknown path and hard-fail the whole plan.
-		rs, hasPrior := p.State.Resources[addr]
 		declared := res.SensitiveAttributes
 		if hasPrior {
 			var recalled []string
@@ -236,7 +249,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		planned := pc.State
 		plannedValues[addr] = planned
 
-		ch, err := newChange(addr, res.Provider, res.Type, prior, planned, ty, pc, spec)
+		ch, err := newChange(addr, res.Provider, providerConfig.Source, res.Type, prior, planned, ty, pc, spec)
 		if err != nil {
 			ds = append(ds, diag.Errorf(addr, "cannot encode change", err.Error()))
 			return nil, ds
@@ -290,6 +303,15 @@ func (p *Planner) lookup(addr, providerName, typeName string) (*provider.Client,
 // No provider plan RPC is needed to plan a deletion in the MVP.
 func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 	rs := p.State.Resources[addr]
+	providerConfig := p.Config.Providers[rs.Provider]
+	if providerConfig == nil || providerConfig.Source == "" {
+		return nil, diag.Diagnostics{diag.Errorf(addr, "provider source unavailable",
+			fmt.Sprintf("provider %q has no canonical source in configuration", rs.Provider))}
+	}
+	ids := validateStateIdentity(addr, rs, rs.Type, rs.Provider, providerConfig.Source)
+	if ids.HasErrors() {
+		return nil, ids
+	}
 	_, schema, lds := p.lookup(addr, rs.Provider, rs.Type)
 	if lds.HasErrors() {
 		return nil, lds
@@ -304,7 +326,7 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 	p.State.NoteSensitive(addr, paths)
 	// A state-only delete has no raw config and therefore no stable literal
 	// instance exemptions; its reporting copy is scrubbed path-level.
-	before, _, err := sensitive.RedactJSON(rs.Attributes, paths, nil)
+	before, _, err := sensitive.RedactJSON(rs.Attributes, paths)
 	if err != nil {
 		return nil, diag.Diagnostics{diag.Errorf(addr, "cannot sanitize delete state", err.Error())}
 	}
@@ -313,19 +335,35 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 		return nil, diag.Diagnostics{diag.Errorf(addr, "cannot encode planned value", err.Error())}
 	}
 	return &Change{
-		Address:    addr,
-		Type:       rs.Type,
-		Provider:   rs.Provider,
-		Action:     "delete",
-		Before:     before,
-		After:      json.RawMessage("null"),
-		PlannedRaw: raw,
-		Private:    rs.Private,
+		Address:        addr,
+		Type:           rs.Type,
+		Provider:       rs.Provider,
+		ProviderSource: rs.ProviderSource,
+		Action:         "delete",
+		Before:         before,
+		After:          json.RawMessage("null"),
+		PlannedRaw:     raw,
+		Private:        rs.Private,
 	}, lds
 }
 
+func validateStateIdentity(addr string, rs *state.ResourceState, resourceType, providerName, providerSource string) diag.Diagnostics {
+	if rs == nil {
+		return nil
+	}
+	if rs.ProviderSource == "" {
+		return diag.Diagnostics{diag.Errorf(addr, "state has unbound provider source",
+			"the stored resource predates canonical provider-source binding; run tchori state sanitize before planning")}
+	}
+	if rs.Type != resourceType || rs.Provider != providerName || rs.ProviderSource != providerSource {
+		return diag.Diagnostics{diag.Errorf(addr, "state does not match resource identity",
+			"the stored resource type, provider alias, or canonical provider source differs from configuration")}
+	}
+	return nil
+}
+
 // newChange classifies and serializes one provider-planned resource change.
-func newChange(addr, providerName, typeName string, prior, planned cty.Value, ty cty.Type, pc *provider.PlannedChange, spec *sensitive.Spec) (*Change, error) {
+func newChange(addr, providerName, providerSource, typeName string, prior, planned cty.Value, ty cty.Type, pc *provider.PlannedChange, spec *sensitive.Spec) (*Change, error) {
 	before := json.RawMessage("null") // JSON null for create
 	if !prior.IsNull() {
 		maskedPrior, _, err := spec.Redact(prior)
@@ -371,6 +409,7 @@ func newChange(addr, providerName, typeName string, prior, planned cty.Value, ty
 		Address:         addr,
 		Type:            typeName,
 		Provider:        providerName,
+		ProviderSource:  providerSource,
 		Action:          classify(prior, planned, pc.RequiresReplace, spec),
 		Before:          before,
 		After:           after,

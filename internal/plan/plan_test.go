@@ -16,6 +16,7 @@ import (
 
 	"github.com/tchori-labs/tchori/internal/config"
 	"github.com/tchori-labs/tchori/internal/plan"
+	"github.com/tchori-labs/tchori/internal/privateblob"
 	"github.com/tchori-labs/tchori/internal/provider"
 	"github.com/tchori-labs/tchori/internal/state"
 	ctymsgpack "github.com/zclconf/go-cty/cty/msgpack"
@@ -154,13 +155,14 @@ func populatedPlan() *plan.Plan {
 				PlannedRaw: []byte{0x81, 0xa4, 'n', 'a', 'm', 'e'},
 			},
 			{
-				Address:  "tchoritest_thing.beta",
-				Action:   "create",
-				Type:     "tchoritest_thing",
-				Provider: "tchoritest",
-				Before:   json.RawMessage("null"),
-				After:    json.RawMessage(`{"token":null}`),
-				Private:  []byte("provider-private-payload"),
+				Address:        "tchoritest_thing.beta",
+				Action:         "create",
+				Type:           "tchoritest_thing",
+				Provider:       "tchoritest",
+				ProviderSource: "tchori-labs/tchoritest",
+				Before:         json.RawMessage("null"),
+				After:          json.RawMessage(`{"token":null}`),
+				Private:        []byte("provider-private-payload"),
 			},
 		},
 		Summary: plan.Summary{Create: 1, Update: 1},
@@ -343,9 +345,10 @@ func stateWith(t *testing.T, serial uint64, resources map[string]string) *state.
 			t.Fatalf("bad address %q", addr)
 		}
 		st.Resources[addr] = &state.ResourceState{
-			Type:       typ,
-			Provider:   "tchoritest",
-			Attributes: json.RawMessage(attrs),
+			Type:           typ,
+			Provider:       "tchoritest",
+			Attributes:     json.RawMessage(attrs),
+			ProviderSource: "tchori-labs/tchoritest",
 		}
 	}
 	return st
@@ -389,6 +392,37 @@ const demoAppliedOld = `{"echo":"demo","id":"id-demo","name":"demo","replace_me"
 
 func driftApplied(name, echo string) string {
 	return fmt.Sprintf(`{"echo":%q,"id":%q,"name":%q,"replace_me":null,"rules":null,"tags":null}`, echo, "id-"+name, name)
+}
+
+func TestPlanRejectsUnboundOrChangedStateProviderSourceBeforeRefresh(t *testing.T) {
+	const addr = "tchoritest_thing.demo"
+	for _, tc := range []struct {
+		name    string
+		source  string
+		summary string
+	}{
+		{name: "unbound", source: "", summary: "state has unbound provider source"},
+		{name: "changed", source: "attacker.example/tchoritest", summary: "state does not match resource identity"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t, map[string]map[string]any{addr: {"name": "demo"}})
+			st := stateWith(t, 3, map[string]string{addr: demoApplied})
+			st.Resources[addr].ProviderSource = tc.source
+			_, ds := newPlanner(t, cfg, st).Plan(context.Background())
+			if !ds.HasErrors() {
+				t.Fatal("Plan sent stored state to a provider without a matching canonical source")
+			}
+			found := false
+			for _, d := range ds {
+				if d.Address == addr && d.Summary == tc.summary {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("diagnostics = %+v, want %q", ds, tc.summary)
+			}
+		})
+	}
 }
 
 func TestPlanRecordsRefreshDriftWithoutChangingExitSemantics(t *testing.T) {
@@ -1180,7 +1214,8 @@ func TestPlanPrivateEncryptedAcrossJSONSeams(t *testing.T) {
 		FormatVersion: plan.FormatVersion,
 		Changes: []*plan.Change{{
 			Address: "test_thing.example", Type: "test_thing", Provider: "test",
-			Action: "create", Before: json.RawMessage("null"), After: json.RawMessage(`{}`),
+			ProviderSource: "example.test/test",
+			Action:         "create", Before: json.RawMessage("null"), After: json.RawMessage(`{}`),
 			Private: []byte(sentinel),
 		}},
 	}
@@ -1220,8 +1255,8 @@ func TestPlanPrivateFailsClosed(t *testing.T) {
 	pl := &plan.Plan{
 		FormatVersion: plan.FormatVersion,
 		Changes: []*plan.Change{
-			{Address: "test_thing.alpha", Type: "test_thing", Provider: "test", Action: "create", Before: json.RawMessage("null"), After: json.RawMessage(`{}`), Private: []byte("alpha-private")},
-			{Address: "test_thing.beta", Type: "test_thing", Provider: "test", Action: "create", Before: json.RawMessage("null"), After: json.RawMessage(`{}`), Private: []byte("beta-private")},
+			{Address: "test_thing.alpha", Type: "test_thing", Provider: "test", ProviderSource: "example.test/test", Action: "create", Before: json.RawMessage("null"), After: json.RawMessage(`{}`), Private: []byte("alpha-private")},
+			{Address: "test_thing.beta", Type: "test_thing", Provider: "test", ProviderSource: "example.test/test", Action: "create", Before: json.RawMessage("null"), After: json.RawMessage(`{}`), Private: []byte("beta-private")},
 		},
 	}
 	data, err := json.Marshal(pl)
@@ -1266,6 +1301,24 @@ func TestPlanPrivateFailsClosed(t *testing.T) {
 		}
 	})
 
+	t.Run("provider source tamper", func(t *testing.T) {
+		t.Setenv("TCHORI_ARTIFACT_KEY", key)
+		var doc map[string]any
+		if err := json.Unmarshal(data, &doc); err != nil {
+			t.Fatal(err)
+		}
+		changes := doc["changes"].([]any)
+		changes[0].(map[string]any)["provider_source"] = "attacker.example/test"
+		tampered, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got plan.Plan
+		if err := json.Unmarshal(tampered, &got); err == nil {
+			t.Fatal("json.Unmarshal accepted private plan data under a different canonical provider source")
+		}
+	})
+
 	t.Run("1.1 plaintext", func(t *testing.T) {
 		t.Setenv("TCHORI_ARTIFACT_KEY", key)
 		plaintext := `{"format_version":"1.1","engine_version":"dev","state_serial":0,"changes":[{"address":"test_thing.alpha","type":"test_thing","provider":"test","action":"create","before":null,"after":{},"private":"YWxwaGEtcHJpdmF0ZQ=="}],"summary":{"create":1,"update":0,"delete":0,"replace":0}}`
@@ -1274,6 +1327,26 @@ func TestPlanPrivateFailsClosed(t *testing.T) {
 			t.Fatal("json.Unmarshal accepted plaintext/base64 private data in format 1.1")
 		}
 	})
+}
+
+func TestReadUnbound11PrivateForExplicitMigration(t *testing.T) {
+	t.Setenv("TCHORI_ARTIFACT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{35}, 32)))
+	const sentinel = "pre-source-binding-plan-private"
+	sealed, err := privateblob.Seal([]byte(sentinel), "plan\x00test_thing.example\x00test\x00test_thing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := fmt.Sprintf(
+		`{"format_version":"1.1","engine_version":"dev","state_serial":2,"changes":[{"address":"test_thing.example","type":"test_thing","provider":"test","action":"update","before":{},"after":{},"private":%s}],"summary":{"create":0,"update":1,"delete":0,"replace":0}}`,
+		sealed,
+	)
+	var got plan.Plan
+	if err := json.Unmarshal([]byte(document), &got); err != nil {
+		t.Fatalf("read pre-source-binding 1.1 plan: %v", err)
+	}
+	if got.Changes[0].ProviderSource != "" || !bytes.Equal(got.Changes[0].Private, []byte(sentinel)) {
+		t.Fatal("pre-source-binding 1.1 plan did not remain readable for explicit migration refusal")
+	}
 }
 
 func TestReadLegacyPlanPrivate(t *testing.T) {

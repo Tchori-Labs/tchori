@@ -46,6 +46,7 @@ var (
 type ResourceState struct {
 	Type             string          `json:"type"`
 	Provider         string          `json:"provider"`
+	ProviderSource   string          `json:"provider_source,omitempty"`
 	Attributes       json.RawMessage `json:"attributes"` // ctyjson-encoded object
 	Private          []byte          `json:"-"`
 	Redacted         []string        `json:"redacted,omitempty"`
@@ -55,10 +56,13 @@ type ResourceState struct {
 
 // Resolution is a live schema+config sensitivity lookup result. An empty Paths
 // slice is a valid, definitive non-sensitive result when the resolver's ok is
-// true; nil-vs-empty is never used to signal resolvability.
+// true; nil-vs-empty is never used to signal resolvability. RedactAttributes
+// preserves provider schema structure and binds raw-literal exemptions to
+// their authored values.
 type Resolution struct {
-	Paths           []string
-	ExemptInstances []string
+	Paths            []string
+	ProviderSource   string
+	RedactAttributes sensitive.JSONRedactor
 }
 
 // SensitiveResolver reports sensitivity for one entry. ok=false means the
@@ -82,6 +86,7 @@ type State struct {
 type resourceDocument struct {
 	Type             string          `json:"type"`
 	Provider         string          `json:"provider"`
+	ProviderSource   string          `json:"provider_source,omitempty"`
 	Attributes       json.RawMessage `json:"attributes"`
 	Private          json.RawMessage `json:"private,omitempty"`
 	Redacted         []string        `json:"redacted,omitempty"`
@@ -132,7 +137,7 @@ func (s State) MarshalJSON() ([]byte, error) {
 			return nil, err
 		}
 		doc.Resources[addr] = &resourceDocument{
-			Type: rs.Type, Provider: rs.Provider, Attributes: rs.Attributes, Private: private,
+			Type: rs.Type, Provider: rs.Provider, ProviderSource: rs.ProviderSource, Attributes: rs.Attributes, Private: private,
 			Redacted: rs.Redacted, SensitivePaths: rs.SensitivePaths, SensitiveScanned: rs.SensitiveScanned,
 		}
 	}
@@ -179,11 +184,11 @@ func (s *State) UnmarshalJSON(data []byte) error {
 				continue
 			}
 			rs := &ResourceState{
-				Type: persisted.Type, Provider: persisted.Provider, Attributes: persisted.Attributes,
+				Type: persisted.Type, Provider: persisted.Provider, ProviderSource: persisted.ProviderSource, Attributes: persisted.Attributes,
 				Redacted: persisted.Redacted, SensitivePaths: persisted.SensitivePaths, SensitiveScanned: persisted.SensitiveScanned,
 			}
 			if len(persisted.Private) != 0 {
-				private, err := privateblob.Open(persisted.Private, resourcePrivateContext("state", addr, rs.Provider, rs.Type))
+				private, err := privateblob.Open(persisted.Private, resourcePrivateContext("state", addr, rs.Provider, rs.ProviderSource, rs.Type))
 				if err != nil {
 					return fmt.Errorf("open private state for %s: %w", addr, err)
 				}
@@ -202,15 +207,23 @@ func sealResourcePrivate(addr string, rs *ResourceState) (json.RawMessage, error
 	if len(rs.Private) == 0 {
 		return nil, nil
 	}
-	sealed, err := privateblob.Seal(rs.Private, resourcePrivateContext("state", addr, rs.Provider, rs.Type))
+	if rs.Type == "" || rs.Provider == "" || rs.ProviderSource == "" {
+		return nil, fmt.Errorf("seal private state for %s: type, provider, and provider source are required", addr)
+	}
+	sealed, err := privateblob.Seal(rs.Private, resourcePrivateContext("state", addr, rs.Provider, rs.ProviderSource, rs.Type))
 	if err != nil {
 		return nil, fmt.Errorf("seal private state for %s: %w", addr, err)
 	}
 	return json.RawMessage(sealed), nil
 }
 
-func resourcePrivateContext(kind, addr, provider, resourceType string) string {
-	return kind + "\x00" + addr + "\x00" + provider + "\x00" + resourceType
+func resourcePrivateContext(kind, addr, provider, providerSource, resourceType string) string {
+	if providerSource == "" {
+		// Compatibility path for already-persisted 1.1 artifacts. State
+		// sanitize must bind a live source before the artifact can be saved.
+		return kind + "\x00" + addr + "\x00" + provider + "\x00" + resourceType
+	}
+	return kind + "\x00" + addr + "\x00" + provider + "\x00" + providerSource + "\x00" + resourceType
 }
 
 // Load returns an empty format 1.1 state when path does not exist. Existing
@@ -512,6 +525,11 @@ func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 		paths := unionStrings(prior.SensitivePaths, prior.Redacted, s.sensitiveHints[addr])
 		if current := s.Resources[addr]; current != nil {
 			paths = unionStrings(paths, current.SensitivePaths)
+			if prior.ProviderSource == "" && current.ProviderSource != "" &&
+				prior.Type == current.Type && prior.Provider == current.Provider {
+				prior.ProviderSource = current.ProviderSource
+				changedDocument = true
+			}
 		}
 		if s.resolver != nil {
 			if resolution, ok := s.resolver(addr, prior); ok {
@@ -525,7 +543,7 @@ func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 		// Conservative by design: a backup is a recovery/reporting copy never
 		// read by the engine, so under-scrubbing is a leak and over-scrubbing a
 		// raw literal is safe.
-		attrs, changed, err := sensitive.RedactJSON(prior.Attributes, paths, nil)
+		attrs, changed, err := sensitive.RedactJSON(prior.Attributes, paths)
 		if err != nil {
 			return nil, false, fmt.Errorf("sanitize backup attributes for %s: %w", addr, err)
 		}
@@ -587,14 +605,17 @@ func (s *State) sanitizeAll() error {
 			continue
 		}
 		paths := unionStrings(rs.SensitivePaths, rs.Redacted, s.sensitiveHints[addr])
-		var exemptions []string
+		redactor := sensitive.JSONRedactor(nil)
 		resolved := false
 		if s.resolver != nil {
 			if resolution, ok := s.resolver(addr, rs); ok {
 				resolved = true
 				// Removing a config declaration must not declassify a stored secret.
 				paths = unionStrings(paths, resolution.Paths)
-				exemptions = resolution.ExemptInstances
+				redactor = resolution.RedactAttributes
+				if resolution.ProviderSource != "" {
+					rs.ProviderSource = resolution.ProviderSource
+				}
 				rs.SensitivePaths = append([]string(nil), paths...)
 				rs.SensitiveScanned = true
 				rs.Redacted = intersectStrings(rs.Redacted, paths)
@@ -609,10 +630,18 @@ func (s *State) sanitizeAll() error {
 			}
 			continue
 		}
-		if !resolved {
-			exemptions = nil
-		} // orphan/config-unavailable: fail closed
-		attrs, changed, err := sensitive.RedactJSON(rs.Attributes, paths, exemptions)
+		var (
+			attrs   json.RawMessage
+			changed []string
+			err     error
+		)
+		if resolved && redactor != nil {
+			attrs, changed, err = redactor(rs.Attributes, paths)
+		} else {
+			// Orphan/config-unavailable state has no trustworthy schema or
+			// literal binding, so provider-free sanitization fails closed.
+			attrs, changed, err = sensitive.RedactJSON(rs.Attributes, paths)
+		}
 		if err != nil {
 			return fmt.Errorf("sanitize state attributes for %s: %w", addr, err)
 		}

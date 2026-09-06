@@ -20,6 +20,7 @@ type Change struct {
 	Address         string          `json:"address"`
 	Type            string          `json:"type,omitempty"`
 	Provider        string          `json:"provider,omitempty"`
+	ProviderSource  string          `json:"provider_source,omitempty"`
 	Action          string          `json:"action"`                  // "create","update","delete","replace","no-op"
 	Before          json.RawMessage `json:"before"`                  // JSON null for create
 	After           json.RawMessage `json:"after"`                   // unknowns rendered as JSON null; JSON null for delete
@@ -56,6 +57,7 @@ type changeDocument struct {
 	Address         string          `json:"address"`
 	Type            string          `json:"type,omitempty"`
 	Provider        string          `json:"provider,omitempty"`
+	ProviderSource  string          `json:"provider_source,omitempty"`
 	Action          string          `json:"action"`
 	Before          json.RawMessage `json:"before"`
 	After           json.RawMessage `json:"after"`
@@ -107,17 +109,17 @@ func (pl Plan) MarshalJSON() ([]byte, error) {
 		}
 		var private json.RawMessage
 		if len(ch.Private) != 0 {
-			if ch.Type == "" || ch.Provider == "" {
-				return nil, fmt.Errorf("seal private plan change for %s: type and provider are required", ch.Address)
+			if ch.Type == "" || ch.Provider == "" || ch.ProviderSource == "" {
+				return nil, fmt.Errorf("seal private plan change for %s: type, provider, and provider source are required", ch.Address)
 			}
-			sealed, err := privateblob.Seal(ch.Private, privateContext("plan", ch.Address, ch.Provider, ch.Type))
+			sealed, err := privateblob.Seal(ch.Private, privateContext("plan", ch.Address, ch.Provider, ch.ProviderSource, ch.Type))
 			if err != nil {
 				return nil, fmt.Errorf("seal private plan change for %s: %w", ch.Address, err)
 			}
 			private = json.RawMessage(sealed)
 		}
 		changes[i] = &changeDocument{
-			Address: ch.Address, Type: ch.Type, Provider: ch.Provider, Action: ch.Action,
+			Address: ch.Address, Type: ch.Type, Provider: ch.Provider, ProviderSource: ch.ProviderSource, Action: ch.Action,
 			Before: ch.Before, After: ch.After, UnknownAfter: ch.UnknownAfter,
 			RequiresReplace: ch.RequiresReplace, PlannedRaw: ch.PlannedRaw, Private: private,
 		}
@@ -176,7 +178,7 @@ func (pl *Plan) UnmarshalJSON(data []byte) error {
 				return fmt.Errorf("invalid plan: change %d is null", i)
 			}
 			ch := &Change{
-				Address: persisted.Address, Type: persisted.Type, Provider: persisted.Provider,
+				Address: persisted.Address, Type: persisted.Type, Provider: persisted.Provider, ProviderSource: persisted.ProviderSource,
 				Action: persisted.Action, Before: persisted.Before, After: persisted.After,
 				UnknownAfter: persisted.UnknownAfter, RequiresReplace: persisted.RequiresReplace,
 				PlannedRaw: persisted.PlannedRaw,
@@ -185,7 +187,7 @@ func (pl *Plan) UnmarshalJSON(data []byte) error {
 				if ch.Type == "" || ch.Provider == "" {
 					return fmt.Errorf("open private plan change for %s: type and provider are required", ch.Address)
 				}
-				private, err := privateblob.Open(persisted.Private, privateContext("plan", ch.Address, ch.Provider, ch.Type))
+				private, err := privateblob.Open(persisted.Private, privateContext("plan", ch.Address, ch.Provider, ch.ProviderSource, ch.Type))
 				if err != nil {
 					return fmt.Errorf("open private plan change for %s: %w", ch.Address, err)
 				}
@@ -203,8 +205,13 @@ func (pl *Plan) UnmarshalJSON(data []byte) error {
 	}
 }
 
-func privateContext(kind, addr, provider, resourceType string) string {
-	return kind + "\x00" + addr + "\x00" + provider + "\x00" + resourceType
+func privateContext(kind, addr, provider, providerSource, resourceType string) string {
+	if providerSource == "" {
+		// Compatibility path for already-persisted 1.1 artifacts. Apply
+		// refuses these unbound changes; a new plan performs the migration.
+		return kind + "\x00" + addr + "\x00" + provider + "\x00" + resourceType
+	}
+	return kind + "\x00" + addr + "\x00" + provider + "\x00" + providerSource + "\x00" + resourceType
 }
 
 // HasChanges reports whether the plan contains any non-no-op change. It

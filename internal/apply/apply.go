@@ -119,7 +119,11 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 		if rds.HasErrors() {
 			return state.Resolution{}, false
 		}
-		return state.Resolution{Paths: spec.Paths(), ExemptInstances: spec.ExemptInstances()}, true
+		return state.Resolution{
+			Paths:            spec.Paths(),
+			ProviderSource:   cfg.Providers[res.Provider].Source,
+			RedactAttributes: spec.Redactor(sch.Block.ImpliedType()),
+		}, true
 	})
 
 	byAddr := make(map[string]*plan.Change, len(pl.Changes))
@@ -204,30 +208,45 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 	// resource after the plan was saved) never appears in `order` and would
 	// otherwise silently vanish from `ordered`, applying nothing with zero
 	// diagnostics. Refuse the whole apply instead, before any provider call
-	// or state save, mirroring the stale-plan check's all-or-nothing
-	// posture: a plan that no longer matches configuration is not
-	// partially actionable.
 	var driftDiags diag.Diagnostics
 	for _, ch := range pl.Changes {
-		if len(ch.Private) != 0 && (ch.Type == "" || ch.Provider == "") {
-			driftDiags = append(driftDiags, diag.Errorf(ch.Address, "plan has unbound private data",
-				"the plan does not record the resource type and provider for its private data; run plan again"))
+		if ch.Action == "no-op" {
 			continue
 		}
-		typeName, providerName, known := resourceIdentity(cfg, st, ch.Address)
-		if known && ((ch.Type != "" && ch.Type != typeName) || (ch.Provider != "" && ch.Provider != providerName)) {
-			driftDiags = append(driftDiags, diag.Errorf(ch.Address, "plan does not match resource identity",
-				"the resource type or provider changed since the plan was created; run plan again"))
-			continue
-		}
-		if ch.Action == "delete" {
-			continue
-		}
-		if cfg == nil || cfg.Resources[ch.Address] == nil {
+		if ch.Action != "delete" && (cfg == nil || cfg.Resources[ch.Address] == nil) {
 			driftDiags = append(driftDiags, diag.Errorf(ch.Address, "plan does not match configuration",
 				fmt.Sprintf(
 					"plan has a %q change for %q, but the address is no longer present in the loaded configuration; the configuration changed since the plan was created — run plan again",
 					ch.Action, ch.Address)))
+			continue
+		}
+		if ch.Type == "" || ch.Provider == "" || ch.ProviderSource == "" {
+			driftDiags = append(driftDiags, diag.Errorf(ch.Address, "plan has unbound resource identity",
+				"every executable change must record its resource type, provider alias, and canonical provider source; run plan again"))
+			continue
+		}
+		typeName, providerName, providerSource, known := resourceIdentity(cfg, st, ch.Address)
+		if !known || ch.Type != typeName || ch.Provider != providerName || ch.ProviderSource != providerSource {
+			driftDiags = append(driftDiags, diag.Errorf(ch.Address, "plan does not match resource identity",
+				"the resource type, provider alias, or canonical provider source changed since the plan was created; run plan again"))
+			continue
+		}
+		if ch.Action != "create" {
+			if rs := st.Resources[ch.Address]; rs != nil {
+				if rs.ProviderSource == "" {
+					driftDiags = append(driftDiags, diag.Errorf(ch.Address, "state has unbound provider source",
+						"the stored resource predates canonical provider-source binding; run tchori state sanitize before applying"))
+					continue
+				}
+				if rs.Type != typeName || rs.Provider != providerName || rs.ProviderSource != providerSource {
+					driftDiags = append(driftDiags, diag.Errorf(ch.Address, "state does not match resource identity",
+						"the stored resource type, provider alias, or canonical provider source differs from the provider selected by configuration"))
+					continue
+				}
+			}
+		}
+		if ch.Action == "delete" {
+			continue
 		}
 	}
 	if driftDiags.HasErrors() {
@@ -426,15 +445,26 @@ func (ex *executor) save() error {
 
 // resourceIdentity is shared by preflight and execution so authenticated plan
 // metadata is checked against the exact provider that will receive the call.
-func resourceIdentity(cfg *config.Config, st *state.State, address string) (resourceType, providerName string, known bool) {
+func resourceIdentity(cfg *config.Config, st *state.State, address string) (resourceType, providerName, providerSource string, known bool) {
 	if cfg != nil && cfg.Resources[address] != nil {
 		resource := cfg.Resources[address]
-		return resource.Type, resource.Provider, true
+		providerConfig := cfg.Providers[resource.Provider]
+		if providerConfig == nil || providerConfig.Source == "" {
+			return resource.Type, resource.Provider, "", false
+		}
+		return resource.Type, resource.Provider, providerConfig.Source, true
 	}
 	if resource := st.Resources[address]; resource != nil {
-		return resource.Type, resource.Provider, true
+		source := resource.ProviderSource
+		if cfg != nil && cfg.Providers[resource.Provider] != nil {
+			source = cfg.Providers[resource.Provider].Source
+		}
+		if source == "" {
+			return resource.Type, resource.Provider, "", false
+		}
+		return resource.Type, resource.Provider, source, true
 	}
-	return "", "", false
+	return "", "", "", false
 }
 
 // applyChange executes one plan change and persists its result. For TC-048,
@@ -443,7 +473,7 @@ func resourceIdentity(cfg *config.Config, st *state.State, address string) (reso
 func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagnostics {
 	addr := ch.Address
 
-	typeName, providerName, known := resourceIdentity(ex.cfg, ex.st, addr)
+	typeName, providerName, providerSource, known := resourceIdentity(ex.cfg, ex.st, addr)
 	if !known {
 		return diag.Diagnostics{diag.Errorf(addr, "unknown resource",
 			"address appears in the plan but in neither configuration nor state")}
@@ -514,7 +544,7 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	}
 
 	if ch.Action == "delete" {
-		return ex.destroy(ctx, client, typeName, addr, ch.Action, ty, prior, priorPrivate)
+		return ex.destroy(ctx, client, typeName, providerName, providerSource, addr, ch.Action, schema.Block, ty, prior, priorPrivate)
 	}
 
 	// Compose before selecting create/update/replace so an unresolved value
@@ -548,24 +578,84 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 		// Destroy-then-create: two explicit ApplyResource calls. The state
 		// entry is removed (and saved) after the destroy leg, then written
 		// back (and saved) after the create leg.
-		destroyDs := ex.destroy(ctx, client, typeName, addr, ch.Action, ty, prior, priorPrivate)
+		destroyDs := ex.destroy(ctx, client, typeName, providerName, providerSource, addr, ch.Action, schema.Block, ty, prior, priorPrivate)
 		ds = append(ds, destroyDs...)
 		if destroyDs.HasErrors() {
 			return ds
 		}
-		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, cty.NullVal(ty), cfgVal, planned, ch)...)
+		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, providerSource, addr, schema.Block, ty, cty.NullVal(ty), cfgVal, planned, ch)...)
 	default: // "create", "update"
-		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, prior, cfgVal, planned, ch)...)
+		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, providerSource, addr, schema.Block, ty, prior, cfgVal, planned, ch)...)
 	}
 }
 
 // destroy applies a null planned value — the plugin-protocol convention for
 // "destroy this object" — then removes the resource from state and saves.
-func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeName, addr, action string, ty cty.Type, prior cty.Value, priorPrivate []byte) diag.Diagnostics {
-	newState, _, ds := client.ApplyResource(ctx, typeName, prior, cty.NullVal(ty), cty.NullVal(ty), priorPrivate)
+func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeName, providerName, providerSource, addr, action string, block *provider.SchemaBlock, ty cty.Type, prior cty.Value, priorPrivate []byte) diag.Diagnostics {
+	newState, newPrivate, ds := client.ApplyResource(ctx, typeName, prior, cty.NullVal(ty), cty.NullVal(ty), priorPrivate)
 	ds = provider.Context(addr, ds)
-	if ds.HasErrors() {
-		return ds
+	failed := ds.HasErrors()
+	if failed {
+		if newState == cty.NilVal || !newState.IsKnown() {
+			return ds
+		}
+		old := ex.st.Resources[addr]
+		if newState.IsNull() {
+			delete(ex.st.Resources, addr)
+			if err := ex.save(); err != nil {
+				if old != nil {
+					ex.st.Resources[addr] = old
+				}
+				return append(ds, diag.Errorf(addr, "saving state", err.Error()))
+			}
+			return append(ds, unresolvedWarnings(ex.st)...)
+		}
+		if old != nil && newState.RawEquals(prior) && (newPrivate == nil || bytes.Equal(newPrivate, old.Private)) {
+			return ds
+		}
+
+		var declared []string
+		var rawCfg map[string]any
+		if ex.cfg != nil && ex.cfg.Resources[addr] != nil {
+			declared = append(declared, ex.cfg.Resources[addr].SensitiveAttributes...)
+			rawCfg = ex.cfg.Resources[addr].Config
+		}
+		if old != nil {
+			declared = append(declared, old.SensitivePaths...)
+		}
+		spec, specDs := sensitive.Resolve(block, declared, rawCfg)
+		ds = append(ds, specDs...)
+		if specDs.HasErrors() {
+			return ds
+		}
+		redacted, redactedPaths, err := spec.Redact(newState)
+		if err != nil {
+			return append(ds, diag.Errorf(addr, "redacting partial destroy state", err.Error()))
+		}
+		attrs, err := ctyjson.Marshal(redacted, ty)
+		if err != nil {
+			return append(ds, diag.Errorf(addr, "encoding partial destroy state", err.Error()))
+		}
+		ex.st.NoteSensitive(addr, spec.Paths())
+		ex.st.Resources[addr] = &state.ResourceState{
+			Type:             typeName,
+			Provider:         providerName,
+			ProviderSource:   providerSource,
+			Attributes:       attrs,
+			Private:          newPrivate,
+			Redacted:         redactedPaths,
+			SensitivePaths:   spec.Paths(),
+			SensitiveScanned: true,
+		}
+		if err := ex.save(); err != nil {
+			if old != nil {
+				ex.st.Resources[addr] = old
+			} else {
+				delete(ex.st.Resources, addr)
+			}
+			return append(ds, diag.Errorf(addr, "saving state", err.Error()))
+		}
+		return append(ds, unresolvedWarnings(ex.st)...)
 	}
 	if !newState.IsNull() {
 		return append(ds, diag.Errorf(addr, "provider did not destroy resource",
@@ -581,7 +671,7 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 
 // createOrUpdate applies the value prepared before any replace destroy leg,
 // then records the provider's returned state and saves.
-func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, addr string, block *provider.SchemaBlock, ty cty.Type, prior, cfgVal, planned cty.Value, ch *plan.Change) diag.Diagnostics {
+func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, providerSource, addr string, block *provider.SchemaBlock, ty cty.Type, prior, cfgVal, planned cty.Value, ch *plan.Change) diag.Diagnostics {
 	var ds diag.Diagnostics
 
 	newState, newPrivate, applyDs := client.ApplyResource(ctx, typeName, prior, planned, cfgVal, ch.Private)
@@ -635,6 +725,7 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	ex.st.Resources[addr] = &state.ResourceState{
 		Type:             typeName,
 		Provider:         providerName,
+		ProviderSource:   providerSource,
 		Attributes:       attrs,
 		Private:          newPrivate,
 		Redacted:         redactedPaths,

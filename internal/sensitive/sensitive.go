@@ -14,10 +14,11 @@ import (
 )
 
 // Spec is the effective sensitive-path contract for one resource. Paths are
-// index-insensitive; exemptions identify individual raw-config instances.
+// index-insensitive; exemptions bind an individual raw-config instance to the
+// exact authored scalar value.
 type Spec struct {
 	paths       []string
-	exempt      []string
+	exempt      map[string]any
 	setPrefixes []string
 }
 
@@ -39,6 +40,17 @@ func Resolve(block *provider.SchemaBlock, declared []string, rawCfg map[string]a
 	}
 	sort.Strings(paths)
 	sort.Strings(setPrefixes)
+	for _, path := range paths {
+		for _, prefix := range setPrefixes {
+			if strings.HasPrefix(path, prefix+".") {
+				ds = append(ds, diag.Errorf("", "sensitive set element cannot be represented safely",
+					fmt.Sprintf("sensitive path %q is inside set %q; redacting element fields can merge distinct set elements, so the resource is rejected before provider execution", path, prefix)))
+			}
+		}
+	}
+	if ds.HasErrors() {
+		return nil, ds
+	}
 	s := &Spec{paths: paths, setPrefixes: setPrefixes}
 	return s.Effective(rawCfg), ds
 }
@@ -137,29 +149,35 @@ func typePathExists(ty cty.Type, parts []string) bool {
 func (s *Spec) Paths() []string { return append([]string(nil), s.paths...) }
 
 // ExemptInstances returns sorted, index-qualified raw-literal instances.
-func (s *Spec) ExemptInstances() []string { return append([]string(nil), s.exempt...) }
+func (s *Spec) ExemptInstances() []string {
+	instances := make([]string, 0, len(s.exempt))
+	for instance := range s.exempt {
+		instances = append(instances, instance)
+	}
+	sort.Strings(instances)
+	return instances
+}
 
 // Effective records per-instance exemptions from raw config syntax. The
 // exemption exists only because the literal is already present in committed
 // configuration. It must never be inferred from composed values: doing so
 // would exempt referenced secrets (and future env wrappers, TC-054/#46).
 func (s *Spec) Effective(rawCfg map[string]any) *Spec {
-	out := &Spec{paths: s.Paths(), setPrefixes: append([]string(nil), s.setPrefixes...)}
+	out := &Spec{
+		paths:       s.Paths(),
+		exempt:      map[string]any{},
+		setPrefixes: append([]string(nil), s.setPrefixes...),
+	}
 	if rawCfg == nil {
 		return out
 	}
-	exempt := map[string]bool{}
-	walkRaw(rawCfg, "", "", out.paths, out.setPrefixes, exempt)
-	for path := range exempt {
-		out.exempt = append(out.exempt, path)
-	}
-	sort.Strings(out.exempt)
+	walkRaw(rawCfg, "", "", out.paths, out.setPrefixes, out.exempt)
 	return out
 }
 
-func walkRaw(v any, logical, instance string, paths, setPrefixes []string, exempt map[string]bool) {
+func walkRaw(v any, logical, instance string, paths, setPrefixes []string, exempt map[string]any) {
 	if scalarLiteral(v) && contains(paths, logical) && !underPrefix(logical, setPrefixes) {
-		exempt[instance] = true
+		exempt[instance] = v
 		return
 	}
 	switch x := v.(type) {
@@ -261,7 +279,10 @@ func (s *Spec) transform(v cty.Value, mode transformMode) (cty.Value, []string, 
 	var changed []string
 	out, err := cty.Transform(v, func(path cty.Path, val cty.Value) (cty.Value, error) {
 		full := PathString(path)
-		if !contains(s.paths, stripIndices(full)) || contains(s.exempt, full) {
+		if !contains(s.paths, logicalPath(path)) {
+			return val, nil
+		}
+		if literal, ok := s.exempt[full]; ok && literalMatches(val, literal) {
 			return val, nil
 		}
 		switch mode {
@@ -282,4 +303,29 @@ func (s *Spec) transform(v cty.Value, mode transformMode) (cty.Value, []string, 
 	})
 	sort.Strings(changed)
 	return out, changed, err
+}
+
+func literalMatches(value cty.Value, literal any) bool {
+	if !value.IsKnown() || value.IsNull() {
+		return false
+	}
+	switch raw := literal.(type) {
+	case string:
+		return value.Type().Equals(cty.String) && value.AsString() == raw
+	case bool:
+		return value.Type().Equals(cty.Bool) && value.True() == raw
+	case jsonNumber:
+		expected, err := cty.ParseNumberVal(raw.String())
+		return err == nil && value.Type().Equals(cty.Number) && value.RawEquals(expected)
+	case float64:
+		return value.Type().Equals(cty.Number) && value.RawEquals(cty.NumberFloatVal(raw))
+	case float32:
+		return value.Type().Equals(cty.Number) && value.RawEquals(cty.NumberFloatVal(float64(raw)))
+	case int:
+		return value.Type().Equals(cty.Number) && value.RawEquals(cty.NumberIntVal(int64(raw)))
+	case int64:
+		return value.Type().Equals(cty.Number) && value.RawEquals(cty.NumberIntVal(raw))
+	default:
+		return false
+	}
 }

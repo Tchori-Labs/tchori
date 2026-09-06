@@ -893,9 +893,14 @@ func TestApplyStateOnlyDeleteFailureAfterSuccess(t *testing.T) {
 	h := newHarness(t, map[string]*config.Resource{alpha: thing("alpha", "alpha")})
 	st := loadState(t, h.statePath)
 	pl := h.plan(t, st, false)
-	pl.Changes = append(pl.Changes, &plan.Change{Address: orphan, Action: "delete"})
+	pl.Changes = append(pl.Changes, &plan.Change{
+		Address: orphan, Type: "tchoritest_thing", Provider: "missing",
+		ProviderSource: "example.test/missing", Action: "delete",
+	})
 	pl.Summary.Delete++
-	st.Resources[orphan] = &state.ResourceState{Type: "tchoritest_thing", Provider: "missing", Attributes: json.RawMessage(`{}`)}
+	st.Resources[orphan] = &state.ResourceState{
+		Type: "tchoritest_thing", Provider: "missing", ProviderSource: "example.test/missing", Attributes: json.RawMessage(`{}`),
+	}
 
 	_, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if !diagnosticsContain(ds, "provider not running") {
@@ -1091,9 +1096,10 @@ func TestApplyRejectsPoisonedStateReferencePropagation(t *testing.T) {
 		Serial:        7,
 		Resources: map[string]*state.ResourceState{
 			aAddr: {
-				Type:       "tchoritest_thing",
-				Provider:   "tchoritest",
-				Attributes: json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"tags":{"parent":"safe-parent"}}`),
+				Type:           "tchoritest_thing",
+				Provider:       "tchoritest",
+				ProviderSource: "tchori-labs/tchoritest",
+				Attributes:     json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"tags":{"parent":"safe-parent"}}`),
 			},
 		},
 	}
@@ -1249,9 +1255,64 @@ func TestApplyDestroyFailureBlocksDependencyDelete(t *testing.T) {
 	if blocked == nil || blocked.Address != base || blocked.Severity != diag.Error {
 		t.Fatalf("blocked diagnostic = %+v", blocked)
 	}
+
 	saved := loadState(t, h.statePath)
 	if saved.Resources[base] == nil || saved.Resources[dependentAddr] == nil {
 		t.Fatalf("destroy removed a blocked or failed resource: %+v", saved.Resources)
+	}
+}
+func TestApplyCheckpointsAuthoritativeDestroyStateOnProviderError(t *testing.T) {
+	for _, tc := range []struct {
+		action      string
+		name        string
+		wantPresent bool
+		wantEcho    string
+		wantPrivate string
+	}{
+		{action: "delete", name: "partial_destroy_null"},
+		{action: "replace", name: "partial_destroy_null"},
+		{action: "delete", name: "partial_destroy_state", wantPresent: true, wantEcho: "destroy-side-effect", wantPrivate: "destroy-partial-recovery"},
+		{action: "replace", name: "partial_destroy_state", wantPresent: true, wantEcho: "destroy-side-effect", wantPrivate: "destroy-partial-recovery"},
+	} {
+		t.Run(tc.action+"/"+tc.name, func(t *testing.T) {
+			const addr = "tchoritest_thing.subject"
+			h := newHarness(t, map[string]*config.Resource{addr: thing("subject", tc.name)})
+			st := loadState(t, h.statePath)
+			if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+				t.Fatalf("initial Apply: %+v", ds)
+			}
+			st = loadState(t, h.statePath)
+			if tc.action == "replace" {
+				h.cfg.Resources[addr].Config["replace_me"] = "replacement"
+			}
+			pl := h.plan(t, st, tc.action == "delete")
+			if len(pl.Changes) != 1 || pl.Changes[0].Action != tc.action {
+				t.Fatalf("changes = %+v, want one %s", pl.Changes, tc.action)
+			}
+
+			result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+			if !diagnosticsContain(ds, "destroy partially failed") {
+				t.Fatalf("diagnostics = %+v, want provider destroy error", ds)
+			}
+			if result.Deleted != 0 || result.Replaced != 0 {
+				t.Fatalf("result = %+v, failed destroy must remain unaccounted", result)
+			}
+			saved := loadState(t, h.statePath)
+			got := saved.Resources[addr]
+			if tc.wantPresent != (got != nil) {
+				t.Fatalf("resource presence = %v, want %v", got != nil, tc.wantPresent)
+			}
+			if got != nil {
+				var attrs map[string]any
+				if err := json.Unmarshal(got.Attributes, &attrs); err != nil {
+					t.Fatal(err)
+				}
+				if attrs["echo"] != tc.wantEcho || string(got.Private) != tc.wantPrivate {
+					t.Fatalf("checkpoint = attrs %s private %q, want echo %q private %q", got.Attributes, got.Private, tc.wantEcho, tc.wantPrivate)
+				}
+			}
+			wantIncomplete(t, saved, addr, []string{}, []string{addr})
+		})
 	}
 }
 
@@ -1261,24 +1322,26 @@ func TestApplyMultipleStateOnlyDeletesIncludeNullAndPrivateState(t *testing.T) {
 	h := newHarness(t, map[string]*config.Resource{})
 	st := &state.State{FormatVersion: "1.0", Resources: map[string]*state.ResourceState{
 		alpha: {
-			Type:       "tchoritest_thing",
-			Provider:   "tchoritest",
-			Attributes: json.RawMessage("null"),
-			Private:    []byte("alpha-private"),
+			Type:           "tchoritest_thing",
+			Provider:       "tchoritest",
+			ProviderSource: "tchori-labs/tchoritest",
+			Attributes:     json.RawMessage("null"),
+			Private:        []byte("alpha-private"),
 		},
 		zeta: {
-			Type:       "tchoritest_thing",
-			Provider:   "tchoritest",
-			Attributes: json.RawMessage(`{"echo":"zeta","id":"id-zeta","name":"zeta","replace_me":null,"tags":null}`),
-			Private:    []byte("zeta-private"),
+			Type:           "tchoritest_thing",
+			Provider:       "tchoritest",
+			ProviderSource: "tchori-labs/tchoritest",
+			Attributes:     json.RawMessage(`{"echo":"zeta","id":"id-zeta","name":"zeta","replace_me":null,"tags":null}`),
+			Private:        []byte("zeta-private"),
 		},
 	}}
 	if err := st.Save(h.statePath); err != nil {
 		t.Fatal(err)
 	}
 	pl := &plan.Plan{StateSerial: st.Serial, Changes: []*plan.Change{
-		{Address: alpha, Action: "delete"},
-		{Address: zeta, Action: "delete"},
+		{Address: alpha, Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Action: "delete"},
+		{Address: zeta, Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Action: "delete"},
 	}}
 	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if ds.HasErrors() {
@@ -1298,15 +1361,16 @@ func TestApplyStateOnlyDeletesKeepReverseLexicalOrderAfterFailures(t *testing.T)
 	const zeta = "tchoritest_thing.zeta"
 	exploding := func(private string) *state.ResourceState {
 		return &state.ResourceState{
-			Type:       "tchoritest_thing",
-			Provider:   "tchoritest",
-			Attributes: json.RawMessage(`{"echo":"explode_destroy","id":"id-explode_destroy","name":"explode_destroy","replace_me":null,"tags":null}`),
-			Private:    []byte(private),
+			Type:           "tchoritest_thing",
+			Provider:       "tchoritest",
+			ProviderSource: "tchori-labs/tchoritest",
+			Attributes:     json.RawMessage(`{"echo":"explode_destroy","id":"id-explode_destroy","name":"explode_destroy","replace_me":null,"tags":null}`),
+			Private:        []byte(private),
 		}
 	}
 	h := newHarness(t, map[string]*config.Resource{})
 	st := &state.State{FormatVersion: "1.0", Resources: map[string]*state.ResourceState{
-		alpha:  {Type: "tchoritest_thing", Provider: "tchoritest", Attributes: json.RawMessage("null")},
+		alpha:  {Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Attributes: json.RawMessage("null")},
 		middle: exploding("middle-private"),
 		zeta:   exploding("zeta-private"),
 	}}
@@ -1314,9 +1378,9 @@ func TestApplyStateOnlyDeletesKeepReverseLexicalOrderAfterFailures(t *testing.T)
 		t.Fatal(err)
 	}
 	pl := &plan.Plan{StateSerial: st.Serial, Changes: []*plan.Change{
-		{Address: alpha, Action: "delete"},
-		{Address: middle, Action: "delete"},
-		{Address: zeta, Action: "delete"},
+		{Address: alpha, Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Action: "delete"},
+		{Address: middle, Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Action: "delete"},
+		{Address: zeta, Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Action: "delete"},
 	}}
 	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if !ds.HasErrors() || result.Deleted != 1 || len(result.NotExecuted) != 0 {
@@ -1425,13 +1489,14 @@ func TestApplyCreateIgnoresStalePriorState(t *testing.T) {
 		EngineVersion: "0.1.0-dev",
 		StateSerial:   0,
 		Changes: []*plan.Change{{
-			Address:    addr,
-			Type:       "tchoritest_thing",
-			Provider:   "tchoritest",
-			Action:     "create",
-			Before:     json.RawMessage("null"),
-			PlannedRaw: raw,
-			Private:    pc.Private,
+			Address:        addr,
+			Type:           "tchoritest_thing",
+			Provider:       "tchoritest",
+			ProviderSource: "tchori-labs/tchoritest",
+			Action:         "create",
+			Before:         json.RawMessage("null"),
+			PlannedRaw:     raw,
+			Private:        pc.Private,
 		}},
 		Summary: plan.Summary{Create: 1},
 	}
@@ -1450,9 +1515,10 @@ func TestApplyCreateIgnoresStalePriorState(t *testing.T) {
 		Serial:        0,
 		Resources: map[string]*state.ResourceState{
 			addr: {
-				Type:       "tchoritest_thing",
-				Provider:   "tchoritest",
-				Attributes: json.RawMessage(`{"echo":"stale","id":"stale-id","name":"stale","replace_me":null,"rules":null,"tags":"not-a-map"}`),
+				Type:           "tchoritest_thing",
+				Provider:       "tchoritest",
+				ProviderSource: "tchori-labs/tchoritest",
+				Attributes:     json.RawMessage(`{"echo":"stale","id":"stale-id","name":"stale","replace_me":null,"rules":null,"tags":"not-a-map"}`),
 			},
 		},
 	}
@@ -1562,9 +1628,10 @@ func TestApplyMixedOptionalNestedObjects(t *testing.T) {
 	const attrs = `{"id":"id-demo","name":"demo","ingress":[{"service":"http://one","origin_request":null},{"service":"http://two","origin_request":{"connect_timeout":null,"no_tls_verify":null}}]}`
 	st := &state.State{FormatVersion: "1.0", Serial: 1, Resources: map[string]*state.ResourceState{
 		"tchoritest_ingress_thing.demo": {
-			Type:       "tchoritest_ingress_thing",
-			Provider:   "tchoritest",
-			Attributes: json.RawMessage(attrs),
+			Type:           "tchoritest_ingress_thing",
+			Provider:       "tchoritest",
+			ProviderSource: "tchori-labs/tchoritest",
+			Attributes:     json.RawMessage(attrs),
 		},
 	}}
 	pl := h.plan(t, st, false)
@@ -1603,8 +1670,11 @@ func TestApplyUnsupportedResourceType(t *testing.T) {
 		FormatVersion: "1.0",
 		EngineVersion: "0.1.0-dev",
 		StateSerial:   0,
-		Changes:       []*plan.Change{{Address: "tchoritest_broken_thing.boom", Action: "create"}},
-		Summary:       plan.Summary{Create: 1},
+		Changes: []*plan.Change{{
+			Address: "tchoritest_broken_thing.boom", Type: "tchoritest_broken_thing",
+			Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Action: "create",
+		}},
+		Summary: plan.Summary{Create: 1},
 	}
 
 	_, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)

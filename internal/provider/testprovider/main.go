@@ -365,6 +365,11 @@ func (s *server) ConfigureProvider(ctx context.Context, req *tfprotov6.Configure
 }
 
 func (s *server) StopProvider(ctx context.Context, req *tfprotov6.StopProviderRequest) (*tfprotov6.StopProviderResponse, error) {
+	if path := os.Getenv("TCHORITEST_STOP_FILE"); path != "" {
+		if err := os.WriteFile(path, []byte("stopping"), 0o600); err != nil { //nolint:gosec // test-only provider writes caller-selected marker
+			return nil, err
+		}
+	}
 	if os.Getenv("TCHORITEST_STALL_STOP") != "" {
 		time.Sleep(30 * time.Second)
 	}
@@ -780,6 +785,33 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 			var name string
 			if err := attrs["name"].As(&name); err != nil {
 				return nil, err
+			}
+			if name == "partial_destroy_null" {
+				return &tfprotov6.ApplyResourceChangeResponse{
+					NewState: req.PlannedState,
+					Private:  []byte("destroy-partial-recovery"),
+					Diagnostics: []*tfprotov6.Diagnostic{{
+						Severity: tfprotov6.DiagnosticSeverityError,
+						Summary:  "destroy partially failed",
+						Detail:   "the remote object was deleted before a follow-up operation failed",
+					}},
+				}, nil
+			}
+			if name == "partial_destroy_state" {
+				attrs["echo"] = tftypes.NewValue(tftypes.String, "destroy-side-effect")
+				partial, err := tfprotov6.NewDynamicValue(thingType, tftypes.NewValue(thingType, attrs))
+				if err != nil {
+					return nil, err
+				}
+				return &tfprotov6.ApplyResourceChangeResponse{
+					NewState: &partial,
+					Private:  []byte("destroy-partial-recovery"),
+					Diagnostics: []*tfprotov6.Diagnostic{{
+						Severity: tfprotov6.DiagnosticSeverityError,
+						Summary:  "destroy partially failed",
+						Detail:   "the remote object changed before a follow-up operation failed",
+					}},
+				}, nil
 			}
 			if name == "explode_destroy" {
 				return &tfprotov6.ApplyResourceChangeResponse{

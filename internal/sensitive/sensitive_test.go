@@ -17,7 +17,7 @@ func testBlock(nesting string) *provider.SchemaBlock {
 }
 
 func TestNestedTypeLeafRedaction(t *testing.T) {
-	for _, nesting := range []string{"single", "list", "set", "map"} {
+	for _, nesting := range []string{"single", "list", "map"} {
 		t.Run(nesting, func(t *testing.T) {
 			value := cty.ObjectVal(map[string]cty.Value{"user": cty.StringVal("alice"), "token": cty.StringVal("synthetic-private-value")})
 			switch nesting {
@@ -87,6 +87,62 @@ func TestResolveAndEffectiveMixedInstances(t *testing.T) {
 	}
 }
 
+func TestLiteralExemptionRequiresAuthoredValue(t *testing.T) {
+	s, ds := Resolve(testBlock("list"), nil, map[string]any{
+		"rules": []any{map[string]any{"token": "authored-public-value"}}, //nolint:gosec // schema attribute name in synthetic redaction input
+	})
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	value := cty.ObjectVal(map[string]cty.Value{
+		"rules": cty.ListVal([]cty.Value{
+			cty.ObjectVal(map[string]cty.Value{"token": cty.StringVal("provider-substituted-secret")}),
+		}),
+	})
+	out, _, err := s.Redact(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !out.GetAttr("rules").Index(cty.NumberIntVal(0)).GetAttr("token").IsNull() {
+		t.Fatal("provider-substituted value inherited a path-only literal exemption")
+	}
+}
+
+func TestMapKeyPunctuationDoesNotChangeSensitiveLogicalPath(t *testing.T) {
+	elementType := cty.Object(map[string]cty.Type{"token": cty.String, "user": cty.String})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"credentials": {
+			Type: cty.Map(elementType),
+			NestedType: map[string]*provider.Attr{
+				"token": {Type: cty.String, Sensitive: true},
+				"user":  {Type: cty.String},
+			},
+		},
+	}}
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	for _, key := range []string{`right]bracket`, `left[bracket`, `quote"key`, `back\slash`, `unicodé雪`} {
+		t.Run(key, func(t *testing.T) {
+			credentials := cty.MapVal(map[string]cty.Value{
+				key: cty.ObjectVal(map[string]cty.Value{
+					"token": cty.StringVal("synthetic-private-value"),
+					"user":  cty.StringVal("alice"),
+				}),
+			})
+			out, _, err := spec.Redact(cty.ObjectVal(map[string]cty.Value{"credentials": credentials}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			element := out.GetAttr("credentials").Index(cty.StringVal(key))
+			if !element.GetAttr("token").IsNull() || element.GetAttr("user").AsString() != "alice" {
+				t.Fatal("map key punctuation changed the logical schema path")
+			}
+		})
+	}
+}
+
 func TestEffectiveLiteralRules(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -109,13 +165,15 @@ func TestEffectiveLiteralRules(t *testing.T) {
 	}
 }
 
-func TestSetNestedBlockNeverExempt(t *testing.T) {
-	s, ds := Resolve(testBlock("set"), nil, map[string]any{"rules": []any{map[string]any{"token": "literal"}}})
-	if ds.HasErrors() {
-		t.Fatal(ds)
-	}
-	if len(s.ExemptInstances()) != 0 {
-		t.Fatalf("set exemptions = %v", s.ExemptInstances())
+func TestSensitiveSetElementIsRejectedBeforeTransformation(t *testing.T) {
+	_, ds := Resolve(testBlock("set"), nil, map[string]any{
+		"rules": []any{
+			map[string]any{"token": "first"},
+			map[string]any{"token": "second"},
+		},
+	})
+	if !ds.HasErrors() {
+		t.Fatal("sensitive descendants of sets must be rejected before redaction can coalesce elements")
 	}
 }
 

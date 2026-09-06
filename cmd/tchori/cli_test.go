@@ -460,12 +460,22 @@ func TestCLIApplyReportsInconsistentProviderResult(t *testing.T) {
 		t.Fatalf("apply stdout = %q, want executed create accounting", stdout)
 	}
 	ds := decodeDiagnosticLines(t, stderr)
-	if len(ds) != 2 {
-		t.Fatalf("diagnostics = %#v, want inconsistent-result error and incomplete-state warning", ds)
+	if len(ds) != 3 {
+		t.Fatalf("diagnostic count = %d: %#v, want sensitive-state warning, inconsistent-result error, and incomplete-state warning", len(ds), ds)
 	}
-	d := ds[0]
-	if d.Severity != "error" || d.Address != "tchoritest_lossy.svc" || !strings.Contains(d.Detail, "flag: planned true, applied false") || strings.Contains(d.Detail, "do-not-print") {
-		t.Fatalf("diagnostic = %#v", d)
+	foundInconsistent := false
+	for _, d := range ds {
+		if strings.Contains(d.Detail, "do-not-print") {
+			t.Fatalf("diagnostic leaked sensitive value: %#v", d)
+		}
+		if d.Summary == "provider produced inconsistent result after apply" {
+			foundInconsistent = d.Severity == "error" &&
+				d.Address == "tchoritest_lossy.svc" &&
+				strings.Contains(d.Detail, "flag: planned true, applied false")
+		}
+	}
+	if !foundInconsistent {
+		t.Fatalf("diagnostics = %#v, want attributed inconsistent-result error", ds)
 	}
 	stateBytes, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // dir is a test-owned t.TempDir
 	if err != nil {
@@ -926,12 +936,13 @@ func TestPlanGatewayHTMLDiagnosticsAreAttributedJSONLines(t *testing.T) {
 	dir := t.TempDir()
 	writeNamedConfig(t, dir, addr, "gateway_html", "t-")
 	stateDoc := `{
-  "format_version": "1.0",
+  "format_version": "1.1",
   "serial": 1,
   "resources": {
     "tchoritest_thing.web": {
       "type": "tchoritest_thing",
       "provider": "tchoritest",
+      "provider_source": "tchori-labs/tchoritest",
       "attributes": {"echo":"gateway_html","id":"id-gateway_html","name":"gateway_html","replace_me":null,"rules":null,"tags":null}
     }
   }

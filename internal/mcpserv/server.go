@@ -158,7 +158,7 @@ func (h *handlers) stateShow(_ context.Context, _ *mcp.CallToolRequest, in state
 		var changed []string
 		// No provider/config is launched here, so rendering intentionally uses
 		// conservative path-level masking and never writes the result back.
-		attrs, changed, err = sensitive.RedactJSON(attrs, paths, nil)
+		attrs, changed, err = sensitive.RedactJSON(attrs, paths)
 		if err != nil {
 			return errResult(diag.Diagnostics{diag.Errorf(in.Address, "failed to mask sensitive state", err.Error())})
 		}

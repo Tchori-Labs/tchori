@@ -66,8 +66,9 @@ The guarantee has three deliberate boundaries:
 | Field | JSON type | Meaning |
 | --- | --- | --- |
 | `address` | string | Resource address, `type.name` (e.g. `tchoritest_thing.a`). |
-| `type` | string, omitted when absent in legacy input | Provider resource type; required for encrypted private data and checked against the execution target. |
-| `provider` | string, omitted when absent in legacy input | Provider local name; required for encrypted private data and checked against the execution target. |
+| `type` | string, omitted when absent in legacy input | Provider resource type; required for every executable change and checked against the execution target. |
+| `provider` | string, omitted when absent in legacy input | Provider local name; required for every executable change and checked against the execution target. |
+| `provider_source` | string, omitted when absent in legacy input | Canonical registry source of the provider selected at plan time; required for every executable change and authenticated with private data. |
 | `action` | string | One of `create`, `update`, `delete`, `replace`, `no-op` — see Action semantics below. |
 | `before` | object or `null` | Prior value, ctyjson-encoded. `null` for `create` (no prior object existed). |
 | `after` | object or `null` | Planned value, ctyjson-encoded, with every attribute unknown at plan time rendered as JSON `null`. `null` for `delete`. |
@@ -79,9 +80,10 @@ The guarantee has three deliberate boundaries:
 `before` and `after` are JSON objects. `planned_raw` is base64-encoded
 MessagePack. Current `private` is an envelope with integer `version: 1`,
 base64 `nonce` (12 bytes), and base64 `ciphertext` (including the 16-byte
-authentication tag). It uses AES-256-GCM and authenticates resource identity
-and artifact kind as additional data. It is not interchangeable with
-`planned_raw`, nor may a plaintext private string appear in a `1.1` document.
+authentication tag). It uses AES-256-GCM and authenticates the resource
+address, resource type, provider alias, canonical provider source, and artifact
+kind as additional data. It is not interchangeable with `planned_raw`, nor may
+a plaintext private string appear in a `1.1` document.
 
 ### Drift fields
 
@@ -196,11 +198,13 @@ encrypted private payload as if it were plaintext provider data.
 The optional `drift` field remains informational and ignored by apply. It did
 not itself require a format increment; authenticated private storage does.
 
-Legacy plans with private data but no bound type/provider may be read, but
-cannot be applied: recompute the plan with this engine. Apply compares recorded
-identity against the live config/state routing before any checkpoint or
-provider mutation; changing a provider alias cannot redirect authenticated
-private data to another provider.
+Legacy plans, and early `1.1` plans, with private data but no complete bound
+type/provider/source identity remain readable for diagnosis but cannot be
+applied: recompute the plan with this engine. Apply requires complete identity
+for every executable change, even when its private payload is empty, and
+compares it against live config/state routing before any checkpoint or provider
+mutation. Changing an alias or its canonical source cannot redirect
+authenticated private data to another provider.
 
 ### Example
 
@@ -218,6 +222,9 @@ doesn't exist yet on a first plan):
   "changes": [
     {
       "address": "tchoritest_thing.a",
+      "type": "tchoritest_thing",
+      "provider": "tchoritest",
+      "provider_source": "tchori-labs/tchoritest",
       "action": "create",
       "before": null,
       "after": {
@@ -235,6 +242,9 @@ doesn't exist yet on a first plan):
     },
     {
       "address": "tchoritest_thing.b",
+      "type": "tchoritest_thing",
+      "provider": "tchoritest",
+      "provider_source": "tchori-labs/tchoritest",
       "action": "create",
       "before": null,
       "after": {
@@ -283,6 +293,7 @@ creates.
 | --- | --- | --- |
 | `type` | string | Provider resource type, e.g. `tchoritest_thing`. |
 | `provider` | string | Provider local name from config, e.g. `tchoritest`. |
+| `provider_source` | string, omitted in legacy/early `1.1` input | Canonical provider registry source. New state binds this value into private-envelope authentication and checks it before provider RPCs. |
 | `attributes` | object | ctyjson-encoded applied values. Every withheld sensitive leaf is JSON `null`; state never stores unknown values. |
 | `private` | object, omitted if empty | Authenticated encrypted envelope with `version`, `nonce`, and `ciphertext`, as described for plans. The opaque plaintext is preserved only in memory for provider RPCs. |
 | `redacted` | array of strings, omitted if empty | Sorted paths whose values are withheld, explaining why the corresponding `attributes` leaf is `null`. |
@@ -311,6 +322,12 @@ A process killed mid-run or a failed finalizing save therefore still leaves an
 artifact that admits it is non-converged. Stale-plan, configuration-order, and
 configuration-drift refusals write nothing. A zero-change apply writes no new
 marker, although it does clear a stale marker from an earlier run.
+
+An early `1.1` resource with no `provider_source` remains readable so operators
+can inspect and migrate it, but planning/apply refuse to send its state or
+private bytes to a provider. `tchori state sanitize` validates the stored
+type/provider alias against live configuration and schema, binds the canonical
+source, and re-encrypts state and backup under the stronger identity.
 
 Use `tchori state status` as the convergence gate: exit 0 means converged and
 exit 1 means incomplete. `plan`, `apply`, and `destroy` warn when loading a
@@ -477,6 +494,7 @@ prefix `demo-`):
     "tchoritest_thing.a": {
       "type": "tchoritest_thing",
       "provider": "tchoritest",
+      "provider_source": "tchori-labs/tchoritest",
       "attributes": {
         "echo": "alpha",
         "id": "demo-id-alpha",
@@ -488,6 +506,7 @@ prefix `demo-`):
     "tchoritest_thing.b": {
       "type": "tchoritest_thing",
       "provider": "tchoritest",
+      "provider_source": "tchori-labs/tchoritest",
       "attributes": {
         "echo": "beta",
         "id": "demo-id-beta",
@@ -521,17 +540,18 @@ state save, in two situations:
    save of the apply, because `Save` itself increments `Serial` — comparing
    after any save would compare against a serial the apply itself just
    changed. The error names both serials and says to plan again.
-2. **Configuration drift.** Every non-delete change's address must still
-   exist in the configuration loaded fresh at apply time. If the config was
-   edited (e.g. a resource declaration removed) after the plan was written,
-   that change would otherwise silently vanish from the execution order
-   with zero diagnostics. Apply instead refuses the whole run with a "plan
-   does not match configuration" diagnostic, mirroring the stale-plan
-   check's all-or-nothing posture — a plan that no longer matches
-   configuration is not partially actionable.
+2. **Configuration and resource-identity drift.** Every non-delete change's
+   address must still exist in freshly loaded configuration. Every executable
+   change must record type, provider alias, and canonical provider source even
+   when private data is empty. Apply compares all three values against the
+   provider selected by live configuration (or the configured provider behind
+   a state-only delete), and separately checks stored state identity before any
+   provider call. Missing legacy source metadata directs the operator to
+   `tchori state sanitize`; changed routing directs the operator to recompute
+   the plan. Every refusal occurs before the state lock/save boundary.
 
-Both refusals are exit code `1`, with a structured diagnostic on stderr
-naming the problem; the fix in both cases is to run `plan` again.
+Both refusal classes are exit code `1`, with a structured diagnostic on stderr
+naming the problem.
 
 ## Result consistency at apply
 
@@ -602,15 +622,20 @@ executed counts. A run containing errors still prints `Apply incomplete` (or
 `Destroy incomplete`) with executed create, update, delete, and replace counts
 plus the number of dependency-blocked changes, then exits `1`. A provider call
 that failed was attempted but is neither reported as completed work nor as
-"not executed". A consistency error after a provider result was durably
-recorded does count that executed mutation while still making the run fail.
+"not executed". If a failed destroy response contains a decodable authoritative
+state, tchori checkpoints it before continuing failure handling: explicit null
+removes the state entry, while a changed non-null state and its private bytes
+replace the prior entry. The action remains unfinished and uncounted. A
+consistency error after a provider result was durably recorded does count that
+executed mutation while still making the run fail.
 
 Apply's durable incomplete marker records the first failed address, all
 successfully completed addresses, and every failed or blocked address still
-unfinished after independent work runs. A replace whose destroy leg succeeded
-but whose create leg failed remains absent from durable state and is not counted
-as a completed replacement. Every failed run advances the state serial, so its
-saved plan no longer matches `state.json`; run `tchori plan` before retrying.
+unfinished after independent work runs. A replace whose destroy leg returned
+null with an error remains absent from durable state but is not counted as a
+completed replacement. Every failed run that enters execution advances the
+state serial when it records the incomplete marker, so run `tchori plan` before
+retrying.
 Stale-plan, configuration-ordering, and configuration-drift refusals happen
 before the execution loop and therefore have no partial outcome.
 
@@ -649,22 +674,28 @@ an unknown in both `after` and decoded `planned_raw`, list it in
 `unknown_after`, and mask it during update/replacement classification so a
 withheld computed value does not cause a perpetual diff.
 
-Sensitivity matching ignores collection indices, while the raw-literal
-exemption is a fully index-qualified instance. Thus one repeated-block element
-may retain an authored literal while a sibling containing a `${...}` reference
-is withheld. Literal authorship is determined from raw config syntax only;
-references, explicit nulls, absent values, and `{"env":"..."}` wrappers are
-never exempt. Set-nested blocks have no stable element identity and therefore
-fail closed with no exemptions. Per-attribute sensitivity inside provider
-`nested_type` objects, lists, sets, and maps is retained recursively and also
-governs consistency diagnostics; no manual override is needed for correctly
-marked nested leaves.
+Sensitivity matching derives logical paths directly from structured cty path
+steps, so brackets, quotes, backslashes, or Unicode in map keys cannot alter the
+schema path being redacted. The raw-literal exemption is a fully
+index-qualified instance bound to the exact authored scalar value. Thus one
+repeated-block element may retain an authored literal while a sibling
+containing a `${...}` reference is withheld; a provider-substituted value at the
+same instance is redacted. References, explicit nulls, absent values, and
+`{"env":"..."}` wrappers are never exempt.
 
-Every save sanitizes the whole state document. Live, resolvable entries honor
-literal-instance exemptions, but union current sensitivity with previously
-recorded paths. Removing a declaration cannot restore a previously withheld
-secret. Backups, delete `before` values, orphans, and read rendering are
-conservative path-level copies with no exemption.
+Set elements have no stable identity after a sensitive leaf becomes null or
+unknown: distinct elements can become equal and coalesce. Tchori therefore
+rejects a sensitive descendant inside a set during sensitivity resolution,
+before provider execution or state transformation. Per-attribute sensitivity
+inside provider `nested_type` objects, lists, and maps is retained recursively.
+
+Every save sanitizes the whole state document. Live, resolvable entries use the
+provider schema's cty type, preserving map elements even when a map key matches
+an attribute name, and honor only value-bound literal exemptions. Current
+sensitivity is unioned with previously recorded paths, so removing a
+declaration cannot restore a previously withheld secret. Backups, delete
+`before` values, orphans, and read rendering are conservative path-level copies
+with no exemption.
 
 Default `state show` and MCP `state_show` mask persisted `sensitive_paths`
 and legacy `redacted` hints in memory and never save or launch providers. An entry with

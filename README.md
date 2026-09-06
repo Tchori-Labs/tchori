@@ -227,20 +227,21 @@ For a provider that omits its sensitivity flag, declare an override:
 ```
 
 An operator-authored raw literal is already present in config, so its exact
-collection instance remains in live `state.json` and participates in drift.
+collection instance remains in live `state.json` and participates in drift
+only while the provider-returned value still equals that authored scalar.
 Exemptions are per instance: `rules[0].token` may stay literal while a sibling
 `rules[1].token` containing a `${...}` reference is withheld. References and
-`{"env":"VAR"}` wrappers are never literals, and set-nested blocks have no
-stable indices, so no exemption applies inside them. Backups, delete plans,
-orphan handling, and `state show`/MCP rendering are deliberately path-level
-and may mask a literal while config remains authoritative.
+`{"env":"VAR"}` wrappers are never literals. Backups, delete plans, orphan
+handling, and `state show`/MCP rendering are deliberately path-level and may
+mask a literal while config remains authoritative.
 
 Removing a `sensitive_attributes` entry does **not** declassify a path already
 recorded in state. Saves union current schema/config sensitivity with persisted
 paths and hints, including for untouched resources and backups. Provider
-`nested_type` conversion retains per-leaf sensitivity through nested
-objects, lists, sets, and maps; overrides remain useful for providers that
-omit their sensitivity flags.
+`nested_type` conversion retains per-leaf sensitivity through nested objects,
+lists, and maps. A sensitive descendant inside a set is rejected before any
+provider execution because replacing distinct secret fields with one sentinel
+can merge set elements and silently lose state.
 
 Provider-free read commands mask recorded `sensitive_paths` and legacy
 `redacted` hints without writing state. For entries whose sensitivity has not
@@ -263,6 +264,11 @@ import validate it before resource mutations. Keep the same key available for
 reading encrypted state/plans and restoring backups; losing it loses access
 to the private provider data. Do not commit or print the key, or regenerate
 it for each invocation. See [artifact key management](docs/configuration.md#artifact-encryption-key).
+
+Private envelopes authenticate the resource address, type, provider alias, and
+canonical provider source. Existing `1.1` artifacts without a source remain
+readable only for migration: run `tchori state sanitize` to bind state to the
+live configured source, and recompute old plans before apply.
 
 ### Importing existing infrastructure
 

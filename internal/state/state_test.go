@@ -13,6 +13,10 @@ import (
 	"testing"
 
 	"github.com/gofrs/flock"
+	"github.com/tchori-labs/tchori/internal/privateblob"
+	"github.com/tchori-labs/tchori/internal/provider"
+	"github.com/tchori-labs/tchori/internal/sensitive"
+	"github.com/zclconf/go-cty/cty"
 )
 
 // TestLoadMissing verifies Load returns an empty, well-formed format 1.1 state.
@@ -263,10 +267,11 @@ func TestSaveRetightensPermissiveBackup(t *testing.T) {
 		t.Fatalf("Load(missing) = %v", err)
 	}
 	s.Resources["thing.example"] = &ResourceState{
-		Type:       "thing",
-		Provider:   "test",
-		Attributes: json.RawMessage(`{"value":"before"}`),
-		Private:    []byte("sensitive state"),
+		Type:           "thing",
+		Provider:       "test",
+		ProviderSource: "example.test/test",
+		Attributes:     json.RawMessage(`{"value":"before"}`),
+		Private:        []byte("sensitive state"),
 	}
 	if err := s.Save(path); err != nil {
 		t.Fatalf("Save #1 = %v", err)
@@ -1222,6 +1227,46 @@ func TestSaveSanitizesSensitiveStateAndBackup(t *testing.T) {
 	}
 }
 
+func TestSavePreservesLiveMapElementsWhileRedactingSensitiveLeaves(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"secret.map": {
+			Type:       "secret",
+			Provider:   "test",
+			Attributes: json.RawMessage(`{"credentials":{"token":{"token":"synthetic-private-value","user":"alice"}}}`),
+		},
+	}}
+	elementType := cty.Object(map[string]cty.Type{"token": cty.String, "user": cty.String})
+	resourceType := cty.Object(map[string]cty.Type{"credentials": cty.Map(elementType)})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"credentials": {
+			Type: cty.Map(elementType),
+			NestedType: map[string]*provider.Attr{
+				"token": {Type: cty.String, Sensitive: true},
+				"user":  {Type: cty.String},
+			},
+		},
+	}}
+	spec, ds := sensitive.Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	s.SetSensitiveResolver(func(string, *ResourceState) (Resolution, bool) {
+		return Resolution{Paths: spec.Paths(), RedactAttributes: spec.Redactor(resourceType)}, true
+	})
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	var attributes map[string]map[string]map[string]any
+	if err := json.Unmarshal(s.Resources["secret.map"].Attributes, &attributes); err != nil {
+		t.Fatal(err)
+	}
+	element, ok := attributes["credentials"]["token"]
+	if !ok || element["user"] != "alice" || element["token"] != nil {
+		t.Fatalf("map element structure was not preserved: %#v", attributes)
+	}
+}
+
 func TestSaveSanitizesBackupFromEffectiveHintWhenValueNowNull(t *testing.T) {
 	const sentinel = "tchori-e2e-super-secret-value"
 	path := filepath.Join(t.TempDir(), "state.json")
@@ -1257,9 +1302,16 @@ func TestSavePreservesLiteralAndRecordedSensitivity(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.Resources["secret.removed"].Attributes = json.RawMessage(`{"note":"visible-again"}`)
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"token": {Type: cty.String, Sensitive: true},
+	}}
+	spec, ds := sensitive.Resolve(block, nil, map[string]any{"token": "literal-token-ok"}) //nolint:gosec // synthetic sensitivity fixture
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
 	s.SetSensitiveResolver(func(addr string, _ *ResourceState) (Resolution, bool) {
 		if addr == "secret.literal" {
-			return Resolution{Paths: []string{"token"}, ExemptInstances: []string{"token"}}, true
+			return Resolution{Paths: spec.Paths(), RedactAttributes: spec.Redactor(cty.Object(map[string]cty.Type{"token": cty.String}))}, true
 		}
 		return Resolution{}, true
 	})
@@ -1310,10 +1362,11 @@ func TestSaveEncryptsPrivateAndLoadRestoresExactBytes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	s := &State{Resources: map[string]*ResourceState{
 		"test_thing.example": {
-			Type:       "test_thing",
-			Provider:   "test",
-			Attributes: json.RawMessage(`{"id":"example"}`),
-			Private:    []byte(sentinel),
+			Type:           "test_thing",
+			Provider:       "test",
+			ProviderSource: "example.test/test",
+			Attributes:     json.RawMessage(`{"id":"example"}`),
+			Private:        []byte(sentinel),
 		},
 	}}
 	if err := s.Save(path); err != nil {
@@ -1362,8 +1415,8 @@ func TestLoadEncryptedPrivateFailsClosed(t *testing.T) {
 	setStateArtifactKey(t, 22)
 	path := filepath.Join(t.TempDir(), "state.json")
 	s := &State{Resources: map[string]*ResourceState{
-		"test_thing.alpha": {Type: "test_thing", Provider: "test", Attributes: json.RawMessage(`{}`), Private: []byte("alpha-private")},
-		"test_thing.beta":  {Type: "test_thing", Provider: "test", Attributes: json.RawMessage(`{}`), Private: []byte("beta-private")},
+		"test_thing.alpha": {Type: "test_thing", Provider: "test", ProviderSource: "example.test/test", Attributes: json.RawMessage(`{}`), Private: []byte("alpha-private")},
+		"test_thing.beta":  {Type: "test_thing", Provider: "test", ProviderSource: "example.test/test", Attributes: json.RawMessage(`{}`), Private: []byte("beta-private")},
 	}}
 	if err := s.Save(path); err != nil {
 		t.Fatal(err)
@@ -1405,6 +1458,31 @@ func TestLoadEncryptedPrivateFailsClosed(t *testing.T) {
 		}
 	})
 
+	t.Run("provider source tamper", func(t *testing.T) {
+		setStateArtifactKey(t, 22)
+		data, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(data, &doc); err != nil {
+			t.Fatal(err)
+		}
+		resources := doc["resources"].(map[string]any)
+		resources["test_thing.alpha"].(map[string]any)["provider_source"] = "attacker.example/test"
+		tampered, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tamperedPath := filepath.Join(t.TempDir(), "state.json")
+		if err := os.WriteFile(tamperedPath, tampered, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(tamperedPath); err == nil {
+			t.Fatal("Load accepted private state under a different canonical provider source")
+		}
+	})
+
 	t.Run("1.1 plaintext", func(t *testing.T) {
 		plaintext := `{"format_version":"1.1","serial":1,"resources":{"test_thing.alpha":{"type":"test_thing","provider":"test","attributes":{},"private":"YWxwaGEtcHJpdmF0ZQ=="}}}`
 		plainPath := filepath.Join(t.TempDir(), "state.json")
@@ -1415,6 +1493,31 @@ func TestLoadEncryptedPrivateFailsClosed(t *testing.T) {
 			t.Fatal("Load accepted plaintext/base64 private data in format 1.1")
 		}
 	})
+}
+
+func TestLoadUnbound11PrivateForExplicitMigration(t *testing.T) {
+	setStateArtifactKey(t, 26)
+	const sentinel = "pre-source-binding-state-private"
+	sealed, err := privateblob.Seal([]byte(sentinel), "state\x00test_thing.example\x00test\x00test_thing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := fmt.Sprintf(
+		`{"format_version":"1.1","serial":2,"resources":{"test_thing.example":{"type":"test_thing","provider":"test","attributes":{},"private":%s}}}`,
+		sealed,
+	)
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load pre-source-binding 1.1 state: %v", err)
+	}
+	if got.Resources["test_thing.example"].ProviderSource != "" ||
+		!bytes.Equal(got.Resources["test_thing.example"].Private, []byte(sentinel)) {
+		t.Fatal("pre-source-binding 1.1 state did not remain readable for explicit migration")
+	}
 }
 
 func TestSaveMigratesLegacyPrivateInStateAndBackup(t *testing.T) {
@@ -1435,8 +1538,9 @@ func TestSaveMigratesLegacyPrivateInStateAndBackup(t *testing.T) {
 	if !bytes.Equal(s.Resources["test_thing.example"].Private, []byte(sentinel)) {
 		t.Fatal("legacy load lost private bytes")
 	}
+	s.Resources["test_thing.example"].ProviderSource = "example.test/test"
 	if err := s.Save(path); err != nil {
-		t.Fatalf("Save migration = %v", err)
+		t.Fatalf("Save migration after explicit source binding = %v", err)
 	}
 	for _, artifact := range []string{path, path + ".backup"} {
 		data, err := os.ReadFile(artifact) //nolint:gosec // test-controlled path
@@ -1462,7 +1566,7 @@ func TestSaveKeyFailureLeavesStateAndBackupUnchanged(t *testing.T) {
 	setStateArtifactKey(t, 25)
 	path := filepath.Join(t.TempDir(), "state.json")
 	s := &State{Resources: map[string]*ResourceState{
-		"test_thing.example": {Type: "test_thing", Provider: "test", Attributes: json.RawMessage(`{}`), Private: []byte("private")},
+		"test_thing.example": {Type: "test_thing", Provider: "test", ProviderSource: "example.test/test", Attributes: json.RawMessage(`{}`), Private: []byte("private")},
 	}}
 	if err := s.Save(path); err != nil {
 		t.Fatal(err)

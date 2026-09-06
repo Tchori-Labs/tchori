@@ -209,6 +209,27 @@ func TestApplyRejectsProviderChangedSincePlan(t *testing.T) {
 	}
 }
 
+func TestApplyRejectsProviderSourceChangedSincePlan(t *testing.T) {
+	const addr = "tchoritest_thing.foo"
+	h := newHarness(t, map[string]*config.Resource{addr: thing("foo", "foo")})
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+
+	h.cfg.Providers["tchoritest"].Source = "untrusted.example/tchoritest"
+	before, beforeErr := os.ReadFile(h.statePath) //nolint:gosec // test-owned artifact
+	if beforeErr != nil && !os.IsNotExist(beforeErr) {
+		t.Fatal(beforeErr)
+	}
+	_, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() {
+		t.Fatal("Apply executed a plan after the canonical provider source changed")
+	}
+	after, afterErr := os.ReadFile(h.statePath) //nolint:gosec // test-owned artifact
+	if !bytes.Equal(before, after) || os.IsNotExist(beforeErr) != os.IsNotExist(afterErr) {
+		t.Fatal("provider source refusal changed state")
+	}
+}
+
 func TestApplyRejectsUnboundLegacyPrivatePlan(t *testing.T) {
 	const addr = "tchoritest_thing.foo"
 	h := newHarness(t, map[string]*config.Resource{addr: thing("foo", "foo")})
@@ -224,5 +245,28 @@ func TestApplyRejectsUnboundLegacyPrivatePlan(t *testing.T) {
 	}
 	if _, err := os.Stat(h.statePath); !os.IsNotExist(err) {
 		t.Fatal("unbound private plan refusal must precede state mutation")
+	}
+}
+
+func TestApplyRejectsExecutablePlanWithoutIdentityEvenWhenPrivateIsEmpty(t *testing.T) {
+	for _, format := range []string{plan.FormatVersion, "1.0"} {
+		t.Run(format, func(t *testing.T) {
+			const addr = "tchoritest_thing.foo"
+			h := newHarness(t, map[string]*config.Resource{addr: thing("foo", "foo")})
+			st := loadState(t, h.statePath)
+			pl := h.plan(t, st, false)
+			pl.FormatVersion = format
+			pl.Changes[0].Type = ""
+			pl.Changes[0].Provider = ""
+			pl.Changes[0].Private = nil
+
+			_, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+			if !ds.HasErrors() {
+				t.Fatal("Apply accepted an executable plan without a verifiable resource identity")
+			}
+			if _, err := os.Stat(h.statePath); !os.IsNotExist(err) {
+				t.Fatal("unbound plan refusal must precede state mutation")
+			}
+		})
 	}
 }

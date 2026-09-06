@@ -450,7 +450,11 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 		if rds.HasErrors() {
 			return state.Resolution{}, false
 		}
-		return state.Resolution{Paths: spec.Paths(), ExemptInstances: spec.ExemptInstances()}, true
+		return state.Resolution{
+			Paths:            spec.Paths(),
+			ProviderSource:   rt.Config.Providers[r.Provider].Source,
+			RedactAttributes: spec.Redactor(sch.Block.ImpliedType()),
+		}, true
 	})
 
 	client, ok := rt.Providers[res.Provider]
@@ -502,8 +506,9 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 	}
 	st.NoteSensitive(address, spec.Paths())
 	st.Resources[address] = &state.ResourceState{
-		Type: res.Type, Provider: res.Provider, Attributes: attrs, Private: refreshedPrivate,
-		Redacted: redactedPaths, SensitivePaths: spec.Paths(), SensitiveScanned: true,
+		Type: res.Type, Provider: res.Provider, ProviderSource: rt.Config.Providers[res.Provider].Source,
+		Attributes: attrs, Private: refreshedPrivate, Redacted: redactedPaths,
+		SensitivePaths: spec.Paths(), SensitiveScanned: true,
 	}
 	if len(redactedPaths) != 0 {
 		emitDiags(diag.Diagnostics{diag.Warnf(address, "sensitive attributes withheld from state", fmt.Sprintf("withheld paths: %s", strings.Join(redactedPaths, ", ")))})
@@ -713,6 +718,17 @@ func buildSensitiveContext(ctx context.Context, st *state.State, addresses []str
 		if rs == nil || resource == nil {
 			continue
 		}
+		providerConfig := cfg.Providers[resource.Provider]
+		if providerConfig == nil {
+			ds = append(ds, diag.Errorf(address, "cannot resolve sensitive state",
+				fmt.Sprintf("provider %q is not configured; state was not changed", resource.Provider)))
+			continue
+		}
+		if rs.Type != resource.Type || rs.Provider != resource.Provider {
+			ds = append(ds, diag.Errorf(address, "state does not match resource identity",
+				"the stored resource type or provider alias differs from configuration; state was not changed"))
+			continue
+		}
 		schemaSet := schemas[resource.Provider]
 		if schemaSet == nil {
 			ds = append(ds, diag.Errorf(address, "cannot resolve sensitive state",
@@ -742,8 +758,9 @@ func buildSensitiveContext(ctx context.Context, st *state.State, addresses []str
 			continue
 		}
 		result.resolutions[address] = state.Resolution{
-			Paths:           mergePaths(spec.Paths(), rs.SensitivePaths, rs.Redacted),
-			ExemptInstances: spec.ExemptInstances(),
+			Paths:            mergePaths(spec.Paths(), rs.SensitivePaths, rs.Redacted),
+			ProviderSource:   providerConfig.Source,
+			RedactAttributes: spec.Redactor(schema.Block.ImpliedType()),
 		}
 		result.resolved[address] = true
 	}
@@ -846,7 +863,7 @@ func runStateShow(cmd *cobra.Command, args []string, discoverSensitive bool) (in
 		// Rendering never honors literal exemptions: operator output is a
 		// reporting surface, so conservative masking is safer than echoing a
 		// value that was previously persisted as sensitive.
-		attrs, changed, err := sensitive.RedactJSON(rs.Attributes, paths, nil)
+		attrs, changed, err := sensitive.RedactJSON(rs.Attributes, paths)
 		if err != nil {
 			return 1, err
 		}
