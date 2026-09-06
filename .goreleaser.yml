@@ -42,6 +42,8 @@ release:
   # A retry safely replaces an incomplete draft left by a failed run.
   draft: true
   replace_existing_draft: true
+  # Semantic-version suffixes (for example -rc.1) stage as prereleases.
+  prerelease: auto
 
 checksum:
   name_template: "checksums.txt"

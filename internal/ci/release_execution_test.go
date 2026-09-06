@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -201,6 +202,54 @@ func TestReleaseSignatureVerifierFailureStopsAcceptance(t *testing.T) {
 			}
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {
 				t.Fatalf("acceptance continued after signature verification failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestPublishReleasePreservesStableLatestAcrossPrereleases(t *testing.T) {
+	var config struct {
+		Release struct {
+			Prerelease string `yaml:"prerelease"`
+		} `yaml:"release"`
+	}
+	if err := yaml.Unmarshal(readRepositoryFile(t, ".goreleaser.yml"), &config); err != nil {
+		t.Fatal(err)
+	}
+	if config.Release.Prerelease != "auto" {
+		t.Fatalf("release.prerelease = %q, want auto", config.Release.Prerelease)
+	}
+
+	script := releaseStep(t, "publish", "Publish attested draft release")
+	for _, tc := range []struct {
+		tag           string
+		wantFlag      string
+		forbiddenFlag string
+	}{
+		{tag: "v1.2.3", wantFlag: "--latest", forbiddenFlag: "--prerelease"},
+		{tag: "v1.2.4-rc.1", wantFlag: "--prerelease", forbiddenFlag: "--latest"},
+	} {
+		t.Run(tc.tag, func(t *testing.T) {
+			dir := t.TempDir()
+			bin := filepath.Join(dir, "bin")
+			if err := os.Mkdir(bin, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			argsPath := filepath.Join(dir, "gh.args")
+			fake := "#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" > \"$GH_ARGS\"\n"
+			if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(fake), 0o700); err != nil { //nolint:gosec // owner-only executable test fixture
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			if err := releaseShell(t, dir, script, "RELEASE_TAG="+tc.tag, "GH_ARGS="+argsPath, "GITHUB_REPOSITORY=Tchori-Labs/tchori"); err != nil {
+				t.Fatal(err)
+			}
+			args, err := os.ReadFile(argsPath) //nolint:gosec // test-controlled fake gh output
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(args), tc.wantFlag) || strings.Contains(string(args), tc.forbiddenFlag) {
+				t.Fatalf("gh args = %q, want %s and no %s", args, tc.wantFlag, tc.forbiddenFlag)
 			}
 		})
 	}

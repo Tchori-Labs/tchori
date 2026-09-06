@@ -18,6 +18,14 @@ review to the public repository. Accepted tags are `v`-prefixed semantic
 versions whose commits belong to reviewed `origin/main` history. The protected
 Environment approval is still required after the tag triggers the workflow.
 
+The ancestry check prevents an accidental release from an unreviewed commit; it
+does not authenticate the tagger or make historical workflow revisions safe.
+Anyone allowed to create or move a matching `v*` tag selects a workflow
+definition from `main` history and can trigger it. Treat tag creation/update
+permission as release authority: a human repository administrator must restrict
+and audit that live permission boundary. It is not encoded by this repository.
+The protected `release` Environment remains the final publication gate.
+
 The live enforcement mechanism is the GitHub Environment named `release`.
 The reviewable source of truth is
 [`.github/environments/release.json`](../.github/environments/release.json),
@@ -254,7 +262,7 @@ repository's tag-triggered release workflow:
 cosign verify-blob \
   --certificate checksums.txt.pem \
   --signature checksums.txt.sig \
-  --certificate-identity-regexp '^https://github\.com/tchori-labs/tchori/\.github/workflows/release\.yml@refs/tags/v.*$' \
+  --certificate-identity-regexp '^https://github\.com/Tchori-Labs/tchori/\.github/workflows/release\.yml@refs/tags/v.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   checksums.txt
 ```
@@ -264,7 +272,7 @@ end in `@refs/heads/main`. For a board-approved manual retry only, replace the
 identity regexp above with this deliberately narrow alternative:
 
 ```sh
---certificate-identity-regexp '^https://github\.com/tchori-labs/tchori/\.github/workflows/release\.yml@refs/heads/main$'
+--certificate-identity-regexp '^https://github\.com/Tchori-Labs/tchori/\.github/workflows/release\.yml@refs/heads/main$'
 ```
 
 Do not use a repository-wide or issuer-only identity expression.
