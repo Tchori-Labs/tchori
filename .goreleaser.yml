@@ -32,9 +32,8 @@ archives:
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
 
-# Pinned explicitly: the repo has no git remote until Task 16 pushes it, and
-# goreleaser would otherwise fail trying to infer the release target from the
-# remote ("scm releases: no remote configured to list refs from").
+# Releases belong to the public product, never the private history archive.
+# The workflow also gates jobs on the public repository identity.
 release:
   github:
     owner: tchori-labs

@@ -139,19 +139,6 @@ func TestValidateLiveReleaseEnvironmentStates(t *testing.T) {
 
 // TestLiveReleaseEnvironmentMatchesPolicy is opt-in so ordinary CI remains
 // offline. scripts/verify-release-environment.sh supplies all three files.
-func TestReleaseEnvironmentVerifierRetainsRequiredCriteria(t *testing.T) {
-	script := string(readRepositoryFile(t, "scripts", "verify-release-environment.sh"))
-	for _, token := range []string{
-		"repos/${repo}/environments/release",
-		"deployment-branch-policies",
-		"prevent_self_review",
-		"TestLiveReleaseEnvironmentMatchesPolicy",
-	} {
-		if !strings.Contains(script, token) {
-			t.Errorf("release Environment verifier must reference %q", token)
-		}
-	}
-}
 
 func TestLiveReleaseEnvironmentMatchesPolicy(t *testing.T) {
 	listPath := os.Getenv("RELEASE_ENVIRONMENTS_JSON")

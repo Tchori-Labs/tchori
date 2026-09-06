@@ -5,29 +5,23 @@ This runbook is the repository-admin and board procedure for making
 this runbook changes no GitHub setting and designates no contact. The human gates
 in [`AGENTS.md`](../AGENTS.md) remain authoritative.
 
-## Current state (2026-09-02)
+## Current state (2026-09-05)
 
-A read-only audit observed:
+A read-only audit of the public `Tchori-Labs/tchori` repository returned
+`{"enabled":true}` from
+`gh api repos/Tchori-Labs/tchori/private-vulnerability-reporting`.
+Option A is therefore operative, and `SECURITY.md` declares `github-pvr`.
+This audit changed no repository setting and did not submit a report.
 
-- `gh api repos/Tchori-Labs/tchori/private-vulnerability-reporting` returned
-  `{"enabled":true}`: GitHub private vulnerability reporting (PVR) is now
-  enabled.
-- `gh api repos/Tchori-Labs/main --jq '[.full_name, .default_branch] | @tsv'`
-  proved the state repository readable. One Git Trees request for
-  `main:decisions?recursive=1` returned `truncated:false`, but local `jq` was
-  unavailable. The single snapshot therefore could not be parsed without a
-  forbidden second request. The fallback verdict remains **NOT AUDITABLE
-  (`listing-tool-unavailable`)**, verdict rule V1; no Option B candidate was
-  classified.
+No fallback contact is published or claimed by this policy; the audit of an
+Option B designation is not required to use the independently verified PVR
+channel. Re-run `scripts/verify-security-contact.sh` before publication.
 
-Option A is now proven operative: live PVR agreement (C3) passes against the
-`{"enabled":true}` readback. Option B remains unaudited rather than proven or
-disproven; an unverified option never downgrades an independently proven
-option, and V3 (`APPROVED`) wins once at least one option is operative.
-`SECURITY.md` still carries whichever marker state was current when it was
-last edited; re-run [`verify-security-contact.sh`](../scripts/verify-security-contact.sh)
-and update the document's marker and published region (C1/C2) before treating
-the channel as fully closed out end to end.
+An unverified option never downgrades an independently proven option, but an
+unproven option never earns a marker. Within Option B, one ambiguous candidate
+makes the entire fallback verdict unauditable (V2 before V3). Ambiguity means
+*unverified*, never *absent*. An approved designation that is not authorized and
+extractable for publication is *not yet publishable*, not an operative channel.
 
 ## Option A: enable GitHub PVR (repository admin only)
 
