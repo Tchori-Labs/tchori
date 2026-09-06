@@ -1351,6 +1351,47 @@ func TestSaveResolverOutcomes(t *testing.T) {
 	}
 }
 
+func TestSaveRejectsProviderSourceDriftBeforeMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"test_thing.example": {
+			Type:           "test_thing",
+			Provider:       "test",
+			ProviderSource: "old.example/test",
+			Attributes:     json.RawMessage(`{"id":"example"}`),
+		},
+	}}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	beforeState, err := os.ReadFile(path) //nolint:gosec // test-controlled state path
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeBackup, err := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled backup path
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetSensitiveResolver(func(string, *ResourceState) (Resolution, bool) {
+		return Resolution{ProviderSource: "new.example/test"}, true
+	})
+	err = s.Save(path)
+	if err == nil || !strings.Contains(err.Error(), "provider source") {
+		t.Fatalf("Save error = %v, want provider source mismatch", err)
+	}
+	afterState, _ := os.ReadFile(path)              //nolint:gosec // test-controlled state path
+	afterBackup, _ := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled backup path
+	if !bytes.Equal(beforeState, afterState) || !bytes.Equal(beforeBackup, afterBackup) {
+		t.Fatal("provider source drift changed state or backup")
+	}
+	if got := s.Resources["test_thing.example"].ProviderSource; got != "old.example/test" {
+		t.Fatalf("in-memory provider source = %q, want old binding", got)
+	}
+}
+
 func setStateArtifactKey(t *testing.T, seed byte) {
 	t.Helper()
 	t.Setenv("TCHORI_ARTIFACT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{seed}, 32)))
@@ -1782,5 +1823,76 @@ func TestSensitiveSetRecoveryIsEncryptedBoundAndBackedUp(t *testing.T) {
 				t.Fatal("Load accepted recovery with invalid key or authenticated identity")
 			}
 		})
+	}
+}
+
+func TestBackupReprojectsSensitiveSetRecoveryAfterRemovingLiteralExemptions(t *testing.T) {
+	setStateArtifactKey(t, 33)
+	elementType := cty.Object(map[string]cty.Type{"label": cty.String, "token": cty.String})
+	resourceType := cty.Object(map[string]cty.Type{
+		"members": cty.Set(elementType),
+		"note":    cty.String,
+	})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"members": {
+			Type: cty.Set(elementType),
+			NestedType: map[string]*provider.Attr{
+				"label": {Type: cty.String},
+				"token": {Type: cty.String, Sensitive: true},
+			},
+		},
+		"note": {Type: cty.String, Sensitive: true},
+	}}
+	spec, ds := sensitive.Resolve(block, nil, map[string]any{"note": "authored-public"})
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	noExempt := spec.Effective(nil)
+	member := func(token string) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{"label": cty.StringVal("same"), "token": cty.StringVal(token)})
+	}
+	original := cty.ObjectVal(map[string]cty.Value{
+		"members": cty.SetVal([]cty.Value{member("set-secret-one"), member("set-secret-two")}),
+		"note":    cty.StringVal("authored-public"),
+	})
+	public, redacted, recovery, err := spec.Project(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"secret.set": {
+			Type: "secret", Provider: "test", ProviderSource: "example.test/test",
+			Attributes: public, SensitiveSetRecovery: recovery,
+			Redacted: redacted, SensitivePaths: spec.Paths(), SensitiveScanned: true,
+		},
+	}}
+	s.SetSensitiveResolver(func(string, *ResourceState) (Resolution, bool) {
+		return Resolution{
+			Paths: spec.Paths(), ProviderSource: "example.test/test",
+			SanitizeAttributes: spec.Sanitizer(resourceType),
+			SanitizeBackup:     noExempt.Sanitizer(resourceType),
+		}, true
+	})
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := Load(path + ".backup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := backup.Resources["secret.set"]
+	restored, err := noExempt.Restore(rs.Attributes, rs.SensitiveSetRecovery, resourceType)
+	if err != nil {
+		t.Fatalf("backup stored a mismatched projection/recovery pair: %v", err)
+	}
+	if !restored.GetAttr("members").RawEquals(original.GetAttr("members")) {
+		t.Fatal("backup lost authoritative set membership")
+	}
+	if !restored.GetAttr("note").IsNull() {
+		t.Fatal("backup retained a sensitive literal exemption")
 	}
 }

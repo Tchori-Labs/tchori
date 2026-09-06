@@ -592,6 +592,96 @@ func TestApplySensitiveSetLifecyclePreservesIdentity(t *testing.T) {
 	}
 }
 
+func TestApplySensitiveSetRetainsProviderPlannedNormalization(t *testing.T) {
+	resource := setThing("normalized", "normalized")
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	if !bytes.Contains(pl.Changes[0].After, []byte(`"normalized":"normalized-same"`)) {
+		t.Fatalf("reviewed plan omitted provider normalization: %s", pl.Changes[0].After)
+	}
+	if _, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("Apply discarded or diverged from provider-planned normalization: %+v", ds)
+	}
+	attrs := stateAttrs(t, h.statePath, resource.Address)
+	for _, field := range []string{"attribute_members", "block_members"} {
+		for _, raw := range attrs[field].([]any) {
+			member := raw.(map[string]any)
+			if member["normalized"] != "normalized-same" {
+				t.Fatalf("%s member normalization = %#v", field, member["normalized"])
+			}
+		}
+	}
+}
+
+func TestApplySensitiveSetRejectsReplanDivergenceBeforeProviderMutation(t *testing.T) {
+	resource := setThing("diverged", "diverged")
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+
+	members := resource.Config["attribute_members"].([]any)
+	members[0].(map[string]any)["label"] = "changed-after-review"
+
+	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() || diagnosticWithSummary(ds, "sensitive set preflight diverged from reviewed plan") == nil {
+		t.Fatalf("Apply diagnostics = %+v, want sensitive-set preflight divergence", ds)
+	}
+	if result.Created != 0 || result.Updated != 0 || result.Deleted != 0 || result.Replaced != 0 {
+		t.Fatalf("provider mutation result = %+v, want no completed mutation", result)
+	}
+	if got := loadState(t, h.statePath).Resources[resource.Address]; got != nil {
+		t.Fatalf("divergent re-plan persisted resource: %+v", got)
+	}
+}
+
+func TestApplyRetainsPersistedConfigOnlySensitiveSetPolicy(t *testing.T) {
+	resource := setThing("declared", "declared")
+	resource.Config["declared_members"] = []any{
+		map[string]any{"label": "same", "token": "declared-private-one"},
+		map[string]any{"label": "same", "token": "declared-private-two"},
+	}
+	resource.SensitiveAttributes = []string{"declared_members.token"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	resource.SensitiveAttributes = nil
+	resource.Config["name"] = "renamed"
+	current := loadState(t, h.statePath)
+	pl := h.plan(t, current, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "update" {
+		t.Fatalf("declaration-removal plan = %+v", pl.Changes)
+	}
+	if _, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, current, h.statePath); ds.HasErrors() {
+		t.Fatalf("declaration-removal Apply: %+v", ds)
+	}
+	data, err := os.ReadFile(h.statePath) //nolint:gosec // test-controlled state path
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"declared-private-one", "declared-private-two"} {
+		if bytes.Contains(data, []byte(secret)) {
+			t.Fatalf("removed declaration declassified %q", secret)
+		}
+	}
+	saved := loadState(t, h.statePath)
+	if !slices.Contains(saved.Resources[resource.Address].SensitivePaths, "declared_members.token") {
+		t.Fatal("apply forgot persisted config-only sensitivity")
+	}
+
+	delete(h.cfg.Resources, resource.Address)
+	destroy := h.plan(t, saved, true)
+	if _, ds := apply.Apply(context.Background(), destroy, h.cfg, h.providers, h.schemas, saved, h.statePath); ds.HasErrors() {
+		t.Fatalf("state-only delete after declaration removal: %+v", ds)
+	}
+	if got := loadState(t, h.statePath).Resources[resource.Address]; got != nil {
+		t.Fatal("state-only delete retained resource")
+	}
+}
+
 func TestApplySensitiveSetMembershipTransitionsConverge(t *testing.T) {
 	resource := setThing("transitions", "transitions")
 	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
@@ -1289,7 +1379,7 @@ func TestApplyRejectsPoisonedStateReferencePropagation(t *testing.T) {
 				Type:           "tchoritest_thing",
 				Provider:       "tchoritest",
 				ProviderSource: "tchori-labs/tchoritest",
-				Attributes:     json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"tags":{"parent":"safe-parent"}}`),
+				Attributes:     json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"rules":null,"tags":{"parent":"safe-parent"}}`),
 			},
 		},
 	}
@@ -1315,7 +1405,7 @@ func TestApplyRejectsPoisonedStateReferencePropagation(t *testing.T) {
 	// Reproduce state left by an older engine after planning. Write directly
 	// to preserve the plan serial; the poisoned entry is intentionally not
 	// cleaned by TC-048, only refused when another outgoing value reads it.
-	st.Resources[aAddr].Attributes = json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"tags":{"parent":"${tchoritest_thing.ghost.id}"}}`)
+	st.Resources[aAddr].Attributes = json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"rules":null,"tags":{"parent":"${tchoritest_thing.ghost.id}"}}`)
 	stateBytes, err = json.Marshal(st)
 	if err != nil {
 		t.Fatalf("marshal poisoned state: %v", err)
@@ -1522,7 +1612,7 @@ func TestApplyMultipleStateOnlyDeletesIncludeNullAndPrivateState(t *testing.T) {
 			Type:           "tchoritest_thing",
 			Provider:       "tchoritest",
 			ProviderSource: "tchori-labs/tchoritest",
-			Attributes:     json.RawMessage(`{"echo":"zeta","id":"id-zeta","name":"zeta","replace_me":null,"tags":null}`),
+			Attributes:     json.RawMessage(`{"echo":"zeta","id":"id-zeta","name":"zeta","replace_me":null,"rules":null,"tags":null}`),
 			Private:        []byte("zeta-private"),
 		},
 	}}
@@ -1554,7 +1644,7 @@ func TestApplyStateOnlyDeletesKeepReverseLexicalOrderAfterFailures(t *testing.T)
 			Type:           "tchoritest_thing",
 			Provider:       "tchoritest",
 			ProviderSource: "tchori-labs/tchoritest",
-			Attributes:     json.RawMessage(`{"echo":"explode_destroy","id":"id-explode_destroy","name":"explode_destroy","replace_me":null,"tags":null}`),
+			Attributes:     json.RawMessage(`{"echo":"explode_destroy","id":"id-explode_destroy","name":"explode_destroy","replace_me":null,"rules":null,"tags":null}`),
 			Private:        []byte(private),
 		}
 	}

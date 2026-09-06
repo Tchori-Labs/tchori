@@ -1347,6 +1347,17 @@ func TestReadUnbound11PrivateForExplicitMigration(t *testing.T) {
 	if got.Changes[0].ProviderSource != "" || !bytes.Equal(got.Changes[0].Private, []byte(sentinel)) {
 		t.Fatal("pre-source-binding 1.1 plan did not remain readable for explicit migration refusal")
 	}
+	path := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	read, err := plan.Read(path)
+	if err != nil {
+		t.Fatalf("plan.Read pre-source-binding 1.1 plan: %v", err)
+	}
+	if !bytes.Equal(read.Changes[0].Private, []byte(sentinel)) {
+		t.Fatal("plan.Read lost pre-source-binding 1.1 private bytes")
+	}
 }
 
 func TestReadLegacyPlanPrivate(t *testing.T) {

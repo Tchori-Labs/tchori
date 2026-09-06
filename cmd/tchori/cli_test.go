@@ -25,6 +25,8 @@ import (
 	tchoricli "github.com/tchori-labs/tchori/cmd/tchori"
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/plan"
+	"github.com/tchori-labs/tchori/internal/privateblob"
+	"github.com/tchori-labs/tchori/internal/state"
 )
 
 // The CLI is tested end to end: TestMain builds the real tchori binary and
@@ -1596,7 +1598,7 @@ func TestStateSanitizeScrubsLegacyStateAndBackup(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	stateDoc := `{"format_version":"1.0","serial":1,"resources":{"tchoritest_lossy.svc":{"type":"tchoritest_lossy","provider":"tchoritest","attributes":{"id":"lossy-svc","name":"svc","secret":"` + sentinel + `","credentials":{"user":"agent","token":"` + sentinel + `"},"endpoints":[{"host":"example.test","api_key":"` + sentinel + `"}]}}}}`
+	stateDoc := `{"format_version":"1.0","serial":1,"resources":{"tchoritest_lossy.svc":{"type":"tchoritest_lossy","provider":"tchoritest","attributes":{"id":"lossy-svc","name":"svc","flag":null,"tags":null,"secret":"` + sentinel + `","replace_me":null,"credentials":{"user":"agent","token":"` + sentinel + `"},"endpoints":[{"host":"example.test","api_key":"` + sentinel + `"}],"probes":[]}}}}`
 	statePath := filepath.Join(dir, "state.json")
 	backupPath := statePath + ".backup"
 	if err := os.WriteFile(statePath, []byte(stateDoc), 0o600); err != nil {
@@ -1620,6 +1622,85 @@ func TestStateSanitizeScrubsLegacyStateAndBackup(t *testing.T) {
 		}
 		if bytes.Contains(got, []byte(sentinel)) {
 			t.Fatalf("%s retains sensitive value: %s", path, got)
+		}
+	}
+}
+
+func TestStateSanitizeRejectsProviderSourceDriftBeforeDiscovery(t *testing.T) {
+	dir := t.TempDir()
+	cfg := `{
+  "providers": {"tchoritest": {"source":"new.example/tchoritest","version":"0.0.1","config":{}}},
+  "resources": {"tchoritest_lossy.svc": {"config":{"name":"svc"}}}
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(dir, "state.json")
+	stateDoc := `{"format_version":"1.2","serial":1,"resources":{"tchoritest_lossy.svc":{"type":"tchoritest_lossy","provider":"tchoritest","provider_source":"old.example/tchoritest","attributes":{"id":"lossy-svc","name":"svc","secret":null,"credentials":null,"endpoints":[]}}}}`
+	if err := os.WriteFile(statePath, []byte(stateDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(statePath) //nolint:gosec // test-controlled state path
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyPlugins := filepath.Join(dir, "empty-plugins")
+	if err := os.Mkdir(emptyPlugins, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, code := runCLI(t, dir, "state", "sanitize", "--plugin-dir="+emptyPlugins)
+	if code != 1 || !strings.Contains(stderr, "provider source") {
+		t.Fatalf("state sanitize source drift: code=%d stderr=%s", code, stderr)
+	}
+	if strings.Contains(stderr, "not installed") || strings.Contains(stderr, "launching provider") {
+		t.Fatalf("state sanitize reached provider discovery before refusing source drift: %s", stderr)
+	}
+	after, _ := os.ReadFile(statePath) //nolint:gosec // test-controlled state path
+	if !bytes.Equal(before, after) {
+		t.Fatal("source drift refusal changed state")
+	}
+	if _, err := os.Stat(statePath + ".backup"); !os.IsNotExist(err) {
+		t.Fatalf("source drift refusal created backup: %v", err)
+	}
+}
+
+func TestStateSanitizeMigratesUnboundEncrypted11Private(t *testing.T) {
+	t.Setenv("TCHORI_ARTIFACT_KEY", testArtifactKey)
+	const privateValue = "early-1.1-provider-private"
+	sealed, err := privateblob.Seal([]byte(privateValue), "state\x00tchoritest_lossy.svc\x00tchoritest\x00tchoritest_lossy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	cfg := `{
+  "providers": {"tchoritest": {"source":"tchori-labs/tchoritest","version":"0.0.1","config":{}}},
+  "resources": {"tchoritest_lossy.svc": {"config":{"name":"svc"}}}
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(dir, "state.json")
+	stateDoc := fmt.Sprintf(`{"format_version":"1.1","serial":1,"resources":{"tchoritest_lossy.svc":{"type":"tchoritest_lossy","provider":"tchoritest","attributes":{"id":"lossy-svc","name":"svc","flag":null,"tags":null,"secret":null,"replace_me":null,"credentials":null,"endpoints":[],"probes":[]},"private":%s}}}`, sealed)
+	if err := os.WriteFile(statePath, []byte(stateDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, code := runCLI(t, dir, "state", "sanitize", "--plugin-dir="+pluginDir)
+	if code != 0 {
+		t.Fatalf("state sanitize early 1.1: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	for _, artifact := range []string{statePath, statePath + ".backup"} {
+		loaded, err := state.Load(artifact)
+		if err != nil {
+			t.Fatalf("Load(%s): %v", artifact, err)
+		}
+		rs := loaded.Resources["tchoritest_lossy.svc"]
+		if rs.ProviderSource != "tchori-labs/tchoritest" {
+			t.Fatalf("%s provider source = %q", artifact, rs.ProviderSource)
+		}
+		if !bytes.Equal(rs.Private, []byte(privateValue)) {
+			t.Fatalf("%s lost early 1.1 private bytes", artifact)
 		}
 	}
 }

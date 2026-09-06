@@ -262,7 +262,8 @@ func Write(pl *Plan, path string) error {
 	return nil
 }
 
-// Read loads a plan.json written by Write, rejecting unknown format versions.
+// Read loads a plan.json written by Write. UnmarshalJSON owns the exhaustive
+// format-version allowlist so this boundary cannot drift from parser support.
 func Read(path string) (*Plan, error) {
 	b, err := os.ReadFile(path) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed plan.json location), not attacker-controlled
 	if err != nil {
@@ -271,9 +272,6 @@ func Read(path string) (*Plan, error) {
 	pl := &Plan{}
 	if err := json.Unmarshal(b, pl); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
-	}
-	if pl.FormatVersion != legacyFormatVersion && pl.FormatVersion != FormatVersion {
-		return nil, fmt.Errorf("unsupported plan format_version %q", pl.FormatVersion)
 	}
 	return pl, nil
 }

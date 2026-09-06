@@ -46,11 +46,25 @@ func Resolve(block *provider.SchemaBlock, declared []string, rawCfg map[string]a
 	return s.Effective(rawCfg), ds
 }
 
+// ResolveWithPersisted applies current schema/config sensitivity plus every
+// previously recorded path that still exists in the live schema. Planning,
+// applying, and state-only deletion use this shared rule so sensitivity memory
+// cannot disappear between phases.
+func ResolveWithPersisted(block *provider.SchemaBlock, declared, persisted []string, rawCfg map[string]any) (*Spec, diag.Diagnostics) {
+	recalled := make([]string, 0, len(persisted))
+	for _, path := range persisted {
+		if path != "" && schemaPathExists(block, strings.Split(path, ".")) {
+			recalled = append(recalled, path)
+		}
+	}
+	return Resolve(block, append(append([]string(nil), declared...), recalled...), rawCfg)
+}
+
 func affectedSets(allSetPrefixes, paths []string) []string {
 	affected := make([]string, 0, len(allSetPrefixes))
 	for _, prefix := range allSetPrefixes {
 		for _, path := range paths {
-			if strings.HasPrefix(path, prefix+".") {
+			if path == prefix || strings.HasPrefix(path, prefix+".") || strings.HasPrefix(prefix, path+".") {
 				affected = append(affected, prefix)
 				break
 			}
@@ -287,13 +301,18 @@ func (s *Spec) transform(v cty.Value, mode transformMode) (cty.Value, []string, 
 	out, err := cty.Transform(v, func(path cty.Path, val cty.Value) (cty.Value, error) {
 		full := PathString(path)
 		logical := logicalPath(path)
-		if mode == transformMask && underPrefix(logical, s.setPrefixes) {
+		if mode == transformMask && (underPrefix(logical, s.setPrefixes) || prefixAtOrBelow(logical, s.setPrefixes)) {
 			return val, nil
 		}
-		if !contains(s.paths, logical) {
+		if !coveredBySensitivePath(logical, s.paths) {
 			return val, nil
 		}
 		if literal, ok := s.exempt[full]; ok && literalMatches(val, literal) {
+			return val, nil
+		}
+		ty := val.Type()
+		composite := ty.IsObjectType() || ty.IsMapType() || ty.IsListType() || ty.IsTupleType() || ty.IsSetType()
+		if composite && (underPrefix(logical, s.setPrefixes) || prefixAtOrBelow(logical, s.setPrefixes)) {
 			return val, nil
 		}
 		switch mode {
@@ -314,6 +333,24 @@ func (s *Spec) transform(v cty.Value, mode transformMode) (cty.Value, []string, 
 	})
 	sort.Strings(changed)
 	return out, changed, err
+}
+
+func coveredBySensitivePath(path string, paths []string) bool {
+	for _, sensitivePath := range paths {
+		if path == sensitivePath || strings.HasPrefix(path, sensitivePath+".") {
+			return true
+		}
+	}
+	return false
+}
+
+func prefixAtOrBelow(path string, prefixes []string) bool {
+	for _, prefix := range prefixes {
+		if path == "" || path == prefix || strings.HasPrefix(prefix, path+".") {
+			return true
+		}
+	}
+	return false
 }
 
 func literalMatches(value cty.Value, literal any) bool {

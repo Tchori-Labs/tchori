@@ -453,6 +453,7 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 			Paths:              spec.Paths(),
 			ProviderSource:     rt.Config.Providers[r.Provider].Source,
 			SanitizeAttributes: spec.Sanitizer(sch.Block.ImpliedType()),
+			SanitizeBackup:     spec.Effective(nil).Sanitizer(sch.Block.ImpliedType()),
 		}, true
 	})
 
@@ -643,6 +644,17 @@ func buildSensitiveContext(ctx context.Context, st *state.State, addresses []str
 					"configured resource type or provider differs from stored state; state was not changed"))
 				continue
 			}
+			providerConfig := cfg.Providers[resource.Provider]
+			if providerConfig == nil {
+				ds = append(ds, diag.Errorf(address, "cannot resolve sensitive state",
+					fmt.Sprintf("provider %q is not configured; state was not changed", resource.Provider)))
+				continue
+			}
+			if rs.ProviderSource != "" && rs.ProviderSource != providerConfig.Source {
+				ds = append(ds, diag.Errorf(address, "state does not match resource identity",
+					"the stored canonical provider source differs from configuration; state was not changed"))
+				continue
+			}
 			required[resource.Provider] = true
 			continue
 		}
@@ -719,9 +731,10 @@ func buildSensitiveContext(ctx context.Context, st *state.State, addresses []str
 				fmt.Sprintf("provider %q is not configured; state was not changed", resource.Provider)))
 			continue
 		}
-		if rs.Type != resource.Type || rs.Provider != resource.Provider {
+		if rs.Type != resource.Type || rs.Provider != resource.Provider ||
+			(rs.ProviderSource != "" && rs.ProviderSource != providerConfig.Source) {
 			ds = append(ds, diag.Errorf(address, "state does not match resource identity",
-				"the stored resource type or provider alias differs from configuration; state was not changed"))
+				"the stored resource type, provider alias, or canonical provider source differs from configuration; state was not changed"))
 			continue
 		}
 		schemaSet := schemas[resource.Provider]
@@ -756,6 +769,7 @@ func buildSensitiveContext(ctx context.Context, st *state.State, addresses []str
 			Paths:              mergePaths(spec.Paths(), rs.SensitivePaths, rs.Redacted),
 			ProviderSource:     providerConfig.Source,
 			SanitizeAttributes: spec.Sanitizer(schema.Block.ImpliedType()),
+			SanitizeBackup:     spec.Effective(nil).Sanitizer(schema.Block.ImpliedType()),
 		}
 		result.resolved[address] = true
 	}

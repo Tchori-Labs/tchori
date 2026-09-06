@@ -106,29 +106,13 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		}
 		ty := schema.Block.ImpliedType()
 
-		// declared is the effective sensitive-path input to spec below: the
-		// union of config's sensitive_attributes and whatever this resource's
-		// state already recorded as sensitive. State sensitivity memory must
-		// be monotonic — a path once recorded as sensitive (a legacy
-		// plaintext write predating the declaration, or a declaration config
-		// has since narrowed or dropped) stays redacted in Change.Before,
-		// Drift, plan -json/-out, and the re-persisted state, not just while
-		// config keeps declaring it. A state-recorded path that no longer
-		// exists in the current schema cannot hold a value there anymore
-		// (the provider dropped or renamed the attribute), so it is filtered
-		// out here rather than handed to sensitive.Resolve, which would
-		// reject an unknown path and hard-fail the whole plan.
-		declared := res.SensitiveAttributes
+		var persistedPaths []string
 		if hasPrior {
-			var recalled []string
-			for _, path := range rs.SensitivePaths {
-				if schemaHasPath(schema.Block, path) {
-					recalled = append(recalled, path)
-				}
-			}
-			declared = unionPaths(declared, recalled)
+			persistedPaths = rs.SensitivePaths
 		}
-		spec, specDs := sensitive.Resolve(schema.Block, declared, res.Config)
+		spec, specDs := sensitive.ResolveWithPersisted(
+			schema.Block, res.SensitiveAttributes, persistedPaths, res.Config,
+		)
 		ds = append(ds, specDs...)
 		if specDs.HasErrors() {
 			return nil, ds
@@ -140,7 +124,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		var priorPrivate []byte
 		var recordedAttrs json.RawMessage
 		if hasPrior {
-			pv, err := spec.Restore(rs.Attributes, rs.SensitiveSetRecovery, ty)
+			pv, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, ty, rs.SensitivePaths)
 			if err != nil {
 				ds = append(ds, diag.Errorf(addr, "invalid state attributes", err.Error()))
 				return nil, ds
@@ -315,7 +299,7 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 		return nil, lds
 	}
 	ty := schema.Block.ImpliedType()
-	spec, sds := sensitive.Resolve(schema.Block, rs.SensitivePaths, nil)
+	spec, sds := sensitive.ResolveWithPersisted(schema.Block, nil, rs.SensitivePaths, nil)
 	lds = append(lds, sds...)
 	if sds.HasErrors() {
 		return nil, lds
@@ -457,72 +441,6 @@ func replaceRequired(prior, planned cty.Value, paths []string) bool {
 
 // attrPath retains the package-private call site while sharing one renderer/parser.
 func attrPath(dotted string) cty.Path { return sensitive.AttrPath(dotted) }
-
-// unionPaths returns the union of a and b, preserving a's order and
-// appending unseen entries from b. sensitive.Resolve sorts and dedupes the
-// effective path set again internally, so the exact order produced here is
-// not load-bearing.
-func unionPaths(a, b []string) []string {
-	if len(b) == 0 {
-		return a
-	}
-	seen := make(map[string]bool, len(a))
-	for _, p := range a {
-		seen[p] = true
-	}
-	out := append([]string(nil), a...)
-	for _, p := range b {
-		if !seen[p] {
-			seen[p] = true
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// schemaHasPath reports whether dotted names an attribute or nested block
-// reachable from block, mirroring internal/sensitive's own schema walk
-// (unexported there). It exists so a state-recorded sensitive path from an
-// older provider schema — an attribute the provider has since dropped or
-// renamed — can be pruned from the union above instead of being handed to
-// sensitive.Resolve, which rejects unknown paths and would hard-fail the
-// whole plan over a path that can no longer hold a value anyway.
-func schemaHasPath(block *provider.SchemaBlock, dotted string) bool {
-	return schemaBlockHasPath(block, strings.Split(dotted, "."))
-}
-
-func schemaBlockHasPath(block *provider.SchemaBlock, parts []string) bool {
-	if block == nil || len(parts) == 0 {
-		return false
-	}
-	if nested, ok := block.Blocks[parts[0]]; ok && nested != nil {
-		if len(parts) == 1 {
-			return true
-		}
-		return schemaBlockHasPath(nested.Block, parts[1:])
-	}
-	attr, ok := block.Attributes[parts[0]]
-	if !ok || attr == nil {
-		return false
-	}
-	if len(parts) == 1 {
-		return true
-	}
-	return schemaTypeHasPath(attr.Type, parts[1:])
-}
-
-func schemaTypeHasPath(ty cty.Type, parts []string) bool {
-	for ty.IsListType() || ty.IsSetType() || ty.IsMapType() {
-		ty = ty.ElementType()
-	}
-	if !ty.IsObjectType() || len(parts) == 0 || !ty.HasAttribute(parts[0]) {
-		return false
-	}
-	if len(parts) == 1 {
-		return true
-	}
-	return schemaTypeHasPath(ty.AttributeType(parts[0]), parts[1:])
-}
 
 // PathString is retained for callers outside plan; implementation lives in the leaf package.
 func PathString(path cty.Path) string { return sensitive.PathString(path) }

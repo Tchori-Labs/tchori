@@ -11,9 +11,15 @@ var setThingDetailType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{
 }}
 
 var setThingMemberType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{
-	"label":   tftypes.String,
-	"token":   tftypes.String,
-	"details": tftypes.List{ElementType: setThingDetailType},
+	"label":      tftypes.String,
+	"token":      tftypes.String,
+	"normalized": tftypes.String,
+	"details":    tftypes.List{ElementType: setThingDetailType},
+}}
+
+var setThingDeclaredMemberType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{
+	"label": tftypes.String,
+	"token": tftypes.String,
 }}
 
 var setThingType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{
@@ -21,11 +27,13 @@ var setThingType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{
 	"name":              tftypes.String,
 	"attribute_members": tftypes.Set{ElementType: setThingMemberType},
 	"block_members":     tftypes.Set{ElementType: setThingMemberType},
+	"declared_members":  tftypes.Set{ElementType: setThingDeclaredMemberType},
 }}
 
 var setThingMemberAttributes = []*tfprotov6.SchemaAttribute{
 	{Name: "label", Type: tftypes.String, Optional: true},
 	{Name: "token", Type: tftypes.String, Optional: true, Sensitive: true},
+	{Name: "normalized", Type: tftypes.String, Computed: true},
 }
 
 func setThingDetailBlock() *tfprotov6.SchemaNestedBlock {
@@ -51,6 +59,7 @@ var setThingSchema = &tfprotov6.Schema{Version: 0, Block: &tfprotov6.SchemaBlock
 				Attributes: []*tfprotov6.SchemaAttribute{
 					{Name: "label", Type: tftypes.String, Optional: true},
 					{Name: "token", Type: tftypes.String, Optional: true, Sensitive: true},
+					{Name: "normalized", Type: tftypes.String, Computed: true},
 					{
 						Name:     "details",
 						Optional: true,
@@ -62,6 +71,17 @@ var setThingSchema = &tfprotov6.Schema{Version: 0, Block: &tfprotov6.SchemaBlock
 							},
 						},
 					},
+				},
+			},
+		},
+		{
+			Name:     "declared_members",
+			Optional: true,
+			NestedType: &tfprotov6.SchemaObject{
+				Nesting: tfprotov6.SchemaObjectNestingModeSet,
+				Attributes: []*tfprotov6.SchemaAttribute{
+					{Name: "label", Type: tftypes.String, Optional: true},
+					{Name: "token", Type: tftypes.String, Optional: true},
 				},
 			},
 		},
@@ -92,6 +112,12 @@ func (s *server) planSetThing(req *tfprotov6.PlanResourceChangeRequest) (*tfprot
 	if err := proposed.As(&attrs); err != nil {
 		return nil, err
 	}
+	for _, name := range []string{"attribute_members", "block_members"} {
+		attrs[name], err = normalizeSetThingMembers(attrs[name])
+		if err != nil {
+			return nil, err
+		}
+	}
 	if prior.IsNull() {
 		attrs["id"] = tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
 	} else {
@@ -106,6 +132,32 @@ func (s *server) planSetThing(req *tfprotov6.PlanResourceChangeRequest) (*tfprot
 		return nil, err
 	}
 	return &tfprotov6.PlanResourceChangeResponse{PlannedState: &planned, PlannedPrivate: req.PriorPrivate}, nil
+}
+func normalizeSetThingMembers(value tftypes.Value) (tftypes.Value, error) {
+	if value.IsNull() || !value.IsKnown() {
+		return value, nil
+	}
+	var members []tftypes.Value
+	if err := value.As(&members); err != nil {
+		return tftypes.Value{}, err
+	}
+	for i, member := range members {
+		var attrs map[string]tftypes.Value
+		if err := member.As(&attrs); err != nil {
+			return tftypes.Value{}, err
+		}
+		normalized := tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+		if label := attrs["label"]; label.IsKnown() && !label.IsNull() {
+			var raw string
+			if err := label.As(&raw); err != nil {
+				return tftypes.Value{}, err
+			}
+			normalized = tftypes.NewValue(tftypes.String, "normalized-"+raw)
+		}
+		attrs["normalized"] = normalized
+		members[i] = tftypes.NewValue(setThingMemberType, attrs)
+	}
+	return tftypes.NewValue(tftypes.Set{ElementType: setThingMemberType}, members), nil
 }
 
 func (s *server) applySetThing(req *tfprotov6.ApplyResourceChangeRequest) (*tfprotov6.ApplyResourceChangeResponse, error) {
@@ -153,8 +205,9 @@ func (s *server) importSetThing(req *tfprotov6.ImportResourceStateRequest) (*tfp
 	}
 	member := func(token, secret string) tftypes.Value {
 		return tftypes.NewValue(setThingMemberType, map[string]tftypes.Value{
-			"label": tftypes.NewValue(tftypes.String, "same"),
-			"token": tftypes.NewValue(tftypes.String, token),
+			"label":      tftypes.NewValue(tftypes.String, "same"),
+			"normalized": tftypes.NewValue(tftypes.String, "normalized-same"),
+			"token":      tftypes.NewValue(tftypes.String, token),
 			"details": tftypes.NewValue(tftypes.List{ElementType: setThingDetailType}, []tftypes.Value{
 				detail(secret),
 			}),
@@ -170,6 +223,7 @@ func (s *server) importSetThing(req *tfprotov6.ImportResourceStateRequest) (*tfp
 		"id":                tftypes.NewValue(tftypes.String, req.ID),
 		"name":              tftypes.NewValue(tftypes.String, "imported"),
 		"attribute_members": members("imported-attribute"),
+		"declared_members":  tftypes.NewValue(tftypes.Set{ElementType: setThingDeclaredMemberType}, nil),
 		"block_members":     members("imported-block"),
 	})
 	dynamic, err := tfprotov6.NewDynamicValue(setThingType, value)

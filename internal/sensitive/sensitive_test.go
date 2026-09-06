@@ -1,8 +1,10 @@
 package sensitive
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tchori-labs/tchori/internal/provider"
@@ -232,6 +234,102 @@ func TestSensitiveNestedBlockSetPreservesDistinctElements(t *testing.T) {
 	}
 }
 
+func TestWholeSetSensitivityPreservesAuthoritativeMembership(t *testing.T) {
+	memberType := cty.Object(map[string]cty.Type{"label": cty.String, "token": cty.String})
+	member := func(token string) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{"label": cty.StringVal("same"), "token": cty.StringVal(token)})
+	}
+	originalSet := cty.SetVal([]cty.Value{member("first-private"), member("second-private")})
+	for _, tc := range []struct {
+		name     string
+		block    *provider.SchemaBlock
+		declared []string
+		value    cty.Value
+	}{
+		{
+			name: "provider sensitive set",
+			block: &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+				"members": {Type: cty.Set(memberType), Sensitive: true, NestedType: map[string]*provider.Attr{
+					"label": {Type: cty.String}, "token": {Type: cty.String},
+				}},
+			}},
+			value: cty.ObjectVal(map[string]cty.Value{"members": originalSet}),
+		},
+		{
+			name: "declared sensitive set",
+			block: &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+				"members": {Type: cty.Set(memberType), NestedType: map[string]*provider.Attr{
+					"label": {Type: cty.String}, "token": {Type: cty.String},
+				}},
+			}},
+			declared: []string{"members"},
+			value:    cty.ObjectVal(map[string]cty.Value{"members": originalSet}),
+		},
+		{
+			name: "sensitive ancestor",
+			block: &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+				"container": {
+					Type:      cty.Object(map[string]cty.Type{"members": cty.Set(memberType)}),
+					Sensitive: true,
+					NestedType: map[string]*provider.Attr{
+						"members": {Type: cty.Set(memberType), NestedType: map[string]*provider.Attr{
+							"label": {Type: cty.String}, "token": {Type: cty.String},
+						}},
+					},
+				},
+			}},
+			value: cty.ObjectVal(map[string]cty.Value{
+				"container": cty.ObjectVal(map[string]cty.Value{"members": originalSet}),
+			}),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, ds := Resolve(tc.block, tc.declared, nil)
+			if ds.HasErrors() {
+				t.Fatal(ds)
+			}
+			public, _, recovery, err := spec.Project(tc.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(recovery) == 0 {
+				t.Fatal("whole-set sensitivity omitted authoritative recovery")
+			}
+			var decoded any
+			if err := json.Unmarshal(public, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if got := countJSONArrays(decoded); got < 2 {
+				t.Fatalf("public projection lost set cardinality: %s", public)
+			}
+			restored, err := spec.Restore(public, recovery, tc.value.Type())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !restored.RawEquals(tc.value) {
+				t.Fatal("whole-set sensitivity lost provider-visible membership")
+			}
+		})
+	}
+}
+
+func countJSONArrays(value any) int {
+	switch value := value.(type) {
+	case []any:
+		return len(value)
+	case map[string]any:
+		maximum := 0
+		for _, child := range value {
+			if count := countJSONArrays(child); count > maximum {
+				maximum = count
+			}
+		}
+		return maximum
+	default:
+		return 0
+	}
+}
+
 func TestSensitiveSetMaskPreservesMembershipChanges(t *testing.T) {
 	spec, ds := Resolve(testBlock("set"), nil, nil)
 	if ds.HasErrors() {
@@ -409,7 +507,7 @@ func TestSensitiveSetRecoverySurvivesRemovedDeclarationAndEmptySet(t *testing.T)
 	if ds.HasErrors() {
 		t.Fatal(ds)
 	}
-	nextPublic, _, nextRecovery, err := withoutDeclaration.SanitizeJSON(public, recovery, resourceType, declared.Paths())
+	nextPublic, _, nextRecovery, err := withoutDeclaration.SanitizeJSON(public, recovery, resourceType, declared.Paths(), declared.Paths())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -422,6 +520,195 @@ func TestSensitiveSetRecoverySurvivesRemovedDeclarationAndEmptySet(t *testing.T)
 	}
 	if !restored.RawEquals(empty) {
 		t.Fatal("empty sensitive set did not survive sanitization")
+	}
+}
+
+func TestSensitiveSetRecoveryRotatesAcrossPolicyExpansion(t *testing.T) {
+	memberType := cty.Object(map[string]cty.Type{"label": cty.String, "token": cty.String})
+	resourceType := cty.Object(map[string]cty.Type{
+		"members": cty.Set(memberType),
+		"note":    cty.String,
+	})
+	oldBlock := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"members": {
+			Type: cty.Set(memberType),
+			NestedType: map[string]*provider.Attr{
+				"label": {Type: cty.String},
+				"token": {Type: cty.String, Sensitive: true},
+			},
+		},
+		"note": {Type: cty.String},
+	}}
+	newBlock := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"members": {
+			Type: cty.Set(memberType),
+			NestedType: map[string]*provider.Attr{
+				"label": {Type: cty.String, Sensitive: true},
+				"token": {Type: cty.String, Sensitive: true},
+			},
+		},
+		"note": {Type: cty.String, Sensitive: true},
+	}}
+	oldSpec, ds := Resolve(oldBlock, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	newSpec, ds := Resolve(newBlock, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	member := func(token string) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{"label": cty.StringVal("newly-sensitive"), "token": cty.StringVal(token)})
+	}
+	original := cty.ObjectVal(map[string]cty.Value{
+		"members": cty.SetVal([]cty.Value{member("first-private"), member("second-private")}),
+		"note":    cty.StringVal("newly-sensitive-note"),
+	})
+	public, _, recovery, err := oldSpec.Project(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy recoveryPayload
+	if err := json.Unmarshal(recovery, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	legacy.Version = 1
+	legacy.ProjectionPaths = nil
+	recovery, err = json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoredLegacy, err := newSpec.RestoreProjected(public, recovery, resourceType, oldSpec.Paths())
+	if err != nil {
+		t.Fatalf("version 1 recovery could not use recorded generation paths: %v", err)
+	}
+	if !restoredLegacy.GetAttr("members").RawEquals(original.GetAttr("members")) {
+		t.Fatal("version 1 recovery lost authoritative membership")
+	}
+	rotatedPublic, _, rotatedRecovery, err := newSpec.SanitizeJSON(public, recovery, resourceType, oldSpec.Paths(), newSpec.Paths())
+	if err != nil {
+		t.Fatalf("policy expansion could not rotate recovery: %v", err)
+	}
+	if bytes := string(rotatedPublic); strings.Contains(bytes, "newly-sensitive") {
+		t.Fatalf("expanded policy left newly sensitive values public: %s", rotatedPublic)
+	}
+	restored, err := newSpec.Restore(rotatedPublic, rotatedRecovery, resourceType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored.GetAttr("members").RawEquals(original.GetAttr("members")) {
+		t.Fatal("policy expansion lost authoritative membership")
+	}
+	if !restored.GetAttr("note").IsNull() {
+		t.Fatal("expanded non-set sensitivity was not withheld")
+	}
+}
+
+func TestNewlyAffectedSensitiveSetRotatesFromPublicState(t *testing.T) {
+	memberType := cty.Object(map[string]cty.Type{"label": cty.String, "token": cty.String})
+	resourceType := cty.Object(map[string]cty.Type{"members": cty.Set(memberType)})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"members": {
+			Type: cty.Set(memberType),
+			NestedType: map[string]*provider.Attr{
+				"label": {Type: cty.String},
+				"token": {Type: cty.String},
+			},
+		},
+	}}
+	oldSpec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	newSpec, ds := Resolve(block, []string{"members.token"}, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	member := func(token string) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{"label": cty.StringVal("same"), "token": cty.StringVal(token)})
+	}
+	original := cty.ObjectVal(map[string]cty.Value{
+		"members": cty.SetVal([]cty.Value{member("first-private"), member("second-private")}),
+	})
+	public, _, recovery, err := oldSpec.Project(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovery) != 0 {
+		t.Fatal("non-sensitive generation unexpectedly emitted recovery")
+	}
+	rotatedPublic, _, rotatedRecovery, err := newSpec.SanitizeJSON(public, recovery, resourceType, oldSpec.Paths(), newSpec.Paths())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rotatedRecovery) == 0 || strings.Contains(string(rotatedPublic), "private") {
+		t.Fatalf("newly affected set was not rotated safely: %s", rotatedPublic)
+	}
+	restored, err := newSpec.Restore(rotatedPublic, rotatedRecovery, resourceType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored.RawEquals(original) {
+		t.Fatal("newly affected set lost authoritative membership")
+	}
+}
+
+func TestSensitiveSetRecoveryReturnsTupleArityCorruption(t *testing.T) {
+	memberType := cty.Object(map[string]cty.Type{"token": cty.String})
+	resourceType := cty.Object(map[string]cty.Type{
+		"members": cty.Set(memberType),
+		"pair":    cty.Tuple([]cty.Type{cty.String, cty.String}),
+	})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"members": {
+			Type: cty.Set(memberType),
+			NestedType: map[string]*provider.Attr{
+				"token": {Type: cty.String, Sensitive: true},
+			},
+		},
+		"pair": {Type: cty.Tuple([]cty.Type{cty.String, cty.String})},
+	}}
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	original := cty.ObjectVal(map[string]cty.Value{
+		"members": cty.SetVal([]cty.Value{
+			cty.ObjectVal(map[string]cty.Value{"token": cty.StringVal("private")}),
+		}),
+		"pair": cty.TupleVal([]cty.Value{cty.StringVal("left"), cty.StringVal("right")}),
+	})
+	public, _, recovery, err := spec.Project(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(public, &root); err != nil {
+		t.Fatal(err)
+	}
+	root["pair"] = []any{"left"}
+	tamperedPublic, err := json.Marshal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload recoveryPayload
+	if err := json.Unmarshal(recovery, &payload); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(tamperedPublic)
+	payload.ProjectionSHA256 = sum[:]
+	tamperedRecovery, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("tuple corruption panicked: %v", recovered)
+		}
+	}()
+	if _, err := spec.Restore(tamperedPublic, tamperedRecovery, resourceType); err == nil ||
+		!strings.Contains(err.Error(), "tuple") {
+		t.Fatalf("Restore error = %v, want tuple arity corruption", err)
 	}
 }
 

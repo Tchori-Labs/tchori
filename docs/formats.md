@@ -164,12 +164,14 @@ reviewable JSON projection; `planned_raw` is the executable one.
 
 At apply time, an unknown left over from planning that turns out to be a
 `${...}` reference to another resource created earlier in the same run is
-resolved against that resource's real, just-applied value before the
-provider is called — this covers references nested arbitrarily deep inside
-lists, sets, tuples, objects, and maps (e.g. a policy list whose element
-holds a reference inside a further-nested object), not just top-level or
-object/map-nested attributes, so a single `tchori apply` suffices even when
-the reference is nested inside an ordered collection (Tchori-Labs/tchori-internal#11).
+resolved against that resource's real, just-applied value before the provider
+is called. Objects, maps, lists, and tuples use their key or positional
+correspondence. Sets have no stable positional correspondence, so tchori never
+substitutes raw configuration for an unknown-bearing planned set. It asks the
+provider to plan again with the concrete configuration, verifies the re-plan
+against every reviewed known value, collection membership, and replacement
+requirement, and then applies that provider-produced value. A divergence fails
+before any provider mutation, including the destroy leg of a replacement.
 
 ### Exit-code contract
 
@@ -316,8 +318,12 @@ The recovery envelope has a purpose distinct from provider `private` and
 authenticates the resource address, type, provider alias, and canonical source
 as AES-GCM additional data. Its plaintext is versioned and contains a SHA-256
 digest of the exact public projection plus structured attribute/map/list paths
-to msgpack-encoded complete sets. Restoration validates the path set and
-projection digest before replacing set arrays and decoding the authoritative
+to msgpack-encoded complete sets. Recovery payload version 2 also records the
+sensitivity paths that produced the projection, so expanding sensitivity can
+authenticate and restore the old set membership before emitting a new
+projection/recovery pair. Version 1 payloads use the resource's recorded
+`sensitive_paths` for the same migration. Restoration validates the path set
+and projection digest before replacing set arrays and decoding the authoritative
 cty value. Moving either envelope to another address/type/source/purpose,
 changing the key, editing the public projection, or removing required recovery
 fails before a provider mutation or state checkpoint.
@@ -346,8 +352,11 @@ can inspect and migrate it, but planning/apply refuse to send its state or
 private bytes to a provider. `tchori state sanitize` validates the stored
 type/provider alias against live configuration and schema, binds the canonical
 source, and re-encrypts state and backup under the stronger identity. A
-nonempty redacted sensitive set without recovery is rejected explicitly:
-membership cannot be reconstructed safely from the public projection.
+nonempty stored source that differs from resolved configuration is refused
+before provider discovery and before state or backup mutation; it is never
+rewritten as a migration. A nonempty redacted sensitive set without recovery is
+rejected explicitly: membership cannot be reconstructed safely from the public
+projection.
 
 Use `tchori state status` as the convergence gate: exit 0 means converged and
 exit 1 means incomplete. `plan`, `apply`, and `destroy` warn when loading a
@@ -404,26 +413,32 @@ side effects between state checkpoints.
    state path and re-run guidance; neither the state nor its backup is touched.
 3. Parses the prior document and sanitizes every entry using persisted paths,
    live resolution, and effective-path hints before writing `path+".backup"`.
-   Sensitive-set recovery remains encrypted and coupled to the same public
-   projection. With no known sensitive path the copy stays byte-identical;
-   otherwise it is canonically re-serialized. Existing `redacted` markers are
-   unioned with newly changed paths. A parse or envelope-authentication failure
-   aborts rather than copying uninspected bytes. The backup deliberately applies
-   no literal-instance exemptions and retains previously persisted paths, so the
-   prior document is scrubbed under the rules that wrote it even when the current
-   declaration was removed. Because apply performs bracketing saves, the backup
-   left by a successful apply normally contains a marker-carrying intermediate,
-   not the pre-apply state. The fresh-temp-and-rename symlink, directory, and
-   `0600` hardening remains unchanged.
+   When schema is available, sensitive-set recovery is authenticated, restored,
+   and reprojected with a matching rotated recovery payload. Without schema, an
+   existing public-projection/recovery pair is preserved byte-for-byte rather
+   than changing one half and invalidating the other. With no known sensitive
+   path the copy stays byte-identical; otherwise it is canonically re-serialized.
+   Existing `redacted` markers are unioned with newly changed paths. A parse or
+   envelope-authentication failure aborts rather than copying uninspected bytes.
+   The backup deliberately applies no literal-instance exemptions and retains
+   previously persisted paths, so the prior document is scrubbed under the
+   rules that wrote it even when the current declaration was removed. Because
+   apply performs bracketing saves, the backup left by a successful apply
+   normally contains a marker-carrying intermediate, not the pre-apply state.
+   The fresh-temp-and-rename symlink, directory, and `0600` hardening remains
+   unchanged.
 4. Sanitizes every live state entry, including resources untouched by this
    apply. Current schema/config paths are unioned with persisted paths and
    effective hints: removing a declaration does not declassify stored secrets.
-   Live resolution restores affected sets before typed decoding, then emits a
-   new public projection and recovery payload. It honors per-instance literal
-   exemptions outside sets. An unresolvable entry falls back to persisted paths
-   and hints without exemptions, retains existing recovery, and is reported. An
-   empty combined path set is definitively non-sensitive only after successful
-   resolution, which records `sensitive_scanned`.
+   Live resolution restores affected sets under their recorded generation
+   paths before typed decoding, then emits a new public projection and recovery
+   payload under current policy. It honors per-instance literal exemptions
+   outside sets. An unresolved entry without set recovery falls back to
+   persisted paths and hints without exemptions and is reported. An unresolved
+   entry with set recovery is rejected: schema is required to keep the
+   authenticated pair valid. An empty combined path set is definitively
+   non-sensitive only after successful resolution, which records
+   `sensitive_scanned`.
 5. Increments `Serial`, marshals with `MarshalIndent`, writes a temp file
    (`.state-*.tmp`) in the same directory, and fsyncs the complete file before
    closing it. It atomically renames the temp file over `path`, then runs the
@@ -712,9 +727,11 @@ same instance is redacted. References, explicit nulls, absent values, and
 
 Set elements have no stable identity after a sensitive leaf becomes null or
 unknown: distinct elements can become equal and coalesce. Tchori therefore
-rejects a sensitive descendant inside a set during sensitivity resolution,
-before provider execution or state transformation. Per-attribute sensitivity
-inside provider `nested_type` objects, lists, and maps is retained recursively.
+retains each redacted public element and separately encrypts the authoritative
+outermost affected set. Provider-declared sensitivity on the whole set, an
+explicit whole-set declaration, and a sensitive ancestor all use the same
+recovery mechanism. Per-attribute sensitivity inside provider `nested_type`
+objects, lists, maps, and sets is retained recursively.
 
 Every save sanitizes the whole state document. Live, resolvable entries use the
 provider schema's cty type, preserving map elements even when a map key matches

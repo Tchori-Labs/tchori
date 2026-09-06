@@ -59,12 +59,13 @@ type ResourceState struct {
 // Resolution is a live schema+config sensitivity lookup result. An empty Paths
 // slice is a valid, definitive non-sensitive result when the resolver's ok is
 // true; nil-vs-empty is never used to signal resolvability. SanitizeAttributes
-// restores sensitive-set identity before typed decoding, preserves provider
-// schema structure, and binds raw-literal exemptions to authored values.
+// applies live literal exemptions; SanitizeBackup deliberately omits them.
+// Both restore sensitive-set identity before typed decoding.
 type Resolution struct {
 	Paths              []string
 	ProviderSource     string
 	SanitizeAttributes sensitive.JSONSanitizer
+	SanitizeBackup     sensitive.JSONSanitizer
 }
 
 // SensitiveResolver reports sensitivity for one entry. ok=false means the
@@ -552,7 +553,8 @@ func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 	}
 	changedDocument := previous.FormatVersion != formatVersion
 	for addr, prior := range previous.Resources {
-		paths := unionStrings(prior.SensitivePaths, prior.Redacted, s.sensitiveHints[addr])
+		generationPaths := append([]string(nil), prior.SensitivePaths...)
+		paths := unionStrings(generationPaths, prior.Redacted, s.sensitiveHints[addr])
 		if current := s.Resources[addr]; current != nil {
 			paths = unionStrings(paths, current.SensitivePaths)
 			if prior.ProviderSource == "" && current.ProviderSource != "" &&
@@ -561,12 +563,35 @@ func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 				changedDocument = true
 			}
 		}
+		var backupSanitizer sensitive.JSONSanitizer
 		if s.resolver != nil {
 			if resolution, ok := s.resolver(addr, prior); ok {
+				if err := bindResolvedProviderSource(addr, prior, resolution.ProviderSource); err != nil {
+					return nil, false, err
+				}
 				paths = unionStrings(paths, resolution.Paths)
+				backupSanitizer = resolution.SanitizeBackup
 			}
 		}
 		if len(paths) == 0 {
+			continue
+		}
+		if backupSanitizer != nil {
+			attrs, changed, recovery, err := backupSanitizer(
+				prior.Attributes, prior.SensitiveSetRecovery, generationPaths, paths,
+			)
+			if err != nil {
+				return nil, false, fmt.Errorf("sanitize backup attributes for %s: %w", addr, err)
+			}
+			prior.Attributes = attrs
+			prior.SensitiveSetRecovery = recovery
+			prior.Redacted = unionStrings(prior.Redacted, changed)
+			changedDocument = true
+			continue
+		}
+		if len(prior.SensitiveSetRecovery) != 0 {
+			// Without a schema, changing either half would invalidate the
+			// authenticated projection/recovery pair. Preserve both verbatim.
 			continue
 		}
 		changedDocument = true
@@ -634,7 +659,8 @@ func (s *State) sanitizeAll() error {
 		if rs == nil {
 			continue
 		}
-		paths := unionStrings(rs.SensitivePaths, rs.Redacted, s.sensitiveHints[addr])
+		generationPaths := append([]string(nil), rs.SensitivePaths...)
+		paths := unionStrings(generationPaths, rs.Redacted, s.sensitiveHints[addr])
 		sanitizer := sensitive.JSONSanitizer(nil)
 		resolved := false
 		if s.resolver != nil {
@@ -643,8 +669,8 @@ func (s *State) sanitizeAll() error {
 				// Removing a config declaration must not declassify a stored secret.
 				paths = unionStrings(paths, resolution.Paths)
 				sanitizer = resolution.SanitizeAttributes
-				if resolution.ProviderSource != "" {
-					rs.ProviderSource = resolution.ProviderSource
+				if err := bindResolvedProviderSource(addr, rs, resolution.ProviderSource); err != nil {
+					return err
 				}
 				rs.SensitivePaths = append([]string(nil), paths...)
 				rs.SensitiveScanned = true
@@ -667,8 +693,11 @@ func (s *State) sanitizeAll() error {
 			err      error
 		)
 		if resolved && sanitizer != nil {
-			attrs, changed, recovery, err = sanitizer(rs.Attributes, rs.SensitiveSetRecovery, paths)
+			attrs, changed, recovery, err = sanitizer(rs.Attributes, rs.SensitiveSetRecovery, generationPaths, paths)
 		} else {
+			if len(rs.SensitiveSetRecovery) != 0 {
+				return fmt.Errorf("sanitize state attributes for %s: live schema is required to preserve the authenticated sensitive set projection", addr)
+			}
 			// Orphan/config-unavailable state has no trustworthy schema or
 			// literal binding, so provider-free sanitization fails closed.
 			attrs, changed, err = sensitive.RedactJSON(rs.Attributes, paths)
@@ -683,6 +712,17 @@ func (s *State) sanitizeAll() error {
 		rs.Redacted = unionStrings(rs.Redacted, changed)
 	}
 	sort.Strings(s.unresolved)
+	return nil
+}
+
+func bindResolvedProviderSource(addr string, rs *ResourceState, source string) error {
+	if source == "" {
+		return nil
+	}
+	if rs.ProviderSource != "" && rs.ProviderSource != source {
+		return fmt.Errorf("state resource %s provider source %q does not match resolved source %q", addr, rs.ProviderSource, source)
+	}
+	rs.ProviderSource = source
 	return nil
 }
 

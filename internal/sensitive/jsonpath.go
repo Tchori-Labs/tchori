@@ -7,7 +7,6 @@ import (
 	"sort"
 
 	"github.com/zclconf/go-cty/cty"
-	ctyjson "github.com/zclconf/go-cty/cty/json"
 )
 
 // RedactJSON provider-freely nulls matching concrete leaves in ctyjson bytes.
@@ -72,36 +71,30 @@ func redactJSONValue(v any, logical string, paths []string, changed map[string]b
 
 // JSONSanitizer sanitizes ctyjson bytes with a live schema while retaining
 // authenticated sensitive-set recovery separately from the public projection.
-type JSONSanitizer func(attrs json.RawMessage, recovery []byte, paths []string) (json.RawMessage, []string, []byte, error)
+// generationPaths describe the authenticated projection being opened;
+// currentPaths describe the policy to emit.
+type JSONSanitizer func(attrs json.RawMessage, recovery []byte, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error)
 
 // Sanitizer binds this sensitivity specification to a concrete provider type.
 func (s *Spec) Sanitizer(ty cty.Type) JSONSanitizer {
-	return func(attrs json.RawMessage, recovery []byte, paths []string) (json.RawMessage, []string, []byte, error) {
-		return s.SanitizeJSON(attrs, recovery, ty, paths)
+	return func(attrs json.RawMessage, recovery []byte, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error) {
+		return s.SanitizeJSON(attrs, recovery, ty, generationPaths, currentPaths)
 	}
 }
 
-// SanitizeJSON restores authoritative set identity before decoding and emits a
-// fresh public projection and recovery payload. A non-empty affected set with
-// no recovery is rejected because its redacted elements may already have
-// coalesced in an older artifact.
-func (s *Spec) SanitizeJSON(attrs json.RawMessage, recovery []byte, ty cty.Type, paths []string) (json.RawMessage, []string, []byte, error) {
-	effectivePaths := sortedUnique(paths)
+// SanitizeJSON opens the persisted projection under its generation-time
+// contract, then emits a fresh projection and recovery payload under the
+// current policy. A new policy may therefore withhold additional fields
+// without weakening the authenticated association of existing set recovery.
+func (s *Spec) SanitizeJSON(attrs json.RawMessage, recovery []byte, ty cty.Type, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error) {
+	effectivePaths := sortedUnique(currentPaths)
 	spec := &Spec{
 		paths:          effectivePaths,
 		exempt:         s.exempt,
 		setPrefixes:    affectedSets(s.allSetPrefixes, effectivePaths),
 		allSetPrefixes: s.allSetPrefixes,
 	}
-	var (
-		value cty.Value
-		err   error
-	)
-	if spec.HasSensitiveSets() {
-		value, err = spec.Restore(attrs, recovery, ty)
-	} else {
-		value, err = ctyjson.Unmarshal(attrs, ty)
-	}
+	value, err := spec.restoreGeneration(attrs, recovery, ty, generationPaths)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("decode typed attributes: %w", err)
 	}

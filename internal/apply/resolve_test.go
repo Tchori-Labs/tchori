@@ -152,7 +152,7 @@ func TestResolvePlannedUnknowns(t *testing.T) {
 			}),
 		},
 		{
-			name: "set with unknown element substituted wholesale by wholly-known cfg set",
+			name: "set with unknown element remains provider planned",
 			planned: cty.SetVal([]cty.Value{
 				cty.UnknownVal(cty.String),
 				cty.StringVal("known"),
@@ -162,8 +162,8 @@ func TestResolvePlannedUnknowns(t *testing.T) {
 				cty.StringVal("cfg2"),
 			}),
 			want: cty.SetVal([]cty.Value{
-				cty.StringVal("cfg1"),
-				cty.StringVal("cfg2"),
+				cty.UnknownVal(cty.String),
+				cty.StringVal("known"),
 			}),
 		},
 		{

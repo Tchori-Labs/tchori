@@ -102,26 +102,36 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 
 	ex := &executor{cfg: cfg, providers: providers, schemas: schemas, st: st, statePath: statePath, applied: map[string]cty.Value{}}
 	st.SetSensitiveResolver(func(addr string, rs *state.ResourceState) (state.Resolution, bool) {
-		if cfg == nil || cfg.Resources[addr] == nil {
-			return state.Resolution{}, false
+		providerName, typeName := rs.Provider, rs.Type
+		providerSource := rs.ProviderSource
+		var declared []string
+		var rawCfg map[string]any
+		if cfg != nil {
+			if res := cfg.Resources[addr]; res != nil {
+				providerName, typeName = res.Provider, res.Type
+				declared, rawCfg = res.SensitiveAttributes, res.Config
+			}
+			if pc := cfg.Providers[providerName]; pc != nil {
+				providerSource = pc.Source
+			}
 		}
-		res := cfg.Resources[addr]
-		ps := schemas[res.Provider]
+		ps := schemas[providerName]
 		if ps == nil {
 			return state.Resolution{}, false
 		}
-		sch, _, known := ps.LookupResourceType(res.Type)
+		sch, _, known := ps.LookupResourceType(typeName)
 		if !known || sch == nil {
 			return state.Resolution{}, false
 		}
-		spec, rds := sensitive.Resolve(sch.Block, res.SensitiveAttributes, res.Config)
+		spec, rds := sensitive.ResolveWithPersisted(sch.Block, declared, rs.SensitivePaths, rawCfg)
 		if rds.HasErrors() {
 			return state.Resolution{}, false
 		}
 		return state.Resolution{
 			Paths:              spec.Paths(),
-			ProviderSource:     cfg.Providers[res.Provider].Source,
+			ProviderSource:     providerSource,
 			SanitizeAttributes: spec.Sanitizer(sch.Block.ImpliedType()),
+			SanitizeBackup:     spec.Effective(nil).Sanitizer(sch.Block.ImpliedType()),
 		}, true
 	})
 
@@ -500,20 +510,20 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	ty := schema.Block.ImpliedType()
 	// Register full effective paths before any destroy removes the entry; the
 	// same save's backup must still scrub the departing resource.
-	var declared []string
+	var declared, persisted []string
 	var rawCfg map[string]any
 	if ex.cfg != nil && ex.cfg.Resources[addr] != nil {
 		declared = ex.cfg.Resources[addr].SensitiveAttributes
 		rawCfg = ex.cfg.Resources[addr].Config
 	}
-	spec, sds := sensitive.Resolve(schema.Block, declared, rawCfg)
+	if rs := ex.st.Resources[addr]; rs != nil {
+		persisted = rs.SensitivePaths
+	}
+	spec, sds := sensitive.ResolveWithPersisted(schema.Block, declared, persisted, rawCfg)
 	if sds.HasErrors() {
 		return sds
 	}
 	ex.st.NoteSensitive(addr, spec.Paths())
-	if rs := ex.st.Resources[addr]; rs != nil {
-		ex.st.NoteSensitive(addr, rs.SensitivePaths)
-	}
 
 	// Prior value and private bytes come from state (null/nil if absent) —
 	// except for "create", where the plan document is trusted over state
@@ -533,7 +543,7 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	var priorPrivate []byte
 	if ch.Action != "create" {
 		if rs := ex.st.Resources[addr]; rs != nil {
-			v, err := spec.Restore(rs.Attributes, rs.SensitiveSetRecovery, ty)
+			v, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, ty, rs.SensitivePaths)
 			if err != nil {
 				return diag.Diagnostics{diag.Errorf(addr, "corrupt state attributes", err.Error())}
 			}
@@ -554,14 +564,35 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	if ds.HasErrors() {
 		return ds
 	}
-
-	// Decode and validate the replacement before destroying the prior object.
-	// Resolve plan-time unknown references against dependency-ordered state.
-	planned, err := provider.DecodeMsgpack(ch.PlannedRaw, ty)
+	// Decode the reviewed plan. Sensitive-set plans deliberately carry
+	// unknown secret leaves, so apply re-plans them with the now-concrete
+	// composed configuration rather than replacing the entire provider plan
+	// with raw config. The re-plan is non-mutating and must satisfy the
+	// reviewed known-value contract as a multiset before any replace destroy.
+	reviewed, err := provider.DecodeMsgpack(ch.PlannedRaw, ty)
 	if err != nil {
 		return append(ds, diag.Errorf(addr, "corrupt planned value", err.Error()))
 	}
-	planned = resolvePlannedUnknowns(planned, cfgVal)
+	planned := reviewed
+	plannedPrivate := ch.Private
+	if spec.HasSensitiveSets() && !reviewed.IsWhollyKnown() {
+		proposed := provider.ProposedNew(schema.Block, prior, cfgVal)
+		replanned, pds := client.PlanResource(ctx, typeName, prior, proposed, cfgVal, priorPrivate)
+		pds = provider.Context(addr, pds)
+		ds = append(ds, pds...)
+		if pds.HasErrors() {
+			return ds
+		}
+		if !plannedContractMatches(reviewed, replanned.State) ||
+			!sameStrings(ch.RequiresReplace, replanned.RequiresReplace) {
+			return append(ds, diag.Errorf(addr, "sensitive set preflight diverged from reviewed plan",
+				"provider re-plan changed a reviewed non-sensitive value, collection membership, or replacement requirement; no resource mutation was attempted"))
+		}
+		planned = replanned.State
+		plannedPrivate = replanned.Private
+	} else {
+		planned = resolvePlannedUnknowns(reviewed, cfgVal)
+	}
 	if planned.IsNull() || !planned.IsKnown() {
 		return append(ds, diag.Errorf(addr, "invalid planned value", "create, update, and replace require a known, non-null resource object"))
 	}
@@ -582,9 +613,9 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 		if destroyDs.HasErrors() {
 			return ds
 		}
-		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, providerSource, addr, schema.Block, ty, cty.NullVal(ty), cfgVal, planned, ch)...)
+		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, providerSource, addr, schema.Block, ty, cty.NullVal(ty), cfgVal, planned, plannedPrivate, ch, spec)...)
 	default: // "create", "update"
-		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, providerSource, addr, schema.Block, ty, prior, cfgVal, planned, ch)...)
+		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, providerSource, addr, schema.Block, ty, prior, cfgVal, planned, plannedPrivate, ch, spec)...)
 	}
 }
 
@@ -613,16 +644,16 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 			return ds
 		}
 
-		var declared []string
+		var declared, persisted []string
 		var rawCfg map[string]any
 		if ex.cfg != nil && ex.cfg.Resources[addr] != nil {
 			declared = append(declared, ex.cfg.Resources[addr].SensitiveAttributes...)
 			rawCfg = ex.cfg.Resources[addr].Config
 		}
 		if old != nil {
-			declared = append(declared, old.SensitivePaths...)
+			persisted = old.SensitivePaths
 		}
-		spec, specDs := sensitive.Resolve(block, declared, rawCfg)
+		spec, specDs := sensitive.ResolveWithPersisted(block, declared, persisted, rawCfg)
 		ds = append(ds, specDs...)
 		if specDs.HasErrors() {
 			return ds
@@ -667,10 +698,10 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 
 // createOrUpdate applies the value prepared before any replace destroy leg,
 // then records the provider's returned state and saves.
-func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, providerSource, addr string, block *provider.SchemaBlock, ty cty.Type, prior, cfgVal, planned cty.Value, ch *plan.Change) diag.Diagnostics {
+func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, providerSource, addr string, block *provider.SchemaBlock, ty cty.Type, prior, cfgVal, planned cty.Value, plannedPrivate []byte, ch *plan.Change, spec *sensitive.Spec) diag.Diagnostics {
 	var ds diag.Diagnostics
 
-	newState, newPrivate, applyDs := client.ApplyResource(ctx, typeName, prior, planned, cfgVal, ch.Private)
+	newState, newPrivate, applyDs := client.ApplyResource(ctx, typeName, prior, planned, cfgVal, plannedPrivate)
 	applyDs = provider.Context(addr, applyDs)
 	ds = append(ds, applyDs...)
 	failed := applyDs.HasErrors()
@@ -695,12 +726,6 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 		consistencyDs = checkResultConsistency(addr, block, planned, cfgVal, newState)
 	}
 	if newState.IsNull() || !newState.IsKnown() {
-		return append(ds, consistencyDs...)
-	}
-	res := ex.cfg.Resources[addr] // composeConfig above verified this resource exists.
-	spec, specDs := sensitive.Resolve(block, res.SensitiveAttributes, res.Config)
-	ds = append(ds, specDs...)
-	if specDs.HasErrors() {
 		return append(ds, consistencyDs...)
 	}
 	// Keep the full result only in memory so same-run references resolve even
@@ -750,36 +775,12 @@ func unresolvedWarnings(st *state.State) diag.Diagnostics {
 // corresponding value from cfgVal, provided cfgVal actually has a concrete
 // (known, non-null) value there. Composite values recurse per-element:
 // objects and maps per-attribute/per-key (as before), and — fixing
-// Tchori-Labs/tchori-internal#11 (TC-033) — lists and tuples per-index, plus a
-// wholesale substitution rule for sets. Before this fix, a ${...} reference
-// nested inside a list (e.g. cloudflare's policies[].include[].
-// service_token.token_id) stayed unknown at apply and was sent to the
-// provider as null, requiring a second apply once the referenced resource
-// was in state; a plain create+create or create+update within a single
-// apply now resolves such nested references in one pass.
-//
-// Soundness argument for lists/tuples: planned and cfgVal decode the SAME
-// raw config at the SAME schema type, so when their lengths agree, index i
-// of planned and index i of cfgVal both derive from the same configured
-// element — the same correspondence guarantee that already justifies the
-// map branch's per-key merge, just keyed by position instead of by map key.
-// A wholly-unknown list/tuple is already replaced wholesale by the
-// top-of-function !planned.IsKnown() branch, so this per-index recursion
-// only ever runs on a list/tuple whose *elements* are individually
-// known/unknown. When lengths disagree (a provider-side length change, or
-// cfgVal not actually known/non-null), no sound positional correspondence
-// exists, so planned is returned unchanged rather than risk misaligning
-// elements.
-//
-// Sets have no stable per-element index at all (cty sets are unordered and
-// de-duplicated), so there is no sound per-element merge rule. Instead, if
-// planned is not wholly known and cfgVal is a known, non-null, wholly-known
-// set, the whole set is substituted with cfgVal; otherwise planned passes
-// through unchanged. This trades away preserving any provider-planned
-// modification to an individual set element in favor of resolving the
-// reference — acceptable here because this branch only ever fires when the
-// set actually contains unresolved unknowns (a wholly-known planned set is
-// returned unchanged, same as any other known leaf).
+// Tchori-Labs/tchori-internal#11 (TC-033) — lists and tuples per-index.
+// Planned and cfgVal decode the same raw config at the same schema type, so
+// positional collections can resolve unknown references only when lengths
+// agree. Sets intentionally have no merge rule: their elements have no stable
+// identity. Sensitive sets are concretized by a provider re-plan plus the
+// reviewed-contract check in applyChange.
 func resolvePlannedUnknowns(planned, cfgVal cty.Value) cty.Value {
 	if !planned.IsKnown() {
 		if cfgVal.IsKnown() && !cfgVal.IsNull() {
@@ -881,18 +882,107 @@ func resolvePlannedUnknowns(planned, cfgVal cty.Value) cty.Value {
 		return cty.TupleVal(elems)
 
 	case ty.IsSetType():
-		// Sets have no stable per-element index, so there is no sound
-		// per-element merge; substitute the whole set only when planned
-		// actually contains unresolved unknowns and cfgVal is a concrete,
-		// wholly-known replacement. Otherwise leave planned untouched.
-		if !planned.IsWhollyKnown() && cfgVal.IsKnown() && !cfgVal.IsNull() && cfgVal.IsWhollyKnown() {
-			return cfgVal
-		}
 		return planned
 
 	default:
 		return planned
 	}
+}
+
+// plannedContractMatches checks that an apply-time provider re-plan preserves
+// every reviewed known value and collection membership. Unknown reviewed
+// leaves are wildcards. Sets use a full bipartite match rather than index
+// association, so duplicate public projections cannot coalesce.
+func plannedContractMatches(reviewed, current cty.Value) bool {
+	if reviewed == cty.NilVal || current == cty.NilVal || !reviewed.Type().Equals(current.Type()) {
+		return false
+	}
+	if !reviewed.IsKnown() {
+		return true
+	}
+	if !current.IsKnown() || reviewed.IsNull() != current.IsNull() {
+		return false
+	}
+	if reviewed.IsNull() {
+		return true
+	}
+
+	ty := reviewed.Type()
+	switch {
+	case ty.IsObjectType():
+		for name := range ty.AttributeTypes() {
+			if !plannedContractMatches(reviewed.GetAttr(name), current.GetAttr(name)) {
+				return false
+			}
+		}
+		return true
+	case ty.IsMapType():
+		reviewedValues, currentValues := reviewed.AsValueMap(), current.AsValueMap()
+		if len(reviewedValues) != len(currentValues) {
+			return false
+		}
+		for key, value := range reviewedValues {
+			other, ok := currentValues[key]
+			if !ok || !plannedContractMatches(value, other) {
+				return false
+			}
+		}
+		return true
+	case ty.IsListType(), ty.IsTupleType():
+		reviewedValues, currentValues := reviewed.AsValueSlice(), current.AsValueSlice()
+		if len(reviewedValues) != len(currentValues) {
+			return false
+		}
+		for i := range reviewedValues {
+			if !plannedContractMatches(reviewedValues[i], currentValues[i]) {
+				return false
+			}
+		}
+		return true
+	case ty.IsSetType():
+		reviewedValues, currentValues := reviewed.AsValueSlice(), current.AsValueSlice()
+		if len(reviewedValues) != len(currentValues) {
+			return false
+		}
+		matched := make([]bool, len(currentValues))
+		var match func(int, []bool) bool
+		match = func(i int, seen []bool) bool {
+			if i == len(reviewedValues) {
+				return true
+			}
+			for j := range currentValues {
+				if seen[j] || !plannedContractMatches(reviewedValues[i], currentValues[j]) {
+					continue
+				}
+				seen[j] = true
+				matched[j] = true
+				if match(i+1, seen) {
+					return true
+				}
+				matched[j] = false
+				seen[j] = false
+			}
+			return false
+		}
+		return match(0, matched)
+	default:
+		return reviewed.RawEquals(current)
+	}
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	a, b = append([]string(nil), a...), append([]string(nil), b...)
+	sort.Strings(a)
+	sort.Strings(b)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveRef resolves a ${type.name.attr} reference against the current
