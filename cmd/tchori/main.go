@@ -4,8 +4,10 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -110,9 +112,11 @@ func newRootCmd() *cobra.Command {
 }
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 	root := newRootCmd()
 	root.SetArgs(normalizeArgs(os.Args[1:]))
-	if err := root.Execute(); err != nil {
+	if err := root.ExecuteContext(ctx); err != nil {
 		// Reached only for errors cobra surfaces itself (unknown command,
 		// bad flag, wrong arg count, -chdir failure) — command bodies exit
 		// via exitRun and never return an error here.

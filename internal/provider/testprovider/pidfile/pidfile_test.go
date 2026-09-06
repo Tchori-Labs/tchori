@@ -82,3 +82,21 @@ func TestWriteNeverObservedEmpty(t *testing.T) {
 		t.Fatal("reader observed a zero-length PID file mid-write")
 	}
 }
+
+func TestWriteFailurePreservesDestination(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "provider.pid")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := pidfile.Write(path, 4242); err == nil {
+		t.Fatal("publishing over a directory must fail")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "provider.pid" || !entries[0].IsDir() {
+		t.Fatalf("failed publication changed destination or left staging files: %v", entries)
+	}
+}

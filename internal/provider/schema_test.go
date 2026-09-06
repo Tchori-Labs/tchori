@@ -254,3 +254,155 @@ func TestProtocol6SensitiveAttributePropagation(t *testing.T) {
 		t.Fatal("protocol-6 Sensitive flag was dropped")
 	}
 }
+
+// TestNestedTypeAttributeSensitivityPreserved guards issue #73: a leaf
+// attribute's Sensitive bit must survive schema conversion when it is
+// nested inside a nested_type attribute (pa.NestedType), exactly as it
+// already does when nested inside a legacy nested *block* (pb.BlockTypes,
+// see TestProtocol6SensitiveAttributePropagation's block.Blocks analogue).
+// A provider whose "token" leaf is Sensitive but whose wrapping
+// "credentials" object is not is exactly the shape the plugin framework
+// emits for e.g. a computed API-credentials object with one secret field.
+// Today nestedObjectType collapses nested attributes straight into a bare
+// cty.Type (which cannot carry a Sensitive bit) and discards pa.Sensitive
+// for every nested attribute, so this test's assertions against
+// Attr.NestedType — the per-leaf metadata map the fix in schema.go adds —
+// fail to compile until that fix lands; that is the expected red-before-
+// green signal for this regression.
+func TestNestedTypeAttributeSensitivityPreserved(t *testing.T) {
+	sensitiveLeaf := func(nesting tfplugin6.Schema_Object_NestingMode) *tfplugin6.Schema_Attribute {
+		return &tfplugin6.Schema_Attribute{
+			Name:     "credentials",
+			Optional: true,
+			NestedType: &tfplugin6.Schema_Object{
+				Nesting: nesting,
+				Attributes: []*tfplugin6.Schema_Attribute{
+					{Name: "user", Type: []byte(`"string"`), Optional: true},
+					{Name: "token", Type: []byte(`"string"`), Optional: true, Sensitive: true},
+				},
+			},
+		}
+	}
+
+	for _, nm := range []struct {
+		name    string
+		nesting tfplugin6.Schema_Object_NestingMode
+	}{
+		{"single", tfplugin6.Schema_Object_SINGLE},
+		{"list", tfplugin6.Schema_Object_LIST},
+		{"set", tfplugin6.Schema_Object_SET},
+		{"map", tfplugin6.Schema_Object_MAP},
+	} {
+		t.Run("nested_type/"+nm.name, func(t *testing.T) {
+			block, err := blockFromProto(&tfplugin6.Schema_Block{
+				Attributes: []*tfplugin6.Schema_Attribute{sensitiveLeaf(nm.nesting)},
+			})
+			if err != nil {
+				t.Fatalf("blockFromProto: %v", err)
+			}
+			attr := block.Attributes["credentials"]
+			if attr == nil {
+				t.Fatal("credentials attribute missing from converted block")
+			}
+			// The wrapping attribute itself is correctly not Sensitive: the
+			// provider only marked the "token" leaf.
+			if attr.Sensitive {
+				t.Fatal("wrapping attribute unexpectedly Sensitive; the provider only marked the \"token\" leaf, not \"credentials\" itself")
+			}
+			if attr.NestedType == nil {
+				t.Fatal("Attr.NestedType is nil for a nested_type attribute; per-leaf metadata (Sensitive included) was not preserved")
+			}
+			user := attr.NestedType["user"]
+			if user == nil || user.Sensitive {
+				t.Fatalf("NestedType[%q] = %+v, want a non-sensitive leaf", "user", user)
+			}
+			token := attr.NestedType["token"]
+			if token == nil || !token.Sensitive {
+				t.Fatalf("NestedType[%q] = %+v, want Sensitive=true (provider declared pa.Sensitive on this leaf)", "token", token)
+			}
+		})
+	}
+}
+
+// TestNestedTypeSensitivityPreservedAtAnyDepth extends
+// TestNestedTypeAttributeSensitivityPreserved to a nested_type attribute
+// nested inside another nested_type attribute (the same arbitrary-depth
+// shape TestBlockFromProtoNestedType's "nested inside nested" case
+// exercises for types): the deepest leaf's Sensitive bit must survive
+// identically regardless of how many nested_type levels sit above it,
+// because Attr.NestedType recurses the same way SchemaBlock/NestedBlock
+// already does for legacy blocks.
+func TestNestedTypeSensitivityPreservedAtAnyDepth(t *testing.T) {
+	block, err := blockFromProto(&tfplugin6.Schema_Block{
+		Attributes: []*tfplugin6.Schema_Attribute{{
+			Name:     "data",
+			Optional: true,
+			NestedType: &tfplugin6.Schema_Object{
+				Nesting: tfplugin6.Schema_Object_SINGLE,
+				Attributes: []*tfplugin6.Schema_Attribute{
+					{Name: "kind", Type: []byte(`"string"`), Required: true},
+					{
+						Name:     "detail",
+						Optional: true,
+						NestedType: &tfplugin6.Schema_Object{
+							Nesting: tfplugin6.Schema_Object_LIST,
+							Attributes: []*tfplugin6.Schema_Attribute{
+								{Name: "note", Type: []byte(`"string"`), Optional: true},
+								{Name: "secret", Type: []byte(`"string"`), Optional: true, Sensitive: true},
+							},
+						},
+					},
+				},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("blockFromProto: %v", err)
+	}
+	dataAttr := block.Attributes["data"]
+	if dataAttr == nil || dataAttr.NestedType == nil {
+		t.Fatal("data attribute missing NestedType metadata")
+	}
+	detailAttr := dataAttr.NestedType["detail"]
+	if detailAttr == nil || detailAttr.NestedType == nil {
+		t.Fatal("data.detail attribute missing NestedType metadata")
+	}
+	secretAttr := detailAttr.NestedType["secret"]
+	if secretAttr == nil || !secretAttr.Sensitive {
+		t.Fatalf("data.detail.secret = %+v, want Sensitive=true", secretAttr)
+	}
+	noteAttr := detailAttr.NestedType["note"]
+	if noteAttr == nil || noteAttr.Sensitive {
+		t.Fatalf("data.detail.note = %+v, want Sensitive=false", noteAttr)
+	}
+}
+
+// TestNestedTypeVsNestedBlockSensitivityRepresentation documents the real
+// boundary distinction issue #73 is about: legacy nested *blocks*
+// (pb.BlockTypes) already preserve a leaf's Sensitive bit today, by
+// recursing into another full *SchemaBlock. nested_type attributes must
+// reach the same outcome through Attr.NestedType instead, since
+// Schema_Object has no BlockTypes of its own to recurse into.
+func TestNestedTypeVsNestedBlockSensitivityRepresentation(t *testing.T) {
+	block, err := blockFromProto(&tfplugin6.Schema_Block{
+		BlockTypes: []*tfplugin6.Schema_NestedBlock{{
+			TypeName: "credentials",
+			Nesting:  tfplugin6.Schema_NestedBlock_LIST,
+			Block: &tfplugin6.Schema_Block{Attributes: []*tfplugin6.Schema_Attribute{
+				{Name: "user", Type: []byte(`"string"`), Optional: true},
+				{Name: "token", Type: []byte(`"string"`), Optional: true, Sensitive: true},
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("blockFromProto: %v", err)
+	}
+	nested := block.Blocks["credentials"]
+	if nested == nil || nested.Block == nil {
+		t.Fatal("credentials nested block missing from converted block")
+	}
+	tokenAttr := nested.Block.Attributes["token"]
+	if tokenAttr == nil || !tokenAttr.Sensitive {
+		t.Fatal("legacy nested block lost the \"token\" leaf's Sensitive bit — the contrast this suite relies on no longer holds")
+	}
+}

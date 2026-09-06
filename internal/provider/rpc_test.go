@@ -29,6 +29,42 @@ func (f *fakeImportProviderClient) ImportResourceState(_ context.Context, _ *tfp
 	return f.resp, f.err
 }
 
+// fakePlanProviderClient embeds the (nil) generated interface so it only
+// needs to implement PlanResourceChange for these unit tests.
+type fakePlanProviderClient struct {
+	tfplugin6.ProviderClient
+	resp *tfplugin6.PlanResourceChange_Response
+	err  error
+}
+
+func (f *fakePlanProviderClient) PlanResourceChange(_ context.Context, _ *tfplugin6.PlanResourceChange_Request, _ ...grpc.CallOption) (*tfplugin6.PlanResourceChange_Response, error) {
+	return f.resp, f.err
+}
+
+// fakeApplyProviderClient embeds the (nil) generated interface so it only
+// needs to implement ApplyResourceChange for these unit tests.
+type fakeApplyProviderClient struct {
+	tfplugin6.ProviderClient
+	resp *tfplugin6.ApplyResourceChange_Response
+	err  error
+}
+
+func (f *fakeApplyProviderClient) ApplyResourceChange(_ context.Context, _ *tfplugin6.ApplyResourceChange_Request, _ ...grpc.CallOption) (*tfplugin6.ApplyResourceChange_Response, error) {
+	return f.resp, f.err
+}
+
+// fakeReadProviderClient embeds the (nil) generated interface so it only
+// needs to implement ReadResource for these unit tests.
+type fakeReadProviderClient struct {
+	tfplugin6.ProviderClient
+	resp *tfplugin6.ReadResource_Response
+	err  error
+}
+
+func (f *fakeReadProviderClient) ReadResource(_ context.Context, _ *tfplugin6.ReadResource_Request, _ ...grpc.CallOption) (*tfplugin6.ReadResource_Response, error) {
+	return f.resp, f.err
+}
+
 // buildFakeProviderForRPC compiles the Task 5 fake provider into a temp dir
 // and returns the binary path. Named distinctively so it cannot collide with
 // build helpers defined by client_test.go or build_test.go.
@@ -300,6 +336,149 @@ func TestImportResource(t *testing.T) {
 			t.Fatalf("ImportResource(multi results): summary = %q, want %q", ds[0].Summary, "multi-resource import not supported")
 		}
 	})
+
+	t.Run("deferred", func(t *testing.T) {
+		// BUG: ImportResource ignores a non-nil Deferred marker and decodes
+		// the (possibly stale or absent) imported state anyway. The engine
+		// has no deferred-operation support, so a deferred response must be
+		// rejected explicitly instead of silently accepted.
+		c := &Client{grpc: &fakeImportProviderClient{resp: &tfplugin6.ImportResourceState_Response{
+			ImportedResources: []*tfplugin6.ImportResourceState_ImportedResource{
+				{TypeName: "tchoritest_thing", State: dv, Private: []byte("priv")},
+			},
+			Deferred: &tfplugin6.Deferred{Reason: tfplugin6.Deferred_ABSENT_PREREQ},
+		}}}
+		_, _, ds := c.ImportResource(ctx, "tchoritest_thing", "Xid-foo", ty)
+		if !ds.HasErrors() {
+			t.Fatalf("ImportResource(deferred): want error diagnostics rejecting the deferred response, got %v", ds)
+		}
+	})
+
+	t.Run("type mismatch", func(t *testing.T) {
+		// BUG: a single ImportedResource whose TypeName does not match the
+		// requested typeName is accepted as long as its state happens to
+		// decode at the caller's schema (schemas can coincidentally match
+		// across resource types). ImportResource must validate TypeName.
+		c := &Client{grpc: &fakeImportProviderClient{resp: &tfplugin6.ImportResourceState_Response{
+			ImportedResources: []*tfplugin6.ImportResourceState_ImportedResource{
+				{TypeName: "tchoritest_other", State: dv, Private: []byte("priv")},
+			},
+		}}}
+		_, _, ds := c.ImportResource(ctx, "tchoritest_thing", "Xid-foo", ty)
+		if !ds.HasErrors() {
+			t.Fatalf("ImportResource(type mismatch): want error diagnostics rejecting a wrong-typed import, got %v", ds)
+		}
+	})
+}
+
+// TestPlanResourceRejectsDeferred covers BUG (1): PlanResource must reject a
+// non-nil Deferred response explicitly rather than silently decoding a
+// (likely absent) PlannedState as a null value. The engine has no
+// deferred-operation support, so a deferred PlanResourceChange response is a
+// protocol condition the caller cannot act on correctly and must surface as
+// an error instead of feeding a bogus "create" plan downstream.
+func TestPlanResourceRejectsDeferred(t *testing.T) {
+	ctx := context.Background()
+	ty := cty.Object(map[string]cty.Type{"id": cty.String})
+	nullVal := cty.NullVal(ty)
+
+	c := &Client{grpc: &fakePlanProviderClient{resp: &tfplugin6.PlanResourceChange_Response{
+		// PlannedState deliberately left nil, matching what a deferring
+		// provider commonly omits; the response is what a real deferred
+		// PlanResourceChange looks like on the wire.
+		Deferred: &tfplugin6.Deferred{Reason: tfplugin6.Deferred_RESOURCE_CONFIG_UNKNOWN},
+	}}}
+	pc, ds := c.PlanResource(ctx, "tchoritest_thing", nullVal, nullVal, nullVal, nil)
+	if !ds.HasErrors() {
+		t.Fatalf("PlanResource(deferred): want error diagnostics rejecting the deferred response, got pc=%#v ds=%v", pc, ds)
+	}
+}
+
+// TestReadResourceRejectsDeferred covers BUG (1)'s ReadResource half: a
+// deferred read with no NewState currently decodes to a null value, which
+// callers read as "resource was deleted" and the planner then proposes a
+// create instead of a no-op refresh. ReadResource must reject the deferred
+// response before any null decoding happens.
+func TestReadResourceRejectsDeferred(t *testing.T) {
+	ctx := context.Background()
+	current := cty.ObjectVal(map[string]cty.Value{"id": cty.StringVal("Xid-foo")})
+
+	c := &Client{grpc: &fakeReadProviderClient{resp: &tfplugin6.ReadResource_Response{
+		// NewState deliberately left nil: today this decodes to a null
+		// value of current's type, which reads as "deleted" to the caller.
+		Deferred: &tfplugin6.Deferred{Reason: tfplugin6.Deferred_PROVIDER_CONFIG_UNKNOWN},
+	}}}
+	got, _, ds := c.ReadResource(ctx, "tchoritest_thing", current, nil)
+	if !ds.HasErrors() {
+		t.Fatalf("ReadResource(deferred): want error diagnostics rejecting the deferred response, got state=%#v ds=%v", got, ds)
+	}
+}
+
+// TestApplyResourcePreservesPartialStateOnError covers BUG (2): today
+// ApplyResource discards any returned NewState/Private whenever the
+// provider's diagnostics contain an error, returning cty.NilVal even when
+// the provider deliberately returned a decodeable partial state (e.g. one
+// nested object created before a later one failed, or — as tchori's own
+// fake providers do for "explode"/"api_400" — the prior state kept
+// specifically to disambiguate from deletion). The caller needs that
+// recoverable state to persist it; only an undecodeable NewState should
+// still yield cty.NilVal.
+func TestApplyResourcePreservesPartialStateOnError(t *testing.T) {
+	ctx := context.Background()
+	ty := cty.Object(map[string]cty.Type{"id": cty.String, "name": cty.String})
+	partial := cty.ObjectVal(map[string]cty.Value{
+		"id":   cty.StringVal("Xid-foo"),
+		"name": cty.StringVal("foo"),
+	})
+	dv, err := EncodeDynamic(partial, ty)
+	if err != nil {
+		t.Fatalf("EncodeDynamic: %v", err)
+	}
+
+	c := &Client{grpc: &fakeApplyProviderClient{resp: &tfplugin6.ApplyResourceChange_Response{
+		NewState: dv,
+		Private:  []byte("partial-priv"),
+		Diagnostics: []*tfplugin6.Diagnostic{
+			{Severity: tfplugin6.Diagnostic_ERROR, Summary: "apply exploded"},
+		},
+	}}}
+	got, priv, ds := c.ApplyResource(ctx, "tchoritest_thing", cty.NullVal(ty), partial, partial, nil)
+	if !ds.HasErrors() {
+		t.Fatalf("ApplyResource(partial failure): want error diagnostics, got none")
+	}
+	if got == cty.NilVal || !got.RawEquals(partial) {
+		t.Fatalf("ApplyResource(partial failure): state = %#v, want recoverable partial state %#v preserved despite the error", got, partial)
+	}
+	if string(priv) != "partial-priv" {
+		t.Fatalf("ApplyResource(partial failure): private = %q, want %q preserved alongside the error", priv, "partial-priv")
+	}
+}
+
+// TestApplyResourceUndecodeableStateStillNilOnError proves the fix does not
+// paper over a genuinely broken NewState: if the bytes the provider returned
+// alongside its error diagnostics fail to decode, ApplyResource must still
+// surface a decode error and return cty.NilVal rather than fabricate state.
+func TestApplyResourceUndecodeableStateStillNilOnError(t *testing.T) {
+	ctx := context.Background()
+	ty := cty.Object(map[string]cty.Type{"id": cty.String, "name": cty.String})
+	planned := cty.ObjectVal(map[string]cty.Value{
+		"id":   cty.StringVal("Xid-foo"),
+		"name": cty.StringVal("foo"),
+	})
+
+	c := &Client{grpc: &fakeApplyProviderClient{resp: &tfplugin6.ApplyResourceChange_Response{
+		NewState: &tfplugin6.DynamicValue{Msgpack: []byte("not valid msgpack")},
+		Diagnostics: []*tfplugin6.Diagnostic{
+			{Severity: tfplugin6.Diagnostic_ERROR, Summary: "apply exploded"},
+		},
+	}}}
+	got, _, ds := c.ApplyResource(ctx, "tchoritest_thing", cty.NullVal(ty), planned, planned, nil)
+	if !ds.HasErrors() {
+		t.Fatalf("ApplyResource(undecodeable partial state): want error diagnostics, got none")
+	}
+	if got != cty.NilVal {
+		t.Fatalf("ApplyResource(undecodeable partial state): state = %#v, want cty.NilVal", got)
+	}
 }
 
 // TestProviderRPCImportResourceState drives ImportResource against the real

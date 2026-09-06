@@ -15,7 +15,7 @@ Status: **0.1.0-dev** — pre-MVP, under active development, built in public.
 ## The four differentiators
 
 1. **Structured plan API.** `tchori plan -out plan.json` writes a
-   schema-versioned, deterministic plan document (`"format_version": "1.0"`)
+   schema-versioned plan document (`"format_version": "1.1"`)
    — the reviewable artifact that lives in the PR. `tchori apply plan.json`
    executes exactly that plan and refuses stale ones (state serial mismatch).
    There is no plan-less apply.
@@ -121,6 +121,10 @@ Create `main.tchori.json` in an empty directory:
 Then, from that directory (`PD=--plugin-dir=$HOME/.tchori/dev-plugins`):
 
 ```sh
+# Generate once for this workspace; store securely and reuse on later runs.
+# Prefer injecting the saved key from your secret manager.
+export TCHORI_ARTIFACT_KEY="$(openssl rand -base64 32)"
+
 tchori validate $PD                  # exit 0: config is valid
 tchori plan $PD -out plan.json       # exit 2: changes present
 tchori apply $PD plan.json           # exit 0: applied; state.json written
@@ -156,11 +160,12 @@ No changes. Configuration matches state.
 Exit codes follow the Terraform convention agents already know:
 `0` success / no changes · `2` plan has changes · `1` error.
 
-State is a deterministic, git-diffable `state.json` in the working directory
+State is a structured, git-diffable `state.json` in the working directory
 (flock-protected, with concurrent modifications rejected before sidecars or the
-state file are changed). `state.json.backup` is written before every mutation;
-it is byte-copied only when no sensitive path is known and otherwise parsed and
-sanitized before a rename that never writes through a symlink and always lands
+state file are changed). Opaque provider private bytes are authenticated and
+encrypted; fresh nonces mean ciphertext changes even when its plaintext does
+not. `state.json.backup` is sanitized and encrypted before a rename that never
+writes through a symlink and always lands
 as a fresh, owner-only regular file on POSIX. Commits fsync the complete temp file before
 atomic replacement and fsync the directory before returning, so reported
 success is durable across abrupt host failure. On Windows the directory-fsync
@@ -230,18 +235,34 @@ stable indices, so no exemption applies inside them. Backups, delete plans,
 orphan handling, and `state show`/MCP rendering are deliberately path-level
 and may mask a literal while config remains authoritative.
 
-Removing a `sensitive_attributes` entry makes the current live resolution
-authoritative on the next save-producing apply, restoring that value to
-`state.json`; the backup of the previous document is still scrubbed using its
-previously persisted paths. Provider `nested_type` conversion does not yet
-retain per-leaf sensitivity, so use the override for those leaves.
+Removing a `sensitive_attributes` entry does **not** declassify a path already
+recorded in state. Saves union current schema/config sensitivity with persisted
+paths and hints, including for untouched resources and backups. Provider
+`nested_type` conversion retains per-leaf sensitivity through nested
+objects, lists, sets, and maps; overrides remain useful for providers that
+omit their sensitivity flags.
 
-Provider-free read commands mask recorded `sensitive_paths` without writing
-state. A legacy entry carrying neither `sensitive_paths` nor
-`sensitive_scanned` cannot be identified without launching a provider and is
-rendered with a warning. Plan and a no-op apply write nothing, so if an older
-state already leaked a credential, rotate it and purge `state.json`,
-`state.json.backup`, and git history manually.
+Provider-free read commands mask recorded `sensitive_paths` and legacy
+`redacted` hints without writing state. For entries whose sensitivity has not
+been recorded, use
+`tchori state show ADDRESS --discover-sensitive` to discover schema/config
+sensitivity and mask the output without writing state. Use
+`tchori state sanitize` to scrub the current state and its backup explicitly,
+without applying infrastructure changes. Both opt-in operations need the
+matching config and installed providers. A changed resource identity or
+attributes incompatible with the schema are rejected before writing.
+Sanitization of a hinted orphan masks its known paths in state and backup but
+exits `1`: without a matching schema, its remaining values are unresolved.
+An entry without configuration or hints is rejected without writing.
+Neither operation revokes a leaked credential or removes historical commits:
+rotate exposed credentials and purge repository history separately.
+
+Opaque provider private bytes are encrypted with `TCHORI_ARTIFACT_KEY`, a
+base64-encoded 32-byte key supplied only through the environment. Apply and
+import validate it before resource mutations. Keep the same key available for
+reading encrypted state/plans and restoring backups; losing it loses access
+to the private provider data. Do not commit or print the key, or regenerate
+it for each invocation. See [artifact key management](docs/configuration.md#artifact-encryption-key).
 
 ### Importing existing infrastructure
 

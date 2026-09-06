@@ -16,6 +16,46 @@ func testBlock(nesting string) *provider.SchemaBlock {
 	}, Blocks: map[string]*provider.NestedBlock{"rules": {Nesting: nesting, Block: inner}}}
 }
 
+func TestNestedTypeLeafRedaction(t *testing.T) {
+	for _, nesting := range []string{"single", "list", "set", "map"} {
+		t.Run(nesting, func(t *testing.T) {
+			value := cty.ObjectVal(map[string]cty.Value{"user": cty.StringVal("alice"), "token": cty.StringVal("synthetic-private-value")})
+			switch nesting {
+			case "list":
+				value = cty.ListVal([]cty.Value{value})
+			case "set":
+				value = cty.SetVal([]cty.Value{value})
+			case "map":
+				value = cty.MapVal(map[string]cty.Value{"primary": value})
+			}
+			block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+				"credentials": {Type: value.Type(), NestedType: map[string]*provider.Attr{
+					"user": {Type: cty.String}, "token": {Type: cty.String, Sensitive: true},
+				}},
+			}}
+			spec, ds := Resolve(block, nil, nil)
+			if ds.HasErrors() {
+				t.Fatal(ds)
+			}
+			out, _, err := spec.Redact(cty.ObjectVal(map[string]cty.Value{"credentials": value}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			credentials := out.GetAttr("credentials")
+			if nesting != "single" {
+				it := credentials.ElementIterator()
+				if !it.Next() {
+					t.Fatal("redaction removed the credentials container")
+				}
+				_, credentials = it.Element()
+			}
+			if !credentials.GetAttr("token").IsNull() || credentials.GetAttr("user").AsString() != "alice" {
+				t.Fatal("nested schema sensitivity must redact only the secret leaf")
+			}
+		})
+	}
+}
+
 func TestResolveAndEffectiveMixedInstances(t *testing.T) {
 	s, ds := Resolve(testBlock("list"), []string{"note", "note"}, map[string]any{
 		"rules": []any{map[string]any{"token": "literal"}, map[string]any{"token": "${thing.a.id}"}}, //nolint:gosec // schema attribute name in synthetic redaction input

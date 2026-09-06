@@ -17,6 +17,26 @@ func scalarBlock(sensitive bool) *provider.SchemaBlock {
 	}, Blocks: map[string]*provider.NestedBlock{}}
 }
 
+func TestNestedTypeConsistencyDiagnosticRedactsSecret(t *testing.T) {
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"credentials": {
+			Type:       cty.Object(map[string]cty.Type{"token": cty.String}),
+			NestedType: map[string]*provider.Attr{"token": {Type: cty.String, Sensitive: true}},
+		},
+	}}
+	planned := cty.ObjectVal(map[string]cty.Value{"credentials": cty.ObjectVal(map[string]cty.Value{"token": cty.StringVal("synthetic-before")})})
+	applied := cty.ObjectVal(map[string]cty.Value{"credentials": cty.ObjectVal(map[string]cty.Value{"token": cty.StringVal("synthetic-after")})})
+	ds := checkResultConsistency("test.demo", block, planned, planned, applied)
+	if !ds.HasErrors() {
+		t.Fatal("changed authored value must report inconsistency")
+	}
+	for _, d := range ds {
+		if strings.Contains(d.Detail, "synthetic-before") || strings.Contains(d.Detail, "synthetic-after") {
+			t.Fatal("nested sensitive values leaked in consistency diagnostic")
+		}
+	}
+}
+
 func scalarRoot(id, flag cty.Value) cty.Value {
 	return cty.ObjectVal(map[string]cty.Value{"id": id, "flag": flag})
 }

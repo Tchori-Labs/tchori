@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6/tf6server"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
@@ -726,6 +727,21 @@ func (s *server) planNestedThing(req *tfprotov6.PlanResourceChangeRequest) (*tfp
 }
 
 func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyResourceChangeRequest) (*tfprotov6.ApplyResourceChangeResponse, error) {
+	if path := os.Getenv("TCHORITEST_VERIFY_STATE_LOCK"); path != "" {
+		lock := flock.New(path + ".lock")
+		defer func() { _ = lock.Close() }()
+		locked, err := lock.TryLock()
+		if err != nil {
+			return nil, err
+		}
+		if locked {
+			return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: []*tfprotov6.Diagnostic{{
+				Severity: tfprotov6.DiagnosticSeverityError,
+				Summary:  "concurrent state mutation possible",
+				Detail:   "state lock was released during provider apply",
+			}}}, nil
+		}
+	}
 	if !knownResourceType(req.TypeName) {
 		return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: []*tfprotov6.Diagnostic{unknownResourceTypeDiagnostic(req.TypeName)}}, nil
 	}
@@ -820,6 +836,17 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 	newDV, err := tfprotov6.NewDynamicValue(thingType, tftypes.NewValue(thingType, attrs))
 	if err != nil {
 		return nil, err
+	}
+	if name == "partial_failure" {
+		return &tfprotov6.ApplyResourceChangeResponse{
+			NewState: &newDV,
+			Private:  []byte("partial-recovery"),
+			Diagnostics: []*tfprotov6.Diagnostic{{
+				Severity: tfprotov6.DiagnosticSeverityError,
+				Summary:  "post-create operation failed",
+				Detail:   "resource exists, but its follow-up operation failed",
+			}},
+		}, nil
 	}
 	return &tfprotov6.ApplyResourceChangeResponse{
 		NewState: &newDV,

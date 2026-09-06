@@ -317,6 +317,7 @@ func (a *protocol5Adapter) PlanResourceChange(ctx context.Context, in *tfplugin6
 		PlannedPrivate:   resp.PlannedPrivate,
 		Diagnostics:      diagnostics5to6(resp.Diagnostics),
 		LegacyTypeSystem: resp.LegacyTypeSystem,
+		Deferred:         deferred5to6(resp.Deferred),
 	}, nil
 }
 

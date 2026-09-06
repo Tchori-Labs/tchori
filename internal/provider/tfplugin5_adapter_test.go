@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"google.golang.org/grpc"
+
 	"github.com/tchori-labs/tchori/internal/provider/proto/tfplugin5"
 	"github.com/tchori-labs/tchori/internal/provider/proto/tfplugin6"
 )
@@ -41,6 +43,41 @@ func TestProtocol5GatewayHTMLDiagnosticContext(t *testing.T) {
 	ds = Context("tchoritest5_thing.web", ds)
 	if len(ds) != 2 || ds[0].Address != "tchoritest5_thing.web" || ds[1].Severity != "warning" || ds[1].Address != "tchoritest5_thing.web" {
 		t.Fatalf("contextual protocol-5 diagnostics = %#v", ds)
+	}
+}
+
+// fakePlan5Client embeds the (nil) generated tfplugin5 interface so it only
+// needs to implement PlanResourceChange for this unit test.
+type fakePlan5Client struct {
+	tfplugin5.ProviderClient
+	resp *tfplugin5.PlanResourceChange_Response
+	err  error
+}
+
+func (f *fakePlan5Client) PlanResourceChange(_ context.Context, _ *tfplugin5.PlanResourceChange_Request, _ ...grpc.CallOption) (*tfplugin5.PlanResourceChange_Response, error) {
+	return f.resp, f.err
+}
+
+// TestProtocol5AdapterPlanResourceChangePreservesDeferred covers BUG (1)'s
+// v5-adapter half: PlanResourceChange's response-building switch (unlike
+// ReadResource's and ImportResourceState's) never copies the underlying
+// tfplugin5 Deferred marker into the tfplugin6.PlanResourceChange_Response
+// it hands back, so a protocol-5 provider deferring a plan looks
+// indistinguishable from one that didn't defer at all — silently defeating
+// any engine-side "reject deferred" check layered on top of the adapter.
+func TestProtocol5AdapterPlanResourceChangePreservesDeferred(t *testing.T) {
+	a := &protocol5Adapter{client: &fakePlan5Client{resp: &tfplugin5.PlanResourceChange_Response{
+		Deferred: &tfplugin5.Deferred{Reason: tfplugin5.Deferred_RESOURCE_CONFIG_UNKNOWN},
+	}}}
+	resp, err := a.PlanResourceChange(context.Background(), &tfplugin6.PlanResourceChange_Request{TypeName: "tchoritest5_thing"})
+	if err != nil {
+		t.Fatalf("PlanResourceChange: %v", err)
+	}
+	if resp.Deferred == nil {
+		t.Fatalf("PlanResourceChange: Deferred dropped by protocol5Adapter, want RESOURCE_CONFIG_UNKNOWN")
+	}
+	if resp.Deferred.Reason != tfplugin6.Deferred_RESOURCE_CONFIG_UNKNOWN {
+		t.Fatalf("PlanResourceChange: Deferred.Reason = %v, want RESOURCE_CONFIG_UNKNOWN", resp.Deferred.Reason)
 	}
 }
 

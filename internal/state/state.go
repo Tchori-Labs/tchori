@@ -1,5 +1,5 @@
-// Package state implements tchori's deterministic, git-diffable state
-// file: crash-durable atomic saves with flock locking and backup-on-write.
+// Package state implements tchori's crash-durable state file with flock
+// locking, backup-on-write, and authenticated private-data encryption.
 package state
 
 import (
@@ -16,20 +16,21 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/tchori-labs/tchori/internal/privateblob"
 	"github.com/tchori-labs/tchori/internal/sensitive"
 )
 
-// formatVersion is the only state file schema version the MVP understands.
-const formatVersion = "1.0"
+const (
+	formatVersion       = "1.1"
+	legacyFormatVersion = "1.0"
+)
 
 // ErrConcurrentModification indicates that state changed on disk after it was
 // loaded. The caller should reload state and re-run its operation to reconcile
 // with the other process's committed changes.
 var ErrConcurrentModification = errors.New("state was modified by another process since it was loaded; re-run the command to reconcile the latest state")
 
-// lockTimeout bounds how long Save waits to acquire path+".lock" before
-// giving up. State files are local and short-lived; a lock should never be
-// held for long.
+// lockTimeout bounds acquisition, not the duration of an apply transaction.
 const lockTimeout = 10 * time.Second
 
 // Filesystem seams keep Save's failure paths deterministic in tests while
@@ -45,8 +46,8 @@ var (
 type ResourceState struct {
 	Type             string          `json:"type"`
 	Provider         string          `json:"provider"`
-	Attributes       json.RawMessage `json:"attributes"`        // ctyjson-encoded object
-	Private          []byte          `json:"private,omitempty"` // std base64 via encoding/json
+	Attributes       json.RawMessage `json:"attributes"` // ctyjson-encoded object
+	Private          []byte          `json:"-"`
 	Redacted         []string        `json:"redacted,omitempty"`
 	SensitivePaths   []string        `json:"sensitive_paths,omitempty"`
 	SensitiveScanned bool            `json:"sensitive_scanned,omitempty"`
@@ -66,7 +67,7 @@ type SensitiveResolver func(addr string, rs *ResourceState) (resolution Resoluti
 
 // State is the top-level state document persisted to state.json.
 type State struct {
-	FormatVersion  string                    `json:"format_version"` // "1.0"
+	FormatVersion  string                    `json:"format_version"`
 	Serial         uint64                    `json:"serial"`
 	Resources      map[string]*ResourceState `json:"resources"` // key = address
 	Incomplete     *IncompleteApply          `json:"incomplete_apply,omitempty"`
@@ -74,14 +75,147 @@ type State struct {
 	resolver       SensitiveResolver         `json:"-"`
 	sensitiveHints map[string][]string       `json:"-"`
 	unresolved     []string                  `json:"-"`
+	lock           *flock.Flock              `json:"-"`
+	lockedPath     string                    `json:"-"`
 }
 
-// Load returns an empty state (FormatVersion "1.0", Serial 0, empty map)
-// when path does not exist. When path does exist, its format_version must be
-// "1.0" (matching plan.Read's rejection of unsupported plan format
-// versions) — this includes a missing/empty format_version, since a state
-// file we ourselves wrote always carries "1.0" (see Save); anything else is
-// a state file this engine did not write and should not guess about.
+type resourceDocument struct {
+	Type             string          `json:"type"`
+	Provider         string          `json:"provider"`
+	Attributes       json.RawMessage `json:"attributes"`
+	Private          json.RawMessage `json:"private,omitempty"`
+	Redacted         []string        `json:"redacted,omitempty"`
+	SensitivePaths   []string        `json:"sensitive_paths,omitempty"`
+	SensitiveScanned bool            `json:"sensitive_scanned,omitempty"`
+}
+
+type stateDocument struct {
+	FormatVersion string                       `json:"format_version"`
+	Serial        uint64                       `json:"serial"`
+	Resources     map[string]*resourceDocument `json:"resources"`
+	Incomplete    *IncompleteApply             `json:"incomplete_apply,omitempty"`
+}
+
+type legacyResourceDocument struct {
+	Type             string          `json:"type"`
+	Provider         string          `json:"provider"`
+	Attributes       json.RawMessage `json:"attributes"`
+	Private          []byte          `json:"private,omitempty"`
+	Redacted         []string        `json:"redacted,omitempty"`
+	SensitivePaths   []string        `json:"sensitive_paths,omitempty"`
+	SensitiveScanned bool            `json:"sensitive_scanned,omitempty"`
+}
+
+type legacyStateDocument struct {
+	FormatVersion string                             `json:"format_version"`
+	Serial        uint64                             `json:"serial"`
+	Resources     map[string]*legacyResourceDocument `json:"resources"`
+	Incomplete    *IncompleteApply                   `json:"incomplete_apply,omitempty"`
+}
+
+// MarshalJSON emits format 1.1 and seals every non-empty private payload in a
+// resource-address-bound envelope. ResourceState itself omits Private, so only
+// the address-aware whole-state boundary can serialize those bytes.
+func (s State) MarshalJSON() ([]byte, error) {
+	doc := stateDocument{
+		FormatVersion: formatVersion,
+		Serial:        s.Serial,
+		Resources:     make(map[string]*resourceDocument, len(s.Resources)),
+		Incomplete:    s.Incomplete,
+	}
+	for addr, rs := range s.Resources {
+		if rs == nil {
+			return nil, fmt.Errorf("invalid state: resource %q is null", addr)
+		}
+		private, err := sealResourcePrivate(addr, rs)
+		if err != nil {
+			return nil, err
+		}
+		doc.Resources[addr] = &resourceDocument{
+			Type: rs.Type, Provider: rs.Provider, Attributes: rs.Attributes, Private: private,
+			Redacted: rs.Redacted, SensitivePaths: rs.SensitivePaths, SensitiveScanned: rs.SensitiveScanned,
+		}
+	}
+	return json.Marshal(doc)
+}
+
+// UnmarshalJSON accepts legacy 1.0 plaintext/base64 private fields for
+// migration and requires authenticated envelopes for all 1.1 private fields.
+func (s *State) UnmarshalJSON(data []byte) error {
+	var header struct {
+		FormatVersion string `json:"format_version"`
+	}
+	if err := json.Unmarshal(data, &header); err != nil {
+		return err
+	}
+	switch header.FormatVersion {
+	case legacyFormatVersion:
+		var legacy legacyStateDocument
+		if err := json.Unmarshal(data, &legacy); err != nil {
+			return err
+		}
+		resources := make(map[string]*ResourceState, len(legacy.Resources))
+		for addr, rs := range legacy.Resources {
+			if rs == nil {
+				resources[addr] = nil
+				continue
+			}
+			resources[addr] = &ResourceState{
+				Type: rs.Type, Provider: rs.Provider, Attributes: rs.Attributes, Private: rs.Private,
+				Redacted: rs.Redacted, SensitivePaths: rs.SensitivePaths, SensitiveScanned: rs.SensitiveScanned,
+			}
+		}
+		*s = State{FormatVersion: legacy.FormatVersion, Serial: legacy.Serial, Resources: resources, Incomplete: legacy.Incomplete}
+		return nil
+	case formatVersion:
+		var doc stateDocument
+		if err := json.Unmarshal(data, &doc); err != nil {
+			return err
+		}
+		resources := make(map[string]*ResourceState, len(doc.Resources))
+		for addr, persisted := range doc.Resources {
+			if persisted == nil {
+				resources[addr] = nil
+				continue
+			}
+			rs := &ResourceState{
+				Type: persisted.Type, Provider: persisted.Provider, Attributes: persisted.Attributes,
+				Redacted: persisted.Redacted, SensitivePaths: persisted.SensitivePaths, SensitiveScanned: persisted.SensitiveScanned,
+			}
+			if len(persisted.Private) != 0 {
+				private, err := privateblob.Open(persisted.Private, resourcePrivateContext("state", addr, rs.Provider, rs.Type))
+				if err != nil {
+					return fmt.Errorf("open private state for %s: %w", addr, err)
+				}
+				rs.Private = private
+			}
+			resources[addr] = rs
+		}
+		*s = State{FormatVersion: doc.FormatVersion, Serial: doc.Serial, Resources: resources, Incomplete: doc.Incomplete}
+		return nil
+	default:
+		return fmt.Errorf("unsupported state format_version %q (supported: %q and %q)", header.FormatVersion, legacyFormatVersion, formatVersion)
+	}
+}
+
+func sealResourcePrivate(addr string, rs *ResourceState) (json.RawMessage, error) {
+	if len(rs.Private) == 0 {
+		return nil, nil
+	}
+	sealed, err := privateblob.Seal(rs.Private, resourcePrivateContext("state", addr, rs.Provider, rs.Type))
+	if err != nil {
+		return nil, fmt.Errorf("seal private state for %s: %w", addr, err)
+	}
+	return json.RawMessage(sealed), nil
+}
+
+func resourcePrivateContext(kind, addr, provider, resourceType string) string {
+	return kind + "\x00" + addr + "\x00" + provider + "\x00" + resourceType
+}
+
+// Load returns an empty format 1.1 state when path does not exist. Existing
+// 1.0 documents remain readable for migration; 1.1 private fields are opened
+// only after authenticating their resource address, provider, and type.
 func Load(path string) (*State, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
 	if err != nil {
@@ -98,11 +232,16 @@ func Load(path string) (*State, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("parse state %s: %w", path, err)
 	}
-	if s.FormatVersion != formatVersion {
-		return nil, fmt.Errorf("unsupported state format_version %q (want %q)", s.FormatVersion, formatVersion)
+	if s.FormatVersion != legacyFormatVersion && s.FormatVersion != formatVersion {
+		return nil, fmt.Errorf("unsupported state format_version %q", s.FormatVersion)
 	}
 	if s.Resources == nil {
 		s.Resources = map[string]*ResourceState{}
+	}
+	for addr, rs := range s.Resources {
+		if rs == nil {
+			return nil, fmt.Errorf("invalid state: resource %q is null", addr)
+		}
 	}
 	s.baseSerial = s.Serial
 	return &s, nil
@@ -142,36 +281,20 @@ func (s *State) UnresolvedSensitiveAddresses() []string {
 // caller to retry safely. Save reports success only after the durability barrier
 // completes.
 func (s *State) Save(path string) error {
-	lockPath := path + ".lock"
-	// Preflight rejects ordinary non-regular entries with an operator-facing
-	// error before a lock is taken. The open-time flags below, not this check,
-	// close the POSIX race window and raced-filesystem-FIFO hang.
-	info, err := os.Lstat(lockPath)
-	if err == nil && !info.Mode().IsRegular() {
-		return fmt.Errorf("lock path %s is not a regular file", lockPath)
-	}
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("inspect lock path %s: %w", lockPath, err)
-	}
-
-	// Existing regular lock files are reused exactly as-is: replacing,
-	// truncating, or chmod'ing an inode another process may hold would weaken
-	// flock synchronization, and the lock contains no sensitive data.
-	lock := flock.New(lockPath, flock.SetFlag(lockOpenFlags()))
-	defer func() { _ = lock.Close() }()
-
-	ctx, cancel := context.WithTimeout(context.Background(), lockTimeout)
-	defer cancel()
-
-	locked, err := lock.TryLockContext(ctx, 50*time.Millisecond)
+	path, err := filepath.Abs(path)
 	if err != nil {
-		return fmt.Errorf("acquire lock %s: %w", lockPath, err)
-	}
-	if !locked {
-		return fmt.Errorf("timed out acquiring lock %s", lockPath)
-	}
-	if err := verifyLockedSidecar(lock, lockPath); err != nil {
 		return err
+	}
+	if s.lock != nil {
+		if s.lockedPath != path {
+			return fmt.Errorf("state is locked for a different path")
+		}
+	} else {
+		lock, err := acquireLock(context.Background(), path)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = lock.Close() }()
 	}
 
 	onDiskSerial, err := readSerial(path)
@@ -185,28 +308,33 @@ func (s *State) Save(path string) error {
 	if s.Resources == nil {
 		s.Resources = map[string]*ResourceState{}
 	}
-	// Sanitize the previous document first, while its persisted path contract
-	// is still available. Backups deliberately use no literal exemptions.
-	if err := s.backupExisting(path); err != nil {
+	// Prepare the recovery artifact and the replacement completely before
+	// committing either. In particular, key/envelope errors cannot replace a
+	// previously valid backup.
+	backupData, hasBackup, err := s.prepareBackup(path)
+	if err != nil {
 		return err
 	}
 	if err := s.sanitizeAll(); err != nil {
 		return err
 	}
 
-	s.FormatVersion = formatVersion
 	// Marshal a copy with the next serial so pre-rename failures do not mutate
-	// the caller's serial. Once rename succeeds, the replacement is visible and
-	// both Serial and baseSerial must advance even if the durability barrier
-	// below subsequently fails.
+	// the caller's serial or format version. Once rename succeeds, the visible
+	// replacement and in-memory CAS fields advance together.
 	next := *s
+	next.FormatVersion = formatVersion
 	next.Serial++
-
 	data, err := json.MarshalIndent(&next, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
 	data = append(data, '\n')
+	if hasBackup {
+		if err := writeBackup(path, backupData); err != nil {
+			return err
+		}
+	}
 
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".state-*.tmp")
@@ -232,12 +360,70 @@ func (s *State) Save(path string) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename temp state file: %w", err)
 	}
+	s.FormatVersion = formatVersion
 	s.Serial = next.Serial
 	s.baseSerial = next.Serial
 	if err := syncDir(dir); err != nil {
 		return fmt.Errorf("sync state directory %s: %w", dir, err)
 	}
 	return nil
+}
+
+// Lock holds the state sidecar across a complete mutating operation. Save on
+// this State reuses the lock; other writers cannot race remote side effects.
+// The caller must release it and must not share this State across goroutines.
+func (s *State) Lock(ctx context.Context, path string) (func(), error) {
+	if s.lock != nil {
+		return nil, fmt.Errorf("state operation already holds a lock")
+	}
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	lock, err := acquireLock(ctx, path)
+	if err != nil {
+		return nil, err
+	}
+	serial, err := readSerial(path)
+	if err == nil && serial != s.baseSerial {
+		err = fmt.Errorf("%s: %w", path, ErrConcurrentModification)
+	}
+	if err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	s.lock, s.lockedPath = lock, path
+	return func() {
+		s.lock, s.lockedPath = nil, ""
+		_ = lock.Close()
+	}, nil
+}
+
+func acquireLock(ctx context.Context, path string) (*flock.Flock, error) {
+	lockPath := path + ".lock"
+	// Never replace an existing lock inode; reject symlinks and special files.
+	info, err := os.Lstat(lockPath)
+	if err == nil && !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("lock path %s is not a regular file", lockPath)
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("inspect lock path %s: %w", lockPath, err)
+	}
+	lock := flock.New(lockPath, flock.SetFlag(lockOpenFlags()))
+	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	defer cancel()
+	locked, err := lock.TryLockContext(ctx, 50*time.Millisecond)
+	if err == nil && !locked {
+		err = fmt.Errorf("timed out acquiring lock %s", lockPath)
+	}
+	if err == nil {
+		err = verifyLockedSidecar(lock, lockPath)
+	}
+	if err != nil {
+		_ = lock.Close()
+		return nil, fmt.Errorf("acquire lock %s: %w", lockPath, err)
+	}
+	return lock, nil
 }
 
 // readSerial returns the serial currently committed at path. A missing or
@@ -302,26 +488,26 @@ func verifyLockedSidecar(lock *flock.Flock, lockPath string) error {
 	return nil
 }
 
-// backupExisting writes a sanitized recovery copy of the previous document.
-// If no entry has a known sensitive path it preserves the historical exact-byte
-// copy. Otherwise it parses and canonically rewrites the document; parse errors
-// fail closed instead of copying bytes that could not be inspected.
-func (s *State) backupExisting(path string) error {
+// prepareBackup returns a sanitized recovery copy of the previous document
+// without changing the backup path. Existing 1.1 bytes are preserved exactly
+// when no attribute sanitization is needed. Legacy documents are always
+// rewritten as 1.1 so private bytes cannot remain plaintext/base64-only.
+func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // operator-selected state path
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil
+			return nil, false, nil
 		}
-		return fmt.Errorf("open state for backup %s: %w", path, err)
+		return nil, false, fmt.Errorf("open state for backup %s: %w", path, err)
 	}
 	var previous State
 	if err := json.Unmarshal(data, &previous); err != nil {
-		return fmt.Errorf("parse state for backup %s: %w", path, err)
+		return nil, false, fmt.Errorf("parse state for backup %s: %w", path, err)
 	}
 	if previous.Resources == nil {
 		previous.Resources = map[string]*ResourceState{}
 	}
-	changedDocument := false
+	changedDocument := previous.FormatVersion != formatVersion
 	for addr, prior := range previous.Resources {
 		paths := unionStrings(prior.SensitivePaths, prior.Redacted, s.sensitiveHints[addr])
 		if current := s.Resources[addr]; current != nil {
@@ -341,7 +527,7 @@ func (s *State) backupExisting(path string) error {
 		// raw literal is safe.
 		attrs, changed, err := sensitive.RedactJSON(prior.Attributes, paths, nil)
 		if err != nil {
-			return fmt.Errorf("sanitize backup attributes for %s: %w", addr, err)
+			return nil, false, fmt.Errorf("sanitize backup attributes for %s: %w", addr, err)
 		}
 		prior.Attributes = attrs
 		prior.Redacted = unionStrings(prior.Redacted, changed)
@@ -349,11 +535,11 @@ func (s *State) backupExisting(path string) error {
 	if changedDocument {
 		data, err = json.MarshalIndent(&previous, "", "  ")
 		if err != nil {
-			return fmt.Errorf("marshal sanitized backup: %w", err)
+			return nil, false, fmt.Errorf("marshal sanitized backup: %w", err)
 		}
 		data = append(data, '\n')
 	}
-	return writeBackup(path, data)
+	return data, true, nil
 }
 
 func writeBackup(path string, data []byte) error {
@@ -379,6 +565,10 @@ func writeBackup(path string, data []byte) error {
 		cleanup()
 		return fmt.Errorf("copy backup %s: %w", backupPath, err)
 	}
+	if err := fsyncFile(tmp); err != nil {
+		cleanup()
+		return fmt.Errorf("sync temporary backup %s: %w", backupPath, err)
+	}
 	if err := tmp.Close(); err != nil {
 		cleanup()
 		return fmt.Errorf("close backup %s: %w", backupPath, err)
@@ -396,13 +586,14 @@ func (s *State) sanitizeAll() error {
 		if rs == nil {
 			continue
 		}
-		paths := unionStrings(rs.SensitivePaths, s.sensitiveHints[addr])
+		paths := unionStrings(rs.SensitivePaths, rs.Redacted, s.sensitiveHints[addr])
 		var exemptions []string
 		resolved := false
 		if s.resolver != nil {
 			if resolution, ok := s.resolver(addr, rs); ok {
 				resolved = true
-				paths = sortedUnique(resolution.Paths) // current live resolution is authoritative
+				// Removing a config declaration must not declassify a stored secret.
+				paths = unionStrings(paths, resolution.Paths)
 				exemptions = resolution.ExemptInstances
 				rs.SensitivePaths = append([]string(nil), paths...)
 				rs.SensitiveScanned = true

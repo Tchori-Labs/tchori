@@ -2,6 +2,7 @@ package state
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,8 +15,7 @@ import (
 	"github.com/gofrs/flock"
 )
 
-// TestLoadMissing verifies Load returns an empty, well-formed state when
-// no state file exists yet: FormatVersion "1.0", Serial 0, empty Resources.
+// TestLoadMissing verifies Load returns an empty, well-formed format 1.1 state.
 func TestLoadMissing(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
@@ -24,8 +24,8 @@ func TestLoadMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(%q) = %v, want nil error", path, err)
 	}
-	if s.FormatVersion != "1.0" {
-		t.Fatalf("FormatVersion = %q, want %q", s.FormatVersion, "1.0")
+	if s.FormatVersion != "1.1" {
+		t.Fatalf("FormatVersion = %q, want %q", s.FormatVersion, "1.1")
 	}
 	if s.Serial != 0 {
 		t.Fatalf("Serial = %d, want 0", s.Serial)
@@ -35,6 +35,21 @@ func TestLoadMissing(t *testing.T) {
 	}
 	if len(s.Resources) != 0 {
 		t.Fatalf("len(Resources) = %d, want 0", len(s.Resources))
+	}
+}
+
+func TestLoadRejectsNullResource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	data := []byte(`{"format_version":"1.0","serial":1,"resources":{"thing.demo":null}}`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("null resource entry must be rejected before CLI or MCP dereferences it")
+	}
+	after, err := os.ReadFile(path) //nolint:gosec // G304: test-owned state artifact in t.TempDir
+	if err != nil || !bytes.Equal(data, after) {
+		t.Fatal("loading invalid state must not change it")
 	}
 }
 
@@ -69,8 +84,8 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load after first Save = %v", err)
 	}
-	if reloaded.FormatVersion != "1.0" {
-		t.Fatalf("Load after first Save: FormatVersion = %q, want %q", reloaded.FormatVersion, "1.0")
+	if reloaded.FormatVersion != "1.1" {
+		t.Fatalf("Load after first Save: FormatVersion = %q, want %q", reloaded.FormatVersion, "1.1")
 	}
 	if reloaded.Serial != 1 {
 		t.Fatalf("Load after first Save: Serial = %d, want 1", reloaded.Serial)
@@ -143,7 +158,6 @@ func TestSaveDeterministicAcrossInsertionOrder(t *testing.T) {
 			Type:       "bbb_thing",
 			Provider:   "bbb",
 			Attributes: json.RawMessage(`{"name":"beta"}`),
-			Private:    []byte("secret"),
 		},
 		"ccc_thing.gamma": {
 			Type:       "ccc_thing",
@@ -239,6 +253,7 @@ func TestSaveWritesBackupOnSecondSave(t *testing.T) {
 // TestSaveRetightensPermissiveBackup verifies Save overwrites stale backup
 // content and forces a pre-existing permissive backup back to mode 0600.
 func TestSaveRetightensPermissiveBackup(t *testing.T) {
+	setStateArtifactKey(t, 20)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
 	backupPath := path + ".backup"
@@ -373,7 +388,12 @@ func TestSaveTempSyncFailure(t *testing.T) {
 
 	s.Resources["thing.new"] = &ResourceState{Type: "thing", Provider: "test", Attributes: json.RawMessage(`{}`)}
 	syncFailure := errors.New("injected temp fsync failure")
-	fsyncFile = func(*os.File) error { return syncFailure }
+	fsyncFile = func(f *os.File) error {
+		if !strings.HasPrefix(filepath.Base(f.Name()), ".state-backup-") {
+			return syncFailure
+		}
+		return originalFsyncFile(f)
+	}
 	err = s.Save(path)
 	if !errors.Is(err, syncFailure) || !strings.Contains(err.Error(), "sync temp state file") {
 		t.Fatalf("Save error = %v, want actionable temp sync failure", err)
@@ -383,6 +403,60 @@ func TestSaveTempSyncFailure(t *testing.T) {
 	}
 	assertStateFileUnchanged(t, path, before)
 	assertNoTempStateFiles(t, filepath.Dir(path))
+}
+
+// TestSaveBackupTempSyncFailure verifies a failed pre-rename data barrier for
+// the recovery artifact preserves both committed files and removes staging.
+func TestSaveBackupTempSyncFailure(t *testing.T) {
+	originalFsyncFile := fsyncFile
+	defer func() { fsyncFile = originalFsyncFile }()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Resources["thing.example"] = &ResourceState{
+		Type:       "thing",
+		Provider:   "test",
+		Attributes: json.RawMessage(`{"value":"first"}`),
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatalf("first Save = %v", err)
+	}
+	s.Resources["thing.example"].Attributes = json.RawMessage(`{"value":"second"}`)
+	if err := s.Save(path); err != nil {
+		t.Fatalf("second Save = %v", err)
+	}
+	beforeState, err := os.ReadFile(path) //nolint:gosec // test-controlled path under t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeBackup, err := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled path under t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSerial := s.Serial
+
+	s.Resources["thing.example"].Attributes = json.RawMessage(`{"value":"third"}`)
+	syncFailure := errors.New("injected backup temp fsync failure")
+	fsyncFile = func(f *os.File) error {
+		if strings.HasPrefix(filepath.Base(f.Name()), ".state-backup-") {
+			return syncFailure
+		}
+		return originalFsyncFile(f)
+	}
+	err = s.Save(path)
+	if !errors.Is(err, syncFailure) || !strings.Contains(err.Error(), "sync temporary backup") {
+		t.Fatalf("Save error = %v, want actionable backup sync failure", err)
+	}
+	if s.Serial != beforeSerial {
+		t.Fatalf("Serial after backup pre-rename failure = %d, want unchanged serial %d", s.Serial, beforeSerial)
+	}
+	assertStateFileUnchanged(t, path, beforeState)
+	assertStateFileUnchanged(t, path+".backup", beforeBackup)
+	assertNoTempStateFiles(t, dir)
 }
 
 // TestSaveCloseFailure verifies a failed close after fsync is surfaced and the
@@ -764,9 +838,8 @@ func TestLoadRejectsUnsupportedFormatVersion(t *testing.T) {
 }
 
 // TestLoadRejectsMissingFormatVersion verifies an existing state.json with
-// no format_version field at all is also rejected — this is a state file
-// tchori did not write (Save always stamps "1.0"), so Load should not treat
-// it as compatible just because a fresh (nonexistent) state file is fine.
+// no format_version field at all is also rejected because Save always stamps
+// the current format version.
 func TestLoadRejectsMissingFormatVersion(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
@@ -1171,7 +1244,7 @@ func TestSaveSanitizesBackupFromEffectiveHintWhenValueNowNull(t *testing.T) {
 	}
 }
 
-func TestSavePreservesLiteralAndCurrentResolutionClearsRemovedPath(t *testing.T) {
+func TestSavePreservesLiteralAndRecordedSensitivity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
 	initial := `{"format_version":"1.0","serial":0,"resources":{` +
 		`"secret.literal":{"type":"secret","provider":"test","attributes":{"token":"literal-token-ok"},"sensitive_paths":["token"]},` +
@@ -1194,12 +1267,12 @@ func TestSavePreservesLiteralAndCurrentResolutionClearsRemovedPath(t *testing.T)
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(path) //nolint:gosec // test-controlled state path under t.TempDir()
-	if !bytes.Contains(b, []byte("literal-token-ok")) || !bytes.Contains(b, []byte("visible-again")) {
-		t.Fatalf("live state clobbered: %s", b)
+	if !bytes.Contains(b, []byte("literal-token-ok")) || bytes.Contains(b, []byte("visible-again")) {
+		t.Fatalf("save must preserve literal exemptions without forgetting recorded sensitivity")
 	}
 	rs := s.Resources["secret.removed"]
-	if len(rs.SensitivePaths) != 0 || len(rs.Redacted) != 0 || !rs.SensitiveScanned {
-		t.Fatalf("stale metadata = %#v", rs)
+	if len(rs.SensitivePaths) != 1 || rs.SensitivePaths[0] != "note" || !rs.SensitiveScanned {
+		t.Fatal("save forgot the previously sensitive path")
 	}
 }
 
@@ -1223,5 +1296,260 @@ func TestSaveResolverOutcomes(t *testing.T) {
 	}
 	if s.Resources["orphan"].SensitiveScanned {
 		t.Fatal("unresolved entry marked scanned")
+	}
+}
+
+func setStateArtifactKey(t *testing.T, seed byte) {
+	t.Helper()
+	t.Setenv("TCHORI_ARTIFACT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{seed}, 32)))
+}
+
+func TestSaveEncryptsPrivateAndLoadRestoresExactBytes(t *testing.T) {
+	setStateArtifactKey(t, 21)
+	const sentinel = "opaque-provider-private-sentinel"
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"test_thing.example": {
+			Type:       "test_thing",
+			Provider:   "test",
+			Attributes: json.RawMessage(`{"id":"example"}`),
+			Private:    []byte(sentinel),
+		},
+	}}
+	if err := s.Save(path); err != nil {
+		t.Fatalf("Save = %v", err)
+	}
+	data, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(sentinel)) ||
+		bytes.Contains(data, []byte(base64.StdEncoding.EncodeToString([]byte(sentinel)))) {
+		t.Fatal("state.json exposed provider private bytes")
+	}
+	if !bytes.Contains(data, []byte(`"format_version": "1.1"`)) ||
+		!bytes.Contains(data, []byte(`"private": {`)) {
+		t.Fatalf("state.json does not contain a 1.1 encrypted private envelope: %s", data)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load = %v", err)
+	}
+	if !bytes.Equal(loaded.Resources["test_thing.example"].Private, []byte(sentinel)) {
+		t.Fatal("Load did not restore exact provider private bytes")
+	}
+}
+
+func TestResourceStateJSONNeverExposesPrivate(t *testing.T) {
+	const sentinel = "standalone-private-sentinel"
+	data, err := json.Marshal(&ResourceState{
+		Type:       "test_thing",
+		Provider:   "test",
+		Attributes: json.RawMessage(`{}`),
+		Private:    []byte(sentinel),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(sentinel)) ||
+		bytes.Contains(data, []byte(base64.StdEncoding.EncodeToString([]byte(sentinel)))) ||
+		bytes.Contains(data, []byte(`"private"`)) {
+		t.Fatalf("standalone ResourceState JSON exposed private data: %s", data)
+	}
+}
+
+func TestLoadEncryptedPrivateFailsClosed(t *testing.T) {
+	setStateArtifactKey(t, 22)
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"test_thing.alpha": {Type: "test_thing", Provider: "test", Attributes: json.RawMessage(`{}`), Private: []byte("alpha-private")},
+		"test_thing.beta":  {Type: "test_thing", Provider: "test", Attributes: json.RawMessage(`{}`), Private: []byte("beta-private")},
+	}}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("wrong key", func(t *testing.T) {
+		t.Setenv("TCHORI_ARTIFACT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{23}, 32)))
+		if _, err := Load(path); err == nil {
+			t.Fatal("Load accepted encrypted private data under the wrong key")
+		} else if strings.Contains(err.Error(), "alpha-private") || strings.Contains(err.Error(), "beta-private") {
+			t.Fatal("wrong-key error exposed private content")
+		}
+	})
+
+	t.Run("cross-resource replay", func(t *testing.T) {
+		setStateArtifactKey(t, 22)
+		data, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(data, &doc); err != nil {
+			t.Fatal(err)
+		}
+		resources := doc["resources"].(map[string]any)
+		alpha := resources["test_thing.alpha"].(map[string]any)
+		beta := resources["test_thing.beta"].(map[string]any)
+		beta["private"] = alpha["private"]
+		replayed, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replayPath := filepath.Join(t.TempDir(), "state.json")
+		if err := os.WriteFile(replayPath, replayed, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(replayPath); err == nil {
+			t.Fatal("Load accepted a private envelope replayed at another address")
+		}
+	})
+
+	t.Run("1.1 plaintext", func(t *testing.T) {
+		plaintext := `{"format_version":"1.1","serial":1,"resources":{"test_thing.alpha":{"type":"test_thing","provider":"test","attributes":{},"private":"YWxwaGEtcHJpdmF0ZQ=="}}}`
+		plainPath := filepath.Join(t.TempDir(), "state.json")
+		if err := os.WriteFile(plainPath, []byte(plaintext), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(plainPath); err == nil {
+			t.Fatal("Load accepted plaintext/base64 private data in format 1.1")
+		}
+	})
+}
+
+func TestSaveMigratesLegacyPrivateInStateAndBackup(t *testing.T) {
+	setStateArtifactKey(t, 24)
+	const sentinel = "legacy-private-sentinel"
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := fmt.Sprintf(
+		`{"format_version":"1.0","serial":4,"resources":{"test_thing.example":{"type":"test_thing","provider":"test","attributes":{},"private":%q}}}`,
+		base64.StdEncoding.EncodeToString([]byte(sentinel)),
+	)
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load legacy state = %v", err)
+	}
+	if !bytes.Equal(s.Resources["test_thing.example"].Private, []byte(sentinel)) {
+		t.Fatal("legacy load lost private bytes")
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatalf("Save migration = %v", err)
+	}
+	for _, artifact := range []string{path, path + ".backup"} {
+		data, err := os.ReadFile(artifact) //nolint:gosec // test-controlled path
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte(sentinel)) ||
+			bytes.Contains(data, []byte(base64.StdEncoding.EncodeToString([]byte(sentinel)))) ||
+			!bytes.Contains(data, []byte(`"format_version": "1.1"`)) {
+			t.Fatalf("migration left an unsafe artifact at %s: %s", artifact, data)
+		}
+		loaded, err := Load(artifact)
+		if err != nil {
+			t.Fatalf("Load(%s) = %v", artifact, err)
+		}
+		if !bytes.Equal(loaded.Resources["test_thing.example"].Private, []byte(sentinel)) {
+			t.Fatalf("migration lost private bytes in %s", artifact)
+		}
+	}
+}
+
+func TestSaveKeyFailureLeavesStateAndBackupUnchanged(t *testing.T) {
+	setStateArtifactKey(t, 25)
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"test_thing.example": {Type: "test_thing", Provider: "test", Attributes: json.RawMessage(`{}`), Private: []byte("private")},
+	}}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	beforeState, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeBackup, err := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSerial := s.Serial
+	if err := os.Unsetenv("TCHORI_ARTIFACT_KEY"); err != nil {
+		t.Fatal(err)
+	}
+	s.Resources["test_thing.example"].Private = []byte("changed-private")
+	if err := s.Save(path); err == nil {
+		t.Fatal("Save accepted private bytes without an artifact key")
+	}
+	afterState, _ := os.ReadFile(path)              //nolint:gosec // test-controlled path
+	afterBackup, _ := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled path
+	if !bytes.Equal(beforeState, afterState) || !bytes.Equal(beforeBackup, afterBackup) {
+		t.Fatal("key failure changed the state or backup artifact")
+	}
+	if s.Serial != beforeSerial {
+		t.Fatalf("key failure advanced serial from %d to %d", beforeSerial, s.Serial)
+	}
+}
+
+func TestSaveMarshalFailureLeavesStateAndBackupUnchanged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"test_thing.example": {Type: "test_thing", Provider: "test", Attributes: json.RawMessage(`{}`)},
+	}}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	beforeState, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeBackup, err := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSerial := s.Serial
+	s.Resources["test_thing.example"].Attributes = json.RawMessage(`{`)
+	if err := s.Save(path); err == nil {
+		t.Fatal("Save accepted malformed resource JSON")
+	}
+	afterState, _ := os.ReadFile(path)              //nolint:gosec // test-controlled path
+	afterBackup, _ := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled path
+	if !bytes.Equal(beforeState, afterState) || !bytes.Equal(beforeBackup, afterBackup) {
+		t.Fatal("marshal failure changed the state or backup artifact")
+	}
+	if s.Serial != beforeSerial {
+		t.Fatalf("marshal failure advanced serial from %d to %d", beforeSerial, s.Serial)
+	}
+}
+
+func TestSaveHonorsLegacyRedactedHint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	document := `{"format_version":"1.0","serial":1,"resources":{"thing.old":{"type":"thing","provider":"test","attributes":{"secret":"legacy-secret","id":"public"},"redacted":["secret"]}}}`
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	for _, artifact := range []string{path, path + ".backup"} {
+		data, err := os.ReadFile(artifact) //nolint:gosec // test-controlled artifact
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte("legacy-secret")) || !bytes.Contains(data, []byte("public")) {
+			t.Fatal("Save did not preserve public data while masking a legacy redacted hint")
+		}
 	}
 }

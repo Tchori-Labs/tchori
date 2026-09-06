@@ -3,6 +3,7 @@ package plan_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -59,16 +60,13 @@ func TestWriteOverwritePermissiveFileTightensMode(t *testing.T) {
 	if err := plan.Write(pl, path); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	first := assertPlanContent(t, path, pl)
+	assertPlanContent(t, path, pl)
 	assertOwnerReadWriteOnly(t, path)
 
 	if err := plan.Write(pl, path); err != nil {
 		t.Fatalf("second Write: %v", err)
 	}
-	second := assertPlanContent(t, path, pl)
-	if !bytes.Equal(first, second) {
-		t.Error("plan.json is not byte-identical across writes")
-	}
+	assertPlanContent(t, path, pl)
 	assertOwnerReadWriteOnly(t, path)
 
 	got, err := plan.Read(path)
@@ -156,11 +154,13 @@ func populatedPlan() *plan.Plan {
 				PlannedRaw: []byte{0x81, 0xa4, 'n', 'a', 'm', 'e'},
 			},
 			{
-				Address: "tchoritest_thing.beta",
-				Action:  "create",
-				Before:  json.RawMessage("null"),
-				After:   json.RawMessage(`{"token":null}`),
-				Private: []byte("provider-private-payload"),
+				Address:  "tchoritest_thing.beta",
+				Action:   "create",
+				Type:     "tchoritest_thing",
+				Provider: "tchoritest",
+				Before:   json.RawMessage("null"),
+				After:    json.RawMessage(`{"token":null}`),
+				Private:  []byte("provider-private-payload"),
 			},
 		},
 		Summary: plan.Summary{Create: 1, Update: 1},
@@ -173,13 +173,26 @@ func assertPlanContent(t *testing.T, path string, pl *plan.Plan) []byte {
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	want, err := json.MarshalIndent(pl, "", "  ")
-	if err != nil {
-		t.Fatalf("MarshalIndent expected plan: %v", err)
+	var decoded plan.Plan
+	if err := json.Unmarshal(got, &decoded); err != nil {
+		t.Fatalf("decode plan content: %v", err)
 	}
-	want = append(want, '\n')
-	if !bytes.Equal(got, want) {
-		t.Errorf("plan content mismatch:\ngot:\n%s\nwant:\n%s", got, want)
+	// Normalize RawMessage whitespace without invoking the encrypting marshaler.
+	type comparablePlan plan.Plan
+	comparableJSON := func(value *plan.Plan) []byte {
+		data, err := json.Marshal((*comparablePlan)(value))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	if !bytes.Equal(comparableJSON(&decoded), comparableJSON(pl)) {
+		t.Fatal("plan content changed during Write/Read")
+	}
+	for i, change := range pl.Changes {
+		if !bytes.Equal(decoded.Changes[i].Private, change.Private) {
+			t.Fatalf("Write/Read changed private bytes for %s", change.Address)
+		}
 	}
 	return got
 }
@@ -200,7 +213,7 @@ func assertOwnerReadWriteOnly(t *testing.T, path string) {
 
 func TestPlanWriteReadDeterminism(t *testing.T) {
 	pl := &plan.Plan{
-		FormatVersion: "1.0",
+		FormatVersion: plan.FormatVersion,
 		EngineVersion: "0.1.0-dev",
 		StateSerial:   4,
 		Changes: []*plan.Change{{
@@ -224,7 +237,7 @@ func TestPlanWriteReadDeterminism(t *testing.T) {
 	if len(b1) == 0 || b1[len(b1)-1] != '\n' {
 		t.Error("plan.json must end with a trailing newline")
 	}
-	if !strings.Contains(string(b1), `"format_version": "1.0"`) {
+	if !strings.Contains(string(b1), `"format_version": "1.1"`) {
 		t.Errorf("plan.json missing two-space-indented format_version:\n%s", b1)
 	}
 
@@ -267,6 +280,10 @@ func TestReadRejectsUnknownFormatVersion(t *testing.T) {
 var testProviderBin string
 
 func TestMain(m *testing.M) {
+	if err := os.Setenv("TCHORI_ARTIFACT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{31}, 32))); err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "set artifact key:", err)
+		os.Exit(1)
+	}
 	dir, err := os.MkdirTemp("", "tchori-plan-test")
 	if err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "mkdtemp:", err)
@@ -758,8 +775,8 @@ func TestPlanCreateWithReference(t *testing.T) {
 	if ds.HasErrors() {
 		t.Fatalf("Plan diagnostics: %+v", ds)
 	}
-	if pl.FormatVersion != "1.0" {
-		t.Errorf("format_version = %q, want \"1.0\"", pl.FormatVersion)
+	if pl.FormatVersion != plan.FormatVersion {
+		t.Errorf("format_version = %q, want %q", pl.FormatVersion, plan.FormatVersion)
 	}
 	if pl.StateSerial != 0 {
 		t.Errorf("state_serial = %d, want 0", pl.StateSerial)
@@ -1153,5 +1170,127 @@ func TestPlanRefreshMixedOptionalNestedObjects(t *testing.T) {
 	}
 	if pl == nil {
 		t.Fatal("Plan returned nil without diagnostics")
+	}
+}
+
+func TestPlanPrivateEncryptedAcrossJSONSeams(t *testing.T) {
+	const sentinel = "plan-private-sentinel"
+	t.Setenv("TCHORI_ARTIFACT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{32}, 32)))
+	pl := &plan.Plan{
+		FormatVersion: plan.FormatVersion,
+		Changes: []*plan.Change{{
+			Address: "test_thing.example", Type: "test_thing", Provider: "test",
+			Action: "create", Before: json.RawMessage("null"), After: json.RawMessage(`{}`),
+			Private: []byte(sentinel),
+		}},
+	}
+	data, err := json.Marshal(pl)
+	if err != nil {
+		t.Fatalf("json.Marshal = %v", err)
+	}
+	if bytes.Contains(data, []byte(sentinel)) ||
+		bytes.Contains(data, []byte(base64.StdEncoding.EncodeToString([]byte(sentinel)))) ||
+		!bytes.Contains(data, []byte(`"private":{`)) {
+		t.Fatalf("plan JSON did not protect private bytes: %s", data)
+	}
+	var decoded plan.Plan
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal = %v", err)
+	}
+	if len(decoded.Changes) != 1 || !bytes.Equal(decoded.Changes[0].Private, []byte(sentinel)) {
+		t.Fatal("plan JSON round-trip lost exact private bytes")
+	}
+
+	path := filepath.Join(t.TempDir(), "plan.json")
+	if err := plan.Write(pl, path); err != nil {
+		t.Fatalf("Write = %v", err)
+	}
+	got, err := plan.Read(path)
+	if err != nil {
+		t.Fatalf("Read = %v", err)
+	}
+	if !bytes.Equal(got.Changes[0].Private, []byte(sentinel)) {
+		t.Fatal("Write/Read round-trip lost exact private bytes")
+	}
+}
+
+func TestPlanPrivateFailsClosed(t *testing.T) {
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{33}, 32))
+	t.Setenv("TCHORI_ARTIFACT_KEY", key)
+	pl := &plan.Plan{
+		FormatVersion: plan.FormatVersion,
+		Changes: []*plan.Change{
+			{Address: "test_thing.alpha", Type: "test_thing", Provider: "test", Action: "create", Before: json.RawMessage("null"), After: json.RawMessage(`{}`), Private: []byte("alpha-private")},
+			{Address: "test_thing.beta", Type: "test_thing", Provider: "test", Action: "create", Before: json.RawMessage("null"), After: json.RawMessage(`{}`), Private: []byte("beta-private")},
+		},
+	}
+	data, err := json.Marshal(pl)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("missing key marshal", func(t *testing.T) {
+		if err := os.Unsetenv("TCHORI_ARTIFACT_KEY"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := json.Marshal(pl); err == nil {
+			t.Fatal("json.Marshal accepted private data without an artifact key")
+		}
+	})
+
+	t.Run("wrong key unmarshal", func(t *testing.T) {
+		t.Setenv("TCHORI_ARTIFACT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{34}, 32)))
+		var got plan.Plan
+		if err := json.Unmarshal(data, &got); err == nil {
+			t.Fatal("json.Unmarshal accepted encrypted private data under the wrong key")
+		}
+	})
+
+	t.Run("cross-change replay", func(t *testing.T) {
+		t.Setenv("TCHORI_ARTIFACT_KEY", key)
+		var doc map[string]any
+		if err := json.Unmarshal(data, &doc); err != nil {
+			t.Fatal(err)
+		}
+		changes := doc["changes"].([]any)
+		alpha := changes[0].(map[string]any)
+		beta := changes[1].(map[string]any)
+		beta["private"] = alpha["private"]
+		replayed, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got plan.Plan
+		if err := json.Unmarshal(replayed, &got); err == nil {
+			t.Fatal("json.Unmarshal accepted a private envelope replayed at another address")
+		}
+	})
+
+	t.Run("1.1 plaintext", func(t *testing.T) {
+		t.Setenv("TCHORI_ARTIFACT_KEY", key)
+		plaintext := `{"format_version":"1.1","engine_version":"dev","state_serial":0,"changes":[{"address":"test_thing.alpha","type":"test_thing","provider":"test","action":"create","before":null,"after":{},"private":"YWxwaGEtcHJpdmF0ZQ=="}],"summary":{"create":1,"update":0,"delete":0,"replace":0}}`
+		var got plan.Plan
+		if err := json.Unmarshal([]byte(plaintext), &got); err == nil {
+			t.Fatal("json.Unmarshal accepted plaintext/base64 private data in format 1.1")
+		}
+	})
+}
+
+func TestReadLegacyPlanPrivate(t *testing.T) {
+	const sentinel = "legacy-plan-private"
+	legacy := fmt.Sprintf(
+		`{"format_version":"1.0","engine_version":"dev","state_serial":2,"changes":[{"address":"test_thing.example","action":"update","before":{},"after":{},"private":%q}],"summary":{"create":0,"update":1,"delete":0,"replace":0}}`,
+		base64.StdEncoding.EncodeToString([]byte(sentinel)),
+	)
+	path := filepath.Join(t.TempDir(), "plan.json")
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := plan.Read(path)
+	if err != nil {
+		t.Fatalf("Read legacy plan = %v", err)
+	}
+	if !bytes.Equal(got.Changes[0].Private, []byte(sentinel)) {
+		t.Fatal("legacy read lost private bytes")
 	}
 }

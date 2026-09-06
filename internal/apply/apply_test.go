@@ -3,6 +3,7 @@ package apply_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -21,6 +22,13 @@ import (
 	"github.com/tchori-labs/tchori/internal/provider"
 	"github.com/tchori-labs/tchori/internal/state"
 )
+
+func TestMain(m *testing.M) {
+	if err := os.Setenv("TCHORI_ARTIFACT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{41}, 32))); err != nil {
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
 
 // buildTestProvider compiles the Task 5 fake provider into a temp dir and
 // returns the binary path (same pattern as the internal/provider tests).
@@ -79,6 +87,45 @@ func newHarness(t *testing.T, resources map[string]*config.Resource) *harness {
 		providers: map[string]*provider.Client{"tchoritest": c},
 		schemas:   map[string]*provider.ProviderSchemas{"tchoritest": ps},
 		statePath: filepath.Join(t.TempDir(), "state.json"),
+	}
+}
+
+func TestApplyHoldsStateLockDuringProviderMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	t.Setenv("TCHORITEST_VERIFY_STATE_LOCK", path)
+	const addr = "tchoritest_thing.foo"
+	h := newHarness(t, map[string]*config.Resource{addr: thing("foo", "foo")})
+	h.statePath = path
+	st := loadState(t, path)
+	ctx := context.Background()
+	for _, destroy := range []bool{false, true} {
+		_, ds := apply.Apply(ctx, h.plan(t, st, destroy), h.cfg, h.providers, h.schemas, st, path)
+		if ds.HasErrors() {
+			t.Fatalf("provider mutation (destroy=%v) did not hold exclusive state lock: %+v", destroy, ds)
+		}
+	}
+}
+
+func TestApplyPersistsPartialProviderErrorState(t *testing.T) {
+	const addr = "tchoritest_thing.partial"
+	const dependentAddr = "tchoritest_thing.dependent"
+	dependent := thing("dependent", "dependent")
+	dependent.Config["tags"] = map[string]any{"parent": "${tchoritest_thing.partial.id}"}
+	h := newHarness(t, map[string]*config.Resource{
+		addr: thing("partial", "partial_failure"), dependentAddr: dependent,
+	})
+	st := loadState(t, h.statePath)
+	result, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() || len(result.NotExecuted) != 1 || result.NotExecuted[0].Address != dependentAddr {
+		t.Fatalf("partial failure must fail and block dependents: %+v %+v", result, ds)
+	}
+	saved := loadState(t, h.statePath)
+	rs := saved.Resources[addr]
+	if rs == nil || !bytes.Contains(rs.Attributes, []byte("id-partial_failure")) || string(rs.Private) != "partial-recovery" {
+		t.Fatal("recoverable provider state was discarded after partial failure")
+	}
+	if saved.Incomplete == nil || saved.Incomplete.FailedAddress != addr {
+		t.Fatal("partial provider result must not mark apply converged")
 	}
 }
 
@@ -776,8 +823,8 @@ func TestApplyMarkerSaveFailureRefusesProviderCall(t *testing.T) {
 	pl := h.plan(t, st, false)
 	h.statePath = filepath.Join(t.TempDir(), "missing", "state.json")
 	_, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
-	if !ds.HasErrors() || !diagnosticsContain(ds, "marking state incomplete") {
-		t.Fatalf("diagnostics = %+v, want marking failure", ds)
+	if !ds.HasErrors() {
+		t.Fatal("apply must refuse mutation when it cannot prepare durable state")
 	}
 	if diagnosticsContain(ds, "apply exploded") {
 		t.Fatalf("provider was called after marker save failed: %+v", ds)
@@ -1374,11 +1421,13 @@ func TestApplyCreateIgnoresStalePriorState(t *testing.T) {
 	}
 
 	pl := &plan.Plan{
-		FormatVersion: "1.0",
+		FormatVersion: plan.FormatVersion,
 		EngineVersion: "0.1.0-dev",
 		StateSerial:   0,
 		Changes: []*plan.Change{{
 			Address:    addr,
+			Type:       "tchoritest_thing",
+			Provider:   "tchoritest",
 			Action:     "create",
 			Before:     json.RawMessage("null"),
 			PlannedRaw: raw,
@@ -1855,4 +1904,26 @@ func TestApplyPreLoopRefusalsDoNotReportAbort(t *testing.T) {
 			t.Fatalf("diagnostics = %#v", ds)
 		}
 	})
+}
+
+func TestApplyRequiresArtifactKeyBeforeMutation(t *testing.T) {
+	const addr = "tchoritest_thing.example"
+	h := newHarness(t, map[string]*config.Resource{addr: thing("example", "example")})
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	t.Setenv("TCHORI_ARTIFACT_KEY", "")
+	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() || diagnosticWithSummary(ds, "invalid artifact key") == nil {
+		t.Fatalf("Apply diagnostics = %+v, want invalid artifact key", ds)
+	}
+	if result.Created != 0 || result.Updated != 0 || result.Deleted != 0 ||
+		result.Replaced != 0 || len(result.NotExecuted) != 0 {
+		t.Fatalf("Apply result = %+v, want zero result", result)
+	}
+	if st.Serial != 0 || st.Incomplete != nil || len(st.Resources) != 0 {
+		t.Fatal("Apply mutated in-memory state without a key")
+	}
+	if _, err := os.Stat(h.statePath); !os.IsNotExist(err) {
+		t.Fatalf("Apply created state without a key: %v", err)
+	}
 }
