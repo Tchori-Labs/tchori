@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -38,18 +39,30 @@ func emitDiags(ds diag.Diagnostics) {
 	diag.Emit(os.Stderr, ds, prettyStderr())
 }
 
-// exitRun adapts a run() (int, error) command body to cobra's RunE. A non-nil
-// error is emitted as a structured diagnostic, then the process exits with
-// the returned code. Command bodies release resources via defer before
-// returning, so exiting here is safe.
+type commandExit struct {
+	code int
+	err  error
+}
+
+func (e *commandExit) Error() string {
+	if e.err != nil {
+		return e.err.Error()
+	}
+	return fmt.Sprintf("exit status %d", e.code)
+}
+
+// exitRun adapts a run() (int, error) command body to cobra's RunE. It returns
+// control to main so command and signal cleanup defers run before os.Exit.
 func exitRun(run func(cmd *cobra.Command, args []string) (int, error)) func(*cobra.Command, []string) error {
 	return func(cmd *cobra.Command, args []string) error {
 		code, err := run(cmd, args)
-		if err != nil {
-			emitDiags(diag.Diagnostics{diag.Errorf("", err.Error(), "")})
+		if code == 0 && err != nil {
+			code = 1
 		}
-		os.Exit(code)
-		return nil
+		if code == 0 {
+			return nil
+		}
+		return &commandExit{code: code, err: err}
 	}
 }
 
@@ -111,16 +124,33 @@ func newRootCmd() *cobra.Command {
 	return root
 }
 
-func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+func runMain() int {
+	ctx, stop := signal.NotifyContext(context.Background(), terminationSignals()...)
 	defer stop()
+	go func() {
+		<-ctx.Done()
+		// The first termination signal requests graceful cancellation. Restore
+		// default handling immediately so a second signal hard-terminates a
+		// provider or filesystem cleanup that does not return.
+		stop()
+	}()
+
 	root := newRootCmd()
 	root.SetArgs(normalizeArgs(os.Args[1:]))
 	if err := root.ExecuteContext(ctx); err != nil {
-		// Reached only for errors cobra surfaces itself (unknown command,
-		// bad flag, wrong arg count, -chdir failure) — command bodies exit
-		// via exitRun and never return an error here.
+		var exit *commandExit
+		if errors.As(err, &exit) {
+			if exit.err != nil {
+				emitDiags(diag.Diagnostics{diag.Errorf("", exit.err.Error(), "")})
+			}
+			return exit.code
+		}
 		emitDiags(diag.Diagnostics{diag.Errorf("", err.Error(), `run "tchori --help" for usage`)})
-		os.Exit(1)
+		return 1
 	}
+	return 0
+}
+
+func main() {
+	os.Exit(runMain())
 }

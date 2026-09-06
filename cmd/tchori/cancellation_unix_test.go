@@ -15,56 +15,126 @@ import (
 	"time"
 )
 
-func TestValidateInterruptKillsLaunchedProvider(t *testing.T) {
+func TestValidateTerminationKillsLaunchedProvider(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		signal os.Signal
+	}{
+		{name: "SIGINT", signal: os.Interrupt},
+		{name: "SIGTERM", signal: syscall.SIGTERM},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			work := t.TempDir()
+			writeConfig(t, work, "cancel-test")
+			pidFile := filepath.Join(t.TempDir(), "provider.pid")
+
+			cmd := exec.Command(tchoriBin, "--plugin-dir="+pluginDir, "validate") //nolint:gosec // binary built by TestMain into a temp dir
+			cmd.Dir = work
+			cmd.Env = append(os.Environ(),
+				"TCHORITEST_STALL_STARTUP=1",
+				"TCHORITEST_PID_FILE="+pidFile,
+			)
+			var stdout, stderr strings.Builder
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("start tchori validate: %v", err)
+			}
+			t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+			providerPID := waitForCLIProviderPID(t, pidFile, 5*time.Second)
+			if providerPID <= 1 {
+				t.Fatal("invalid provider PID")
+			}
+			process, err := os.FindProcess(providerPID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = process.Kill(); _ = process.Release() })
+
+			if err := cmd.Process.Signal(tc.signal); err != nil {
+				t.Fatalf("sending %s to tchori process: %v", tc.name, err)
+			}
+			waitErrCh := make(chan error, 1)
+			go func() { waitErrCh <- cmd.Wait() }()
+			select {
+			case err := <-waitErrCh:
+				var ee *exec.ExitError
+				if err != nil && !errors.As(err, &ee) {
+					t.Fatalf("tchori validate did not exit cleanly: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+				}
+			case <-time.After(5 * time.Second):
+				_ = cmd.Process.Kill()
+				t.Fatalf("tchori validate did not exit within 5s of %s; stdout: %s\nstderr: %s", tc.name, stdout.String(), stderr.String())
+			}
+			waitForCLIProviderExit(t, providerPID, 5*time.Second)
+		})
+	}
+}
+
+func TestSecondSIGINTHardTerminatesStalledCleanup(t *testing.T) {
 	work := t.TempDir()
-	writeConfig(t, work, "cancel-test")
-
+	writeConfig(t, work, "stop-test")
+	stopFile := filepath.Join(t.TempDir(), "provider.stopping")
 	pidFile := filepath.Join(t.TempDir(), "provider.pid")
-
 	cmd := exec.Command(tchoriBin, "--plugin-dir="+pluginDir, "validate") //nolint:gosec // binary built by TestMain into a temp dir
 	cmd.Dir = work
 	cmd.Env = append(os.Environ(),
-		"TCHORITEST_STALL_STARTUP=1",
+		"TCHORITEST_STALL_STOP=1",
+		"TCHORITEST_STOP_FILE="+stopFile,
 		"TCHORITEST_PID_FILE="+pidFile,
 	)
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("start tchori validate: %v", err)
+		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = cmd.Process.Kill() })
-
 	providerPID := waitForCLIProviderPID(t, pidFile, 5*time.Second)
-	if providerPID <= 1 {
-		t.Fatal("invalid provider PID")
-	}
-	process, err := os.FindProcess(providerPID)
+	providerProcess, err := os.FindProcess(providerPID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = process.Kill(); _ = process.Release() })
+	t.Cleanup(func() { _ = providerProcess.Kill(); _ = providerProcess.Release() })
+	waitForFile(t, stopFile, 5*time.Second)
 
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
-		t.Fatalf("sending SIGINT to tchori process: %v", err)
+		t.Fatal(err)
 	}
-
+	time.Sleep(25 * time.Millisecond)
+	if err := cmd.Process.Signal(os.Interrupt); err != nil {
+		t.Fatal(err)
+	}
 	waitErrCh := make(chan error, 1)
 	go func() { waitErrCh <- cmd.Wait() }()
-
 	select {
 	case err := <-waitErrCh:
-		var ee *exec.ExitError
-		if err != nil && !errors.As(err, &ee) {
-			t.Fatalf("tchori validate did not exit cleanly: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("second SIGINT did not terminate the process: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+		status, ok := exitErr.Sys().(syscall.WaitStatus)
+		if !ok || !status.Signaled() || status.Signal() != syscall.SIGINT {
+			t.Fatalf("exit status = %v, want termination by SIGINT", exitErr.Sys())
+		}
+	case <-time.After(2 * time.Second):
 		_ = cmd.Process.Kill()
-		t.Fatalf("tchori validate did not exit within 5s of SIGINT (the stalled provider sleeps 24h); stdout: %s\nstderr: %s",
-			stdout.String(), stderr.String())
+		t.Fatal("second SIGINT remained intercepted during stalled provider cleanup")
 	}
+}
 
-	waitForCLIProviderExit(t, providerPID, 5*time.Second)
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s was not created within %v", path, timeout)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func waitForCLIProviderPID(t *testing.T, path string, timeout time.Duration) int {
