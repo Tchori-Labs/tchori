@@ -18,6 +18,8 @@ type Attr struct {
 	Optional  bool
 	Computed  bool
 	Sensitive bool
+	// NestedType retains per-leaf metadata that cty.Type cannot represent.
+	NestedType map[string]*Attr
 }
 
 // NestedBlock is a nested configuration block inside a SchemaBlock.
@@ -157,7 +159,7 @@ func schemaFromProto(ps *tfplugin6.Schema) (*Schema, error) {
 // blockFromProto converts a wire Schema.Block. Flat attribute types arrive as
 // JSON-encoded cty type bytes (e.g. `"string"`, `["map","string"]`) and are
 // parsed with ctyjson.UnmarshalType; nested_type attributes (pa.NestedType)
-// are converted recursively by attrTypeFromProto/nestedObjectType.
+// are converted recursively by attrFromProto/nestedObjectType.
 func blockFromProto(pb *tfplugin6.Schema_Block) (*SchemaBlock, error) {
 	b := &SchemaBlock{
 		Attributes: map[string]*Attr{},
@@ -167,17 +169,11 @@ func blockFromProto(pb *tfplugin6.Schema_Block) (*SchemaBlock, error) {
 		return b, nil
 	}
 	for _, pa := range pb.Attributes {
-		ty, err := attrTypeFromProto(pa)
+		attr, err := attrFromProto(pa)
 		if err != nil {
 			return nil, err
 		}
-		b.Attributes[pa.Name] = &Attr{
-			Type:      ty,
-			Required:  pa.Required,
-			Optional:  pa.Optional,
-			Computed:  pa.Computed,
-			Sensitive: pa.Sensitive,
-		}
+		b.Attributes[pa.Name] = attr
 	}
 	for _, pnb := range pb.BlockTypes {
 		var nesting string
@@ -202,32 +198,31 @@ func blockFromProto(pb *tfplugin6.Schema_Block) (*SchemaBlock, error) {
 	return b, nil
 }
 
-// attrTypeFromProto converts one wire Schema_Attribute into a cty.Type. A
-// well-formed attribute carries exactly one of pa.Type (JSON-encoded cty
-// type bytes) or pa.NestedType (a *Schema_Object, aka nested_type — see
-// nestedObjectType). Neither set is a malformed schema.
-func attrTypeFromProto(pa *tfplugin6.Schema_Attribute) (cty.Type, error) {
+// attrFromProto preserves both the wire type and nested sensitivity metadata.
+func attrFromProto(pa *tfplugin6.Schema_Attribute) (*Attr, error) {
+	var ty cty.Type
+	var nested map[string]*Attr
+	var err error
 	if pa.NestedType != nil {
-		ty, err := nestedObjectType(pa.NestedType)
-		if err != nil {
-			return cty.NilType, fmt.Errorf("attribute %q: %w", pa.Name, err)
-		}
-		return ty, nil
+		ty, nested, err = nestedObjectType(pa.NestedType)
+	} else if len(pa.Type) != 0 {
+		ty, err = ctyjson.UnmarshalType(pa.Type)
+	} else {
+		return nil, fmt.Errorf("attribute %q: neither type nor nested_type is set", pa.Name)
 	}
-	if len(pa.Type) == 0 {
-		return cty.NilType, fmt.Errorf("attribute %q: neither type nor nested_type is set", pa.Name)
-	}
-	ty, err := ctyjson.UnmarshalType(pa.Type)
 	if err != nil {
-		return cty.NilType, fmt.Errorf("attribute %q: parsing type %s: %w", pa.Name, pa.Type, err)
+		return nil, fmt.Errorf("attribute %q: %w", pa.Name, err)
 	}
-	return ty, nil
+	return &Attr{
+		Type: ty, Required: pa.Required, Optional: pa.Optional,
+		Computed: pa.Computed, Sensitive: pa.Sensitive, NestedType: nested,
+	}, nil
 }
 
 // nestedObjectType converts a tfprotov6 nested_type (Schema_Object) into its
 // cty type: SINGLE -> object, LIST -> list(object), SET -> set(object),
 // MAP -> map(object). Each nested attribute recurses through
-// attrTypeFromProto, so a nested_type attribute nested inside another
+// attrFromProto, so a nested_type attribute nested inside another
 // nested_type attribute converts the same way arbitrarily deep (issue #7).
 //
 // Non-required nested attributes (Optional or Computed-only) are marked
@@ -246,15 +241,17 @@ func attrTypeFromProto(pa *tfplugin6.Schema_Attribute) (cty.Type, error) {
 // records it in ProviderSchemas.UnsupportedResources and tolerates it until
 // the resource type is actually used (issue #5's tolerate-until-used
 // machinery), exactly like any other conversion failure from this file.
-func nestedObjectType(so *tfplugin6.Schema_Object) (cty.Type, error) {
+func nestedObjectType(so *tfplugin6.Schema_Object) (cty.Type, map[string]*Attr, error) {
 	atys := make(map[string]cty.Type, len(so.Attributes))
+	nested := make(map[string]*Attr, len(so.Attributes))
 	var optional []string
 	for _, pa := range so.Attributes {
-		aty, err := attrTypeFromProto(pa)
+		attr, err := attrFromProto(pa)
 		if err != nil {
-			return cty.NilType, err
+			return cty.NilType, nil, err
 		}
-		atys[pa.Name] = aty
+		atys[pa.Name] = attr.Type
+		nested[pa.Name] = attr
 		if !pa.Required {
 			optional = append(optional, pa.Name)
 		}
@@ -262,15 +259,15 @@ func nestedObjectType(so *tfplugin6.Schema_Object) (cty.Type, error) {
 	obj := cty.ObjectWithOptionalAttrs(atys, optional)
 	switch so.Nesting {
 	case tfplugin6.Schema_Object_SINGLE:
-		return obj, nil
+		return obj, nested, nil
 	case tfplugin6.Schema_Object_LIST:
-		return cty.List(obj), nil
+		return cty.List(obj), nested, nil
 	case tfplugin6.Schema_Object_SET:
-		return cty.Set(obj), nil
+		return cty.Set(obj), nested, nil
 	case tfplugin6.Schema_Object_MAP:
-		return cty.Map(obj), nil
+		return cty.Map(obj), nested, nil
 	default:
-		return cty.NilType, fmt.Errorf("nested attribute type (nested_type): unsupported nesting mode %s", so.Nesting)
+		return cty.NilType, nil, fmt.Errorf("nested attribute type (nested_type): unsupported nesting mode %s", so.Nesting)
 	}
 }
 

@@ -47,12 +47,7 @@ func walkSchema(block *provider.SchemaBlock, prefix string, paths map[string]boo
 	if block == nil {
 		return
 	}
-	for name, attr := range block.Attributes {
-		path := join(prefix, name)
-		if attr != nil && attr.Sensitive {
-			paths[path] = true
-		}
-	}
+	walkAttributes(block.Attributes, prefix, paths, setPrefixes)
 	for name, nested := range block.Blocks {
 		if nested == nil {
 			continue
@@ -62,6 +57,24 @@ func walkSchema(block *provider.SchemaBlock, prefix string, paths map[string]boo
 			*setPrefixes = append(*setPrefixes, path)
 		}
 		walkSchema(nested.Block, path, paths, setPrefixes)
+	}
+}
+
+func walkAttributes(attrs map[string]*provider.Attr, prefix string, paths map[string]bool, setPrefixes *[]string) {
+	for name, attr := range attrs {
+		if attr == nil {
+			continue
+		}
+		path := join(prefix, name)
+		if attr.Sensitive {
+			paths[path] = true
+		}
+		if len(attr.NestedType) != 0 {
+			if attr.Type.IsSetType() {
+				*setPrefixes = append(*setPrefixes, path)
+			}
+			walkAttributes(attr.NestedType, path, paths, setPrefixes)
+		}
 	}
 }
 

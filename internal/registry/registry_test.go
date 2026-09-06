@@ -26,6 +26,40 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp/armor"
 )
 
+func TestInstallBoundsMetadata(t *testing.T) {
+	for _, endpoint := range []string{"versions", "descriptor", "checksums", "signature"} {
+		t.Run(endpoint, func(t *testing.T) {
+			fr := newFakeRegistry(t, "example", "fixture", "1.2.3", "fixture")
+			oversized := func(w http.ResponseWriter, _ *http.Request) {
+				// A finite chunked body exceeds the metadata limit even without
+				// an advertised Content-Length.
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				chunk := strings.Repeat(" ", 1<<20)
+				for range 9 {
+					if _, err := io.WriteString(w, chunk); err != nil {
+						return
+					}
+				}
+			}
+			switch endpoint {
+			case "versions":
+				fr.versionsHandler = oversized
+			case "descriptor":
+				fr.descriptorHandler = oversized
+			case "checksums":
+				fr.shasumsHandler = oversized
+			case "signature":
+				fr.signatureHandler = oversized
+			}
+			_, err := Install(context.Background(), "example/fixture", "1.2.3", fr.srv.URL, t.TempDir())
+			if err == nil || !strings.Contains(err.Error(), "metadata exceeds") {
+				t.Fatalf("oversized %s must hit the metadata size limit, got %v", endpoint, err)
+			}
+		})
+	}
+}
+
 // buildFakeProviderZip returns zip bytes containing a single flat-root file
 // named "terraform-provider-<name>" holding content. This mirrors the real
 // OpenTofu registry archive layout confirmed in research: an unversioned

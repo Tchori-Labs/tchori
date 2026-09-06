@@ -23,6 +23,7 @@
 package apply
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sort"
@@ -34,6 +35,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/config"
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/plan"
+	"github.com/tchori-labs/tchori/internal/privateblob"
 	"github.com/tchori-labs/tchori/internal/provider"
 	"github.com/tchori-labs/tchori/internal/sensitive"
 	"github.com/tchori-labs/tchori/internal/state"
@@ -56,8 +58,8 @@ import (
 // ordering, and configuration-drift refusals happen before any save.
 //
 // Ordering note: pl.Changes is sorted alphabetically by address (see
-// plan.finalize) purely so plan.json is byte-for-byte deterministic — that
-// order carries no dependency information and must never drive execution.
+// plan.finalize) for stable document ordering; it carries no dependency
+// information and must never drive execution.
 // A dependent whose address sorts before its dependency (e.g.
 // tchoritest_thing.a_first referencing ${tchoritest_thing.z_second.id})
 // would otherwise be applied before the resource it depends on exists.
@@ -89,6 +91,9 @@ type NotExecutedChange struct {
 // Apply returns truthful execution accounting alongside all diagnostics.
 func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map[string]*provider.Client, schemas map[string]*provider.ProviderSchemas, st *state.State, statePath string) (Result, diag.Diagnostics) {
 	var result Result
+	if err := privateblob.ValidateKey(); err != nil {
+		return result, diag.Diagnostics{diag.Errorf("", "invalid artifact key", err.Error())}
+	}
 	hadMarker := st.Incomplete != nil
 	if pl.StateSerial != st.Serial {
 		return result, diag.Diagnostics{diag.Errorf("", "stale plan", fmt.Sprintf(
@@ -204,6 +209,17 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 	// partially actionable.
 	var driftDiags diag.Diagnostics
 	for _, ch := range pl.Changes {
+		if len(ch.Private) != 0 && (ch.Type == "" || ch.Provider == "") {
+			driftDiags = append(driftDiags, diag.Errorf(ch.Address, "plan has unbound private data",
+				"the plan does not record the resource type and provider for its private data; run plan again"))
+			continue
+		}
+		typeName, providerName, known := resourceIdentity(cfg, st, ch.Address)
+		if known && ((ch.Type != "" && ch.Type != typeName) || (ch.Provider != "" && ch.Provider != providerName)) {
+			driftDiags = append(driftDiags, diag.Errorf(ch.Address, "plan does not match resource identity",
+				"the resource type or provider changed since the plan was created; run plan again"))
+			continue
+		}
 		if ch.Action == "delete" {
 			continue
 		}
@@ -217,6 +233,12 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 	if driftDiags.HasErrors() {
 		return result, driftDiags
 	}
+
+	unlock, err := st.Lock(ctx, statePath)
+	if err != nil {
+		return result, diag.Diagnostics{diag.Errorf("", "locking state", err.Error())}
+	}
+	defer unlock()
 
 	marked := len(ordered) > 0
 	if marked {
@@ -402,24 +424,27 @@ func (ex *executor) save() error {
 	return nil
 }
 
+// resourceIdentity is shared by preflight and execution so authenticated plan
+// metadata is checked against the exact provider that will receive the call.
+func resourceIdentity(cfg *config.Config, st *state.State, address string) (resourceType, providerName string, known bool) {
+	if cfg != nil && cfg.Resources[address] != nil {
+		resource := cfg.Resources[address]
+		return resource.Type, resource.Provider, true
+	}
+	if resource := st.Resources[address]; resource != nil {
+		return resource.Type, resource.Provider, true
+	}
+	return "", "", false
+}
+
 // applyChange executes one plan change and persists its result. For TC-048,
 // every non-delete config is composed before action dispatch so replace cannot
 // destroy the prior object before an unresolved-reference failure is known.
 func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagnostics {
 	addr := ch.Address
 
-	// Type and provider come from config when the resource is present; a
-	// delete of a resource that was removed from config falls back to the
-	// state entry (which records both).
-	var typeName, providerName string
-	switch {
-	case ex.cfg != nil && ex.cfg.Resources[addr] != nil:
-		typeName = ex.cfg.Resources[addr].Type
-		providerName = ex.cfg.Resources[addr].Provider
-	case ex.st.Resources[addr] != nil:
-		typeName = ex.st.Resources[addr].Type
-		providerName = ex.st.Resources[addr].Provider
-	default:
+	typeName, providerName, known := resourceIdentity(ex.cfg, ex.st, addr)
+	if !known {
 		return diag.Diagnostics{diag.Errorf(addr, "unknown resource",
 			"address appears in the plan but in neither configuration nor state")}
 	}
@@ -501,6 +526,23 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 		return ds
 	}
 
+	// Decode and validate the replacement before destroying the prior object.
+	// Resolve plan-time unknown references against dependency-ordered state.
+	planned, err := provider.DecodeMsgpack(ch.PlannedRaw, ty)
+	if err != nil {
+		return append(ds, diag.Errorf(addr, "corrupt planned value", err.Error()))
+	}
+	planned = resolvePlannedUnknowns(planned, cfgVal)
+	if planned.IsNull() || !planned.IsKnown() {
+		return append(ds, diag.Errorf(addr, "invalid planned value", "create, update, and replace require a known, non-null resource object"))
+	}
+	for _, finding := range provider.FindUnresolvedReferences(planned) {
+		ds = append(ds, provider.UnresolvedReferenceDiagnostic(addr, finding))
+	}
+	if ds.HasErrors() {
+		return ds
+	}
+
 	switch ch.Action {
 	case "replace":
 		// Destroy-then-create: two explicit ApplyResource calls. The state
@@ -511,9 +553,9 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 		if destroyDs.HasErrors() {
 			return ds
 		}
-		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, cty.NullVal(ty), cfgVal, ch)...)
+		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, cty.NullVal(ty), cfgVal, planned, ch)...)
 	default: // "create", "update"
-		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, prior, cfgVal, ch)...)
+		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, prior, cfgVal, planned, ch)...)
 	}
 }
 
@@ -537,53 +579,35 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 	return append(ds, unresolvedWarnings(ex.st)...)
 }
 
-// createOrUpdate decodes the planned value captured at plan time (msgpack,
-// may contain unknowns), overlays the already-composed config, rejects any
-// unresolved reference that survived in an older plan document, applies, then
-// records the provider's returned state and saves. cfgVal was composed by
-// applyChange before any replace destroy leg.
-func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, addr string, block *provider.SchemaBlock, ty cty.Type, prior, cfgVal cty.Value, ch *plan.Change) diag.Diagnostics {
-	planned, err := provider.DecodeMsgpack(ch.PlannedRaw, ty)
-	if err != nil {
-		return diag.Diagnostics{diag.Errorf(addr, "corrupt planned value", err.Error())}
-	}
-
-	// ch.PlannedRaw was captured at plan time: an attribute whose raw config
-	// is a ${..} reference to a resource that had not yet applied within
-	// that same plan (e.g. two new resources created together, one
-	// referencing the other's computed id) is still unknown there — the
-	// referenced resource's real value did not exist yet. By now,
-	// dependency-ordered execution (see Apply) guarantees any resource
-	// addr's config references has already applied, so cfgVal — recomposed
-	// above against current state — holds the concrete value. Overlay it
-	// onto planned's unknown leaves before applying; leaves the provider's
-	// own computed attributes (absent from raw config, hence null in
-	// cfgVal, e.g. "id") unknown for the provider itself to resolve, same
-	// as before.
-	planned = resolvePlannedUnknowns(planned, cfgVal)
+// createOrUpdate applies the value prepared before any replace destroy leg,
+// then records the provider's returned state and saves.
+func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, addr string, block *provider.SchemaBlock, ty cty.Type, prior, cfgVal, planned cty.Value, ch *plan.Change) diag.Diagnostics {
 	var ds diag.Diagnostics
-	for _, finding := range provider.FindUnresolvedReferences(planned) {
-		ds = append(ds, provider.UnresolvedReferenceDiagnostic(addr, finding))
-	}
-	if ds.HasErrors() {
-		return ds
-	}
 
 	newState, newPrivate, applyDs := client.ApplyResource(ctx, typeName, prior, planned, cfgVal, ch.Private)
 	applyDs = provider.Context(addr, applyDs)
 	ds = append(ds, applyDs...)
-	if applyDs.HasErrors() {
-		return append(ds, attemptedChangeSummary(addr, ch.Action, block, prior, planned)...)
-	}
-	if ds.HasErrors() {
-		return ds
+	failed := applyDs.HasErrors()
+	if failed {
+		ds = append(ds, attemptedChangeSummary(addr, ch.Action, block, prior, planned)...)
+		if newState == cty.NilVal || newState.IsNull() || !newState.IsKnown() {
+			return ds
+		}
+		// Unchanged prior state needs no extra checkpoint. A changed partial
+		// result must survive so the next run can recover the remote object.
+		if old := ex.st.Resources[addr]; old != nil && newState.RawEquals(prior) && bytes.Equal(newPrivate, old.Private) {
+			return ds
+		}
 	}
 
 	// Compute consistency diagnostics before encoding. Degenerate null or
 	// shallow-unknown resource roots return their named errors immediately;
 	// a partially unknown object is still walked for actionable leaf errors,
 	// then the encoding guard below prevents it from being persisted.
-	consistencyDs := checkResultConsistency(addr, block, planned, cfgVal, newState)
+	var consistencyDs diag.Diagnostics
+	if !failed {
+		consistencyDs = checkResultConsistency(addr, block, planned, cfgVal, newState)
+	}
 	if newState.IsNull() || !newState.IsKnown() {
 		return append(ds, consistencyDs...)
 	}
@@ -595,7 +619,9 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	}
 	// Keep the full result only in memory so same-run references resolve even
 	// though the durable state withholds the source value.
-	ex.applied[addr] = newState
+	if !failed {
+		ex.applied[addr] = newState
+	}
 	redactedState, redactedPaths, err := spec.Redact(newState)
 	if err != nil {
 		return append(ds, diag.Errorf(addr, "redacting new state", err.Error()))
@@ -621,7 +647,9 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	if err := ex.save(); err != nil {
 		return append(ds, diag.Errorf(addr, "saving state", err.Error()))
 	}
-	ex.mutations = append(ex.mutations, stateMutation{addr: addr, action: ch.Action})
+	if !failed {
+		ex.mutations = append(ex.mutations, stateMutation{addr: addr, action: ch.Action})
+	}
 	ds = append(ds, unresolvedWarnings(ex.st)...)
 	return append(ds, consistencyDs...)
 }

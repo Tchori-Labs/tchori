@@ -33,11 +33,11 @@ over later candidates. Duplicate names are allowed and are checked in the
 order written. A candidate list must contain at least one name, and every
 candidate must be a string.
 
-The names are chosen entirely by the configuration author. **tchori defines no
-built-in or provider-specific environment variable names.** In particular, it
-does not automatically try names documented by a provider or translate one
-provider's naming convention into another. Use a candidate list when the same
-configuration must work in environments that already export different names.
+For provider/resource environment wrappers, the names are chosen entirely by
+the configuration author. **tchori defines no built-in provider credential
+names.** It does not automatically try names documented by a provider or
+translate one provider's naming convention into another. Use a candidate list
+when environments already export different names.
 
 For example, a Coolify-style provider configuration can accept both an
 existing workspace convention and an alternate convention without shell alias
@@ -58,10 +58,13 @@ assignments:
 }
 ```
 
-Environment wrappers are currently accepted only in provider `config` blocks.
-They are rejected in resource configuration. They are also valid only where
-the provider schema expects a string; wrapping a boolean or number is an
-error. Objects with additional keys are ordinary JSON objects, not wrappers.
+Environment wrappers are accepted in provider and resource `config` blocks.
+They are valid only where the provider schema expects a string; wrapping a
+boolean or number is an error. Objects with additional keys are ordinary JSON
+objects, not wrappers. Resource wrappers resolve from the environment at
+execution time and are not treated as literal exemptions from sensitivity
+redaction. JSON numbers retain their precision when loaded for provider RPCs,
+including integers above JavaScript's safe-integer range.
 
 ## Commands that require provider values
 
@@ -106,3 +109,41 @@ never return or copy that value into resource data. Resolved values may be
 recorded in `state.json` or `plan.json`; protect and review those files as
 sensitive artifacts. See [plan and state formats](formats.md), including the
 sensitive-attribute behavior and override mechanism.
+
+## Artifact encryption key
+
+`TCHORI_ARTIFACT_KEY` is an engine setting, separate from provider environment
+wrappers. Supply exactly 32 random bytes encoded with standard base64 through
+the environment. Tchori uses AES-256-GCM to protect opaque provider private
+data in state, backups, plans, and JSON serialization; it never tries to
+interpret or redact those bytes.
+
+Generate a workspace key once and store it in your secret manager. Inject
+that same key into subsequent CLI/MCP sessions and automation. Do not place
+it in config, command-line arguments, source control, logs, or alongside the
+artifacts it protects. Key loss prevents recovery of encrypted private data.
+There is no plaintext fallback or automatic replacement key.
+
+Apply and import check the key before resource mutations, even when the
+provider has not yet returned private data. Reading encrypted artifacts and
+writing nonempty private data also require the key. Validation and reads of
+artifacts without private data do not require it merely to parse those
+artifacts. Invalid keys, failed authentication, and tampering produce errors
+without revealing key or private values.
+
+New state and plan writes use format `1.1`. This build can read legacy `1.0`
+artifacts for migration, but old engines reject `1.1` instead of silently
+discarding encrypted private data. `tchori state sanitize` upgrades legacy
+state and protects its backup without applying infrastructure changes.
+Previously leaked values still require credential rotation and history
+cleanup; rewriting the working tree does not erase existing commits.
+Legacy plans carrying private bytes without recorded resource identity must
+be recomputed before apply; reading them does not authenticate which provider
+should receive their private data. Current plans are refused if their recorded
+type/provider differs from the live execution target.
+
+
+Encryption protects private bytes, not the entire document. Resource
+attributes still rely on provider sensitivity metadata and explicit
+`sensitive_attributes`; treat artifacts as sensitive and review them before
+publishing.

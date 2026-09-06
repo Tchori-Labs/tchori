@@ -12,6 +12,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -90,6 +91,9 @@ func (c *Client) PlanResource(ctx context.Context, typeName string, prior, propo
 		return nil, diag.Diagnostics{diag.Errorf("", "PlanResourceChange RPC failed", err.Error())}
 	}
 	ds = rpcDiagnostics(resp.Diagnostics)
+	if resp.Deferred != nil {
+		return nil, append(ds, diag.Errorf("", "deferred planning is not supported", "provider deferred this resource; no executable plan was produced"))
+	}
 	if ds.HasErrors() {
 		return nil, ds
 	}
@@ -132,12 +136,12 @@ func (c *Client) ApplyResource(ctx context.Context, typeName string, prior, plan
 		return cty.NilVal, nil, diag.Diagnostics{diag.Errorf("", "ApplyResourceChange RPC failed", err.Error())}
 	}
 	ds = rpcDiagnostics(resp.Diagnostics)
-	if ds.HasErrors() {
+	if ds.HasErrors() && resp.NewState == nil {
 		return cty.NilVal, nil, ds
 	}
 	newState, moreDs := decodeRPCState(resp.NewState, planned.Type(), "new state")
 	ds = append(ds, moreDs...)
-	if ds.HasErrors() {
+	if moreDs.HasErrors() {
 		return cty.NilVal, nil, ds
 	}
 	return newState, resp.Private, ds
@@ -159,6 +163,9 @@ func (c *Client) ReadResource(ctx context.Context, typeName string, current cty.
 		return cty.NilVal, nil, diag.Diagnostics{diag.Errorf("", "ReadResource RPC failed", err.Error())}
 	}
 	ds = rpcDiagnostics(resp.Diagnostics)
+	if resp.Deferred != nil {
+		return cty.NilVal, nil, append(ds, diag.Errorf("", "deferred refresh is not supported", "provider deferred this resource; recorded state is retained"))
+	}
 	if ds.HasErrors() {
 		return cty.NilVal, nil, ds
 	}
@@ -186,6 +193,9 @@ func (c *Client) ImportResource(ctx context.Context, typeName, id string, ty cty
 		return cty.NilVal, nil, diag.Diagnostics{diag.Errorf("", "ImportResourceState RPC failed", err.Error())}
 	}
 	ds := rpcDiagnostics(resp.Diagnostics)
+	if resp.Deferred != nil {
+		return cty.NilVal, nil, append(ds, diag.Errorf("", "deferred import is not supported", "provider deferred this resource; no state was imported"))
+	}
 	if ds.HasErrors() {
 		return cty.NilVal, nil, ds
 	}
@@ -198,6 +208,9 @@ func (c *Client) ImportResource(ctx context.Context, typeName, id string, ty cty
 		return cty.NilVal, nil, diag.Diagnostics{diag.Errorf("", "multi-resource import not supported", "")}
 	}
 	imported := resp.ImportedResources[0]
+	if imported == nil || imported.TypeName != typeName {
+		return cty.NilVal, nil, append(ds, diag.Errorf("", "imported resource type mismatch", fmt.Sprintf("provider must return exactly one resource of type %q", typeName)))
+	}
 	state, moreDs := decodeRPCState(imported.State, ty, "imported state")
 	ds = append(ds, moreDs...)
 	if ds.HasErrors() {

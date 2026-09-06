@@ -61,12 +61,11 @@ export TCHORI_BIN="$HOME/.local/tchori-bin/tchori"
       importless binary, so stop and fix `PATH`. Under Discipline B, verify
       `ls -l "$TCHORI_BIN"` and use that expansion everywhere. Run `tchori
       import --help`: it must exit 0 and print `tchori import ADDRESS ID`.
-- [ ] Capture `tchori version` as metadata only (expected `0.1.0-dev`). It is
-      **not provenance**: `version.Version` is a hardcoded, build-invariant
-      constant with no SHA ldflags stamping, and the CLI test asserts that
-      literal. Identity comes from the clean checkout, matching HEAD, build
-      from that checkout, resolution check, and `import --help` capability
-      probe.
+- [ ] Capture `tchori version` as metadata only. Source builds normally report
+      `0.1.0-dev`; release builds stamp their version through linker flags.
+      Neither value alone proves source provenance. Identity comes from the
+      clean checkout, matching HEAD, build from that checkout, resolution
+      check, and `import --help` capability probe.
 - [ ] Check out Tchori-Labs/infra. Its `infra/cloudflare` directory must have
       the existing `state.json` and at least one `*.tchori.json`. Start with a
       clean `git status` so every resulting change is attributable to this run.
@@ -78,6 +77,13 @@ export TCHORI_BIN="$HOME/.local/tchori-bin/tchori"
       zone as `CLOUDFLARE_API_TOKEN`, and the zone ID as
       `CLOUDFLARE_ZONE_ID`. Source the token from a secret manager or use
       `read -rs`; never type it inline or retain it in shell history.
+- [ ] Inject the persistent workspace `TCHORI_ARTIFACT_KEY` from the approved
+      secret manager: standard base64 encoding of 32 random bytes. Import
+      refuses to mutate without a valid key. Reuse the same key for encrypted
+      state, plans, and backup recovery; never print it, commit it, or generate
+      a different key on each invocation. See
+      [artifact key management](configuration.md#artifact-encryption-key) and
+      [infra adoption #150](https://github.com/Tchori-Labs/infra/issues/150).
 - [ ] Install `jq` and curl 7.x or newer; verify with `curl --version`. Keep
       shell xtrace (`set -x`) off.
 
@@ -215,9 +221,10 @@ EOF
   Adapt rather than copy. TTL must equal the live numeric value (automatic is
   `1`). Proxied is not meaningful for TXT; include it only when schema and live
   object both carry it. Match comment/tags when set and omit only when absent.
-  Priority applies to MX/SRV, not TXT. Environment wrappers are permitted only
-  in provider config and rejected in resource config. Record each managed
-  argument and whether its source was a live field or deliberate omission.
+  Priority applies to MX/SRV, not TXT. Environment wrappers are permitted in
+  both provider and resource config when the schema expects a string. Record
+  each managed argument and whether its source was a live field or deliberate
+  omission.
 
 - [ ] **6. Validate.** `tchori validate` must exit 0, proving the merged block
       parses and its provider resolves before state is touched.
@@ -241,9 +248,11 @@ EOF
 
 Never place the token in config, argv, this run record, or a PR comment. It is
 referenced only as `${CLOUDFLARE_API_TOKEN}` in curl's stdin config and as
-`{"env": "CLOUDFLARE_API_TOKEN"}` in provider config. Provider responses are
-stored verbatim in state and plan files; inspect diffs for token-derived data
-before committing.
+`{"env": "CLOUDFLARE_API_TOKEN"}` in provider config. Sensitive attributes are
+withheld according to schema/config metadata and opaque private recovery data
+is encrypted. Unmarked attributes can still carry token-derived data; inspect
+diffs before committing. Neither sanitization nor encryption revokes an
+already exposed credential or removes historical copies.
 
 Import never overwrites an existing state entry, so repeating it after a
 mistake exits 1. For the expected uncommitted failure (wrong object, or plan
@@ -253,6 +262,10 @@ state.json` (or `git checkout -- state.json`), fix config or the record ID, and
 restart at validation. If a wrong import was already merged, open a reverting
 PR in the infra repo. Rollback is always restore from version control or revert
 of a reviewed commit.
+Retain the artifact key for restored encrypted versions. If a rollback brings
+back legacy plaintext, sanitize the restored state and backup before
+recommitting; follow the security incident's rotation/history-remediation
+procedure rather than treating a clean working-tree diff as proof of cleanup.
 
 ## Run record
 

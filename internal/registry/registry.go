@@ -426,6 +426,23 @@ func safeZipEntryName(name string) (string, error) {
 	return cleaned, nil
 }
 
+// Metadata is small relative to provider archives; bound even chunked streams.
+func readMetadata(resp *http.Response) ([]byte, error) {
+	const limit = 8 << 20
+	defer func() { _ = resp.Body.Close() }()
+	if resp.ContentLength > limit {
+		return nil, fmt.Errorf("registry: metadata exceeds %d byte limit", limit)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > limit {
+		return nil, fmt.Errorf("registry: metadata exceeds %d byte limit", limit)
+	}
+	return body, nil
+}
+
 // Install downloads source@version for the current GOOS/GOARCH from the
 // OpenTofu registry (baseURL default "https://registry.opentofu.org"),
 // authenticates the exact SHA256SUMS bytes with a detached OpenPGP signature
@@ -465,8 +482,10 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 		return "", err
 	}
 	var vBody versionsResponse
-	decErr := json.NewDecoder(vResp.Body).Decode(&vBody)
-	_ = vResp.Body.Close()
+	vBodyBytes, decErr := readMetadata(vResp)
+	if decErr == nil {
+		decErr = json.Unmarshal(vBodyBytes, &vBody)
+	}
 	if decErr != nil {
 		return "", fmt.Errorf("registry: decoding %s: %w", versionsURL, decErr)
 	}
@@ -489,8 +508,10 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 		return "", err
 	}
 	var meta downloadResponse
-	decErr = json.NewDecoder(dResp.Body).Decode(&meta)
-	_ = dResp.Body.Close()
+	dBodyBytes, decErr := readMetadata(dResp)
+	if decErr == nil {
+		decErr = json.Unmarshal(dBodyBytes, &meta)
+	}
 	if decErr != nil {
 		return "", fmt.Errorf("registry: decoding %s: %w", downloadURL, decErr)
 	}
@@ -536,8 +557,7 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 	if err != nil {
 		return "", err
 	}
-	sumsBody, err := io.ReadAll(sResp.Body)
-	_ = sResp.Body.Close()
+	sumsBody, err := readMetadata(sResp)
 	if err != nil {
 		return "", fmt.Errorf("registry: reading %s: %w", meta.ShasumsURL, err)
 	}
@@ -548,8 +568,7 @@ func Install(ctx context.Context, source, version, baseURL, cacheDir string) (st
 	if err != nil {
 		return "", err
 	}
-	sigBytes, err := io.ReadAll(sigResp.Body)
-	_ = sigResp.Body.Close()
+	sigBytes, err := readMetadata(sigResp)
 	if err != nil {
 		return "", fmt.Errorf("registry: reading %s: %w", meta.ShasumsSignatureURL, err)
 	}

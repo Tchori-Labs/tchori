@@ -9,7 +9,6 @@ import (
 	"io"
 	"maps"
 	"os"
-	"os/signal"
 	"slices"
 	"strconv"
 	"strings"
@@ -24,6 +23,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/mcpserv"
 	"github.com/tchori-labs/tchori/internal/plan"
+	"github.com/tchori-labs/tchori/internal/privateblob"
 	"github.com/tchori-labs/tchori/internal/provider"
 	"github.com/tchori-labs/tchori/internal/registry"
 	"github.com/tchori-labs/tchori/internal/sensitive"
@@ -405,6 +405,10 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 	ctx := cmd.Context()
 	address, id := args[0], args[1]
 
+	if err := privateblob.ValidateKey(); err != nil {
+		return 1, err
+	}
+
 	rt, cleanup, ds := buildRuntime(ctx, flagPluginDir)
 	emitDiags(ds)
 	if ds.HasErrors() {
@@ -421,6 +425,11 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	unlock, err := st.Lock(ctx, stateFileName)
+	if err != nil {
+		return 1, err
+	}
+	defer unlock()
 	if _, exists := st.Resources[address]; exists {
 		return 1, fmt.Errorf("%s already exists in state; import does not overwrite", address)
 	}
@@ -519,6 +528,17 @@ func emitIncompleteStateWarning(st *state.State) {
 }
 
 func newStateCmd() *cobra.Command {
+	var discoverSensitive bool
+	show := &cobra.Command{
+		Use:   "show ADDRESS",
+		Short: "Show one resource's state as JSON",
+		Args:  cobra.ExactArgs(1),
+		RunE: exitRun(func(cmd *cobra.Command, args []string) (int, error) {
+			return runStateShow(cmd, args, discoverSensitive)
+		}),
+	}
+	show.Flags().BoolVar(&discoverSensitive, "discover-sensitive", false, "load provider schemas to discover and mask sensitive attributes without changing state")
+
 	cmd := &cobra.Command{
 		Use:   "state",
 		Short: "Inspect the state file",
@@ -530,11 +550,12 @@ func newStateCmd() *cobra.Command {
 			Args:  cobra.NoArgs,
 			RunE:  exitRun(runStateList),
 		},
+		show,
 		&cobra.Command{
-			Use:   "show ADDRESS",
-			Short: "Show one resource's state as JSON",
-			Args:  cobra.ExactArgs(1),
-			RunE:  exitRun(runStateShow),
+			Use:   "sanitize",
+			Short: "Scrub sensitive values from state and its backup",
+			Args:  cobra.NoArgs,
+			RunE:  exitRun(runStateSanitize),
 		},
 		&cobra.Command{
 			Use:   "status",
@@ -592,7 +613,206 @@ func runStateStatus(cmd *cobra.Command, _ []string) (int, error) {
 	return 0, nil
 }
 
-func runStateShow(cmd *cobra.Command, args []string) (int, error) {
+// sensitiveContext is the schema-only sensitivity view shared by state
+// sanitization and --discover-sensitive rendering. It launches providers only
+// to fetch schemas: it never configures them or calls a resource RPC.
+type sensitiveContext struct {
+	resolutions map[string]state.Resolution
+	resolved    map[string]bool
+}
+
+func buildSensitiveContext(ctx context.Context, st *state.State, addresses []string) (*sensitiveContext, func(), diag.Diagnostics) {
+	cfg, ds := config.Load(".")
+	if ds.HasErrors() {
+		return nil, func() {}, ds
+	}
+
+	result := &sensitiveContext{
+		resolutions: make(map[string]state.Resolution, len(addresses)),
+		resolved:    make(map[string]bool, len(addresses)),
+	}
+	required := map[string]bool{}
+	for _, address := range mergePaths(addresses) {
+		rs := st.Resources[address]
+		if rs == nil {
+			continue
+		}
+		if resource := cfg.Resources[address]; resource != nil {
+			if resource.Type != rs.Type || resource.Provider != rs.Provider {
+				ds = append(ds, diag.Errorf(address, "cannot resolve sensitive state",
+					"configured resource type or provider differs from stored state; state was not changed"))
+				continue
+			}
+			required[resource.Provider] = true
+			continue
+		}
+		paths := mergePaths(rs.SensitivePaths, rs.Redacted)
+		if len(paths) == 0 {
+			ds = append(ds, diag.Errorf(address, "cannot resolve sensitive state",
+				"no live configuration or persisted sensitive paths are available; state was not changed"))
+			continue
+		}
+		// An orphan has no live schema. Keep persisted paths as a conservative
+		// fallback, but do not certify schema discovery as successful.
+		result.resolutions[address] = state.Resolution{Paths: paths}
+	}
+	if ds.HasErrors() {
+		return nil, func() {}, ds
+	}
+
+	cacheDir, err := providerCacheDir()
+	if err != nil {
+		return nil, func() {}, append(ds, diag.Errorf("", "cannot locate provider cache", err.Error()))
+	}
+	clients := map[string]*provider.Client{}
+	cleanup := func() {
+		for _, client := range clients {
+			_ = client.Close()
+		}
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			cleanup()
+		}
+	}()
+
+	schemas := make(map[string]*provider.ProviderSchemas, len(required))
+	for _, name := range slices.Sorted(maps.Keys(required)) {
+		p := cfg.Providers[name]
+		if p == nil {
+			ds = append(ds, diag.Errorf("", fmt.Sprintf("provider %q is not configured", name), "state was not changed"))
+			continue
+		}
+		binary, err := registry.Discover(cacheDir, flagPluginDir, p.Source, p.Version)
+		if err != nil {
+			ds = append(ds, diag.Errorf("", fmt.Sprintf("provider %q is not installed", name),
+				fmt.Sprintf("%s\nrun: tchori providers install %s %s", err, p.Source, p.Version)))
+			continue
+		}
+		client, err := provider.Launch(ctx, binary)
+		if err != nil {
+			ds = append(ds, diag.Errorf("", fmt.Sprintf("launching provider %q failed", name), err.Error()))
+			continue
+		}
+		clients[name] = client
+		schema, schemaDiags := client.Schemas(ctx)
+		ds = append(ds, provider.Context("provider."+name, schemaDiags)...)
+		if schemaDiags.HasErrors() {
+			continue
+		}
+		schemas[name] = schema
+	}
+	if ds.HasErrors() {
+		return nil, func() {}, ds
+	}
+
+	for _, address := range mergePaths(addresses) {
+		rs := st.Resources[address]
+		resource := cfg.Resources[address]
+		if rs == nil || resource == nil {
+			continue
+		}
+		schemaSet := schemas[resource.Provider]
+		if schemaSet == nil {
+			ds = append(ds, diag.Errorf(address, "cannot resolve sensitive state",
+				fmt.Sprintf("provider %q returned no schemas; state was not changed", resource.Provider)))
+			continue
+		}
+		schema, unsupported, known := schemaSet.LookupResourceType(resource.Type)
+		if !known {
+			ds = append(ds, diag.Errorf(address, "cannot resolve sensitive state",
+				fmt.Sprintf("provider %q has no schema for resource type %q; state was not changed", resource.Provider, resource.Type)))
+			continue
+		}
+		if schema == nil {
+			ds = append(ds, diag.Errorf(address, "cannot resolve sensitive state",
+				fmt.Sprintf("unsupported schema for resource type %q: %s", resource.Type, unsupported)))
+			continue
+		}
+		attributes, err := provider.DecodeJSON(rs.Attributes, schema.Block.ImpliedType())
+		if err != nil || attributes.IsNull() {
+			ds = append(ds, diag.Errorf(address, "cannot resolve sensitive state",
+				"stored attributes do not match the configured provider schema; state was not changed"))
+			continue
+		}
+		spec, resolutionDiags := sensitive.Resolve(schema.Block, resource.SensitiveAttributes, resource.Config)
+		ds = append(ds, resolutionDiags.InContext(address)...)
+		if resolutionDiags.HasErrors() {
+			continue
+		}
+		result.resolutions[address] = state.Resolution{
+			Paths:           mergePaths(spec.Paths(), rs.SensitivePaths, rs.Redacted),
+			ExemptInstances: spec.ExemptInstances(),
+		}
+		result.resolved[address] = true
+	}
+	if ds.HasErrors() {
+		return nil, func() {}, ds
+	}
+	ok = true
+	return result, cleanup, ds
+}
+
+func (c *sensitiveContext) lookup(address string) (state.Resolution, bool, bool) {
+	resolution, found := c.resolutions[address]
+	return resolution, found, found && c.resolved[address]
+}
+
+func (c *sensitiveContext) resolve(address string, _ *state.ResourceState) (state.Resolution, bool) {
+	resolution, found, resolved := c.lookup(address)
+	return resolution, found && resolved
+}
+
+func (c *sensitiveContext) unresolvedAddresses() []string {
+	var unresolved []string
+	for address := range c.resolutions {
+		if !c.resolved[address] {
+			unresolved = append(unresolved, address)
+		}
+	}
+	slices.Sort(unresolved)
+	return unresolved
+}
+
+func runStateSanitize(cmd *cobra.Command, _ []string) (int, error) {
+	st, err := state.Load(stateFileName)
+	if err != nil {
+		return 1, err
+	}
+	unlock, err := st.Lock(cmd.Context(), stateFileName)
+	if err != nil {
+		return 1, err
+	}
+	defer unlock()
+
+	context, cleanup, ds := buildSensitiveContext(cmd.Context(), st, slices.Sorted(maps.Keys(st.Resources)))
+	emitDiags(ds)
+	if ds.HasErrors() {
+		return 1, nil
+	}
+	defer cleanup()
+	st.SetSensitiveResolver(context.resolve)
+	if err := st.Save(stateFileName); err != nil {
+		return 1, err
+	}
+	if unresolved := mergePaths(context.unresolvedAddresses(), st.UnresolvedSensitiveAddresses()); len(unresolved) != 0 {
+		for _, address := range unresolved {
+			emitDiags(diag.Diagnostics{diag.Errorf(address, "cannot resolve sensitive state",
+				"state was saved only with persisted sensitive paths; review this entry before relying on sanitization")})
+		}
+		return 1, nil
+	}
+
+	withheld := 0
+	for _, rs := range st.Resources {
+		withheld += len(rs.Redacted)
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Sanitized state: %d resources checked; %d sensitive paths withheld.\n", len(st.Resources), withheld)
+	return 0, nil
+}
+
+func runStateShow(cmd *cobra.Command, args []string, discoverSensitive bool) (int, error) {
 	st, err := state.Load(stateFileName)
 	if err != nil {
 		return 1, err
@@ -602,17 +822,38 @@ func runStateShow(cmd *cobra.Command, args []string) (int, error) {
 		return 1, fmt.Errorf("no resource %q in state", args[0])
 	}
 	shown := *rs
-	if len(rs.SensitivePaths) != 0 {
-		// Provider-free read rendering is deliberately path-level: no raw config
-		// is available, and masking an authored literal in output is safer than
-		// echoing a credential. The on-disk state is never modified.
-		attrs, changed, err := sensitive.RedactJSON(rs.Attributes, rs.SensitivePaths, nil)
+	// Provider-private bytes are opaque transport state. State inspection must
+	// never serialize them back to an operator, whether or not discovery runs.
+	shown.Private = nil
+
+	paths := mergePaths(rs.SensitivePaths, rs.Redacted)
+	if discoverSensitive {
+		context, cleanup, ds := buildSensitiveContext(cmd.Context(), st, []string{args[0]})
+		emitDiags(ds)
+		if ds.HasErrors() {
+			return 1, nil
+		}
+		defer cleanup()
+		resolution, found, resolved := context.lookup(args[0])
+		if !found {
+			return 1, fmt.Errorf("%s: cannot resolve sensitive state", args[0])
+		}
+		paths = mergePaths(paths, resolution.Paths)
+		shown.SensitivePaths = paths
+		shown.SensitiveScanned = resolved
+	}
+	if len(paths) != 0 {
+		// Rendering never honors literal exemptions: operator output is a
+		// reporting surface, so conservative masking is safer than echoing a
+		// value that was previously persisted as sensitive.
+		attrs, changed, err := sensitive.RedactJSON(rs.Attributes, paths, nil)
 		if err != nil {
 			return 1, err
 		}
 		shown.Attributes = attrs
 		shown.Redacted = mergePaths(rs.Redacted, changed)
-	} else if !rs.SensitiveScanned {
+	}
+	if !shown.SensitiveScanned {
 		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Note: this state entry was not checked for sensitive values and may contain unredacted values; it will be checked on the next save-producing apply.")
 	}
 	b, err := json.MarshalIndent(&shown, "", "  ")
@@ -710,9 +951,7 @@ func newMCPCmd() *cobra.Command {
 		Short: "Serve state_list/state_show/plan/provider_schema over MCP stdio",
 		Args:  cobra.NoArgs,
 		RunE: exitRun(func(cmd *cobra.Command, _ []string) (int, error) {
-			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
-			defer stop()
-			if err := mcpserv.Serve(ctx, "."); err != nil && !errors.Is(err, context.Canceled) {
+			if err := mcpserv.Serve(cmd.Context(), "."); err != nil && !errors.Is(err, context.Canceled) {
 				return 1, err
 			}
 			return 0, nil

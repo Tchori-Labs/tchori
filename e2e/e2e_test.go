@@ -42,7 +42,8 @@ import (
 // binary whose wire protocol is genuinely 5-only. Do not swap in a
 // different provider without re-verifying.
 const nullVersion = "3.3.0"
-const secretSentinelE2E = "tchori-e2e-super-secret-value" //nolint:gosec // fake credential sentinel must be absent from artifacts
+const secretSentinelE2E = "tchori-e2e-super-secret-value"                                 //nolint:gosec // fake credential sentinel must be absent from artifacts
+const artifactKeyE2E = "TCHORI_ARTIFACT_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" //nolint:gosec // fixed non-secret test key
 
 // lifecycleConfig is the fake-provider workspace: two tchoritest_thing
 // resources where b's tag references a's computed id — a real dependency
@@ -160,11 +161,13 @@ func TestEndToEnd(t *testing.T) {
 		cmd := exec.Command(bin, args...)
 		cmd.Dir = dir
 		for _, kv := range os.Environ() {
-			if !strings.HasPrefix(kv, "HOME=") {
+			if !strings.HasPrefix(kv, "HOME=") &&
+				!strings.HasPrefix(kv, "TCHORI_REGISTRY_URL=") &&
+				!strings.HasPrefix(kv, "TCHORI_ARTIFACT_KEY=") {
 				cmd.Env = append(cmd.Env, kv)
 			}
 		}
-		cmd.Env = append(cmd.Env, "HOME="+home, "TCHORI_REGISTRY_URL="+fixture.URL)
+		cmd.Env = append(cmd.Env, "HOME="+home, "TCHORI_REGISTRY_URL="+fixture.URL, artifactKeyE2E)
 		var outBuf, errBuf bytes.Buffer
 		cmd.Stdout = &outBuf
 		cmd.Stderr = &errBuf
@@ -218,8 +221,8 @@ func TestEndToEnd(t *testing.T) {
 		// proves Configure ran with the composed config).
 		var st stateDoc
 		readJSON(t, filepath.Join(work, "state.json"), &st)
-		if st.FormatVersion != "1.0" {
-			t.Fatalf("state format_version = %q, want %q", st.FormatVersion, "1.0")
+		if st.FormatVersion != "1.1" {
+			t.Fatalf("state format_version = %q, want %q", st.FormatVersion, "1.1")
 		}
 		if st.Incomplete != nil {
 			t.Fatalf("successful end-to-end apply left incomplete marker: %+v", st.Incomplete)

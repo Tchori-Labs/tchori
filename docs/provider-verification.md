@@ -39,6 +39,11 @@ Using the same retained bytes for signature verification and checksum lookup is
 intentional. Reformatting, reparsing, or refetching the document between those
 operations could verify one byte sequence while trusting another.
 
+Each versions response, download descriptor, checksum document, and detached
+signature is limited to 8 MiB. The bound applies to streamed/chunked bodies as
+well as advertised `Content-Length`; oversized metadata is rejected before
+signature processing or cache extraction.
+
 ## Fail-closed policy
 
 Installation stops before cache extraction if any authenticity or integrity

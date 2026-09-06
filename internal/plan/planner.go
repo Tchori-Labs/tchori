@@ -236,7 +236,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		planned := pc.State
 		plannedValues[addr] = planned
 
-		ch, err := newChange(addr, prior, planned, ty, pc, spec)
+		ch, err := newChange(addr, res.Provider, res.Type, prior, planned, ty, pc, spec)
 		if err != nil {
 			ds = append(ds, diag.Errorf(addr, "cannot encode change", err.Error()))
 			return nil, ds
@@ -314,6 +314,8 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 	}
 	return &Change{
 		Address:    addr,
+		Type:       rs.Type,
+		Provider:   rs.Provider,
 		Action:     "delete",
 		Before:     before,
 		After:      json.RawMessage("null"),
@@ -323,7 +325,7 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 }
 
 // newChange classifies and serializes one provider-planned resource change.
-func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.PlannedChange, spec *sensitive.Spec) (*Change, error) {
+func newChange(addr, providerName, typeName string, prior, planned cty.Value, ty cty.Type, pc *provider.PlannedChange, spec *sensitive.Spec) (*Change, error) {
 	before := json.RawMessage("null") // JSON null for create
 	if !prior.IsNull() {
 		maskedPrior, _, err := spec.Redact(prior)
@@ -367,6 +369,8 @@ func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.
 
 	return &Change{
 		Address:         addr,
+		Type:            typeName,
+		Provider:        providerName,
 		Action:          classify(prior, planned, pc.RequiresReplace, spec),
 		Before:          before,
 		After:           after,

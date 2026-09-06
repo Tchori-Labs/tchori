@@ -302,7 +302,7 @@ func assertCommandTree(t *testing.T, tree *commandTree) {
 	groups := []string{"state", "providers"}
 	leaves := map[string][2]int{
 		"validate": {0, 0}, "plan": {0, 0}, "apply": {1, 1}, "destroy": {0, 0},
-		"import": {2, 2}, "state list": {0, 0}, "state show": {1, 1},
+		"import": {2, 2}, "state list": {0, 0}, "state show": {1, 1}, "state sanitize": {0, 0},
 		"providers install": {2, 2}, "providers list": {0, 0}, "mcp": {0, 0}, "version": {0, 0},
 	}
 	for _, path := range groups {
