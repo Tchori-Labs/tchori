@@ -30,7 +30,6 @@ import (
 	"strings"
 
 	"github.com/zclconf/go-cty/cty"
-	ctyjson "github.com/zclconf/go-cty/cty/json"
 
 	"github.com/tchori-labs/tchori/internal/config"
 	"github.com/tchori-labs/tchori/internal/diag"
@@ -120,9 +119,9 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 			return state.Resolution{}, false
 		}
 		return state.Resolution{
-			Paths:            spec.Paths(),
-			ProviderSource:   cfg.Providers[res.Provider].Source,
-			RedactAttributes: spec.Redactor(sch.Block.ImpliedType()),
+			Paths:              spec.Paths(),
+			ProviderSource:     cfg.Providers[res.Provider].Source,
+			SanitizeAttributes: spec.Sanitizer(sch.Block.ImpliedType()),
 		}, true
 	})
 
@@ -534,7 +533,7 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	var priorPrivate []byte
 	if ch.Action != "create" {
 		if rs := ex.st.Resources[addr]; rs != nil {
-			v, err := provider.DecodeJSON(rs.Attributes, ty)
+			v, err := spec.Restore(rs.Attributes, rs.SensitiveSetRecovery, ty)
 			if err != nil {
 				return diag.Diagnostics{diag.Errorf(addr, "corrupt state attributes", err.Error())}
 			}
@@ -628,24 +627,21 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 		if specDs.HasErrors() {
 			return ds
 		}
-		redacted, redactedPaths, err := spec.Redact(newState)
+		attrs, redactedPaths, recovery, err := spec.Project(newState)
 		if err != nil {
 			return append(ds, diag.Errorf(addr, "redacting partial destroy state", err.Error()))
 		}
-		attrs, err := ctyjson.Marshal(redacted, ty)
-		if err != nil {
-			return append(ds, diag.Errorf(addr, "encoding partial destroy state", err.Error()))
-		}
 		ex.st.NoteSensitive(addr, spec.Paths())
 		ex.st.Resources[addr] = &state.ResourceState{
-			Type:             typeName,
-			Provider:         providerName,
-			ProviderSource:   providerSource,
-			Attributes:       attrs,
-			Private:          newPrivate,
-			Redacted:         redactedPaths,
-			SensitivePaths:   spec.Paths(),
-			SensitiveScanned: true,
+			Type:                 typeName,
+			Provider:             providerName,
+			ProviderSource:       providerSource,
+			Attributes:           attrs,
+			Private:              newPrivate,
+			SensitiveSetRecovery: recovery,
+			Redacted:             redactedPaths,
+			SensitivePaths:       spec.Paths(),
+			SensitiveScanned:     true,
 		}
 		if err := ex.save(); err != nil {
 			if old != nil {
@@ -712,25 +708,21 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	if !failed {
 		ex.applied[addr] = newState
 	}
-	redactedState, redactedPaths, err := spec.Redact(newState)
+	attrs, redactedPaths, recovery, err := spec.Project(newState)
 	if err != nil {
 		return append(ds, diag.Errorf(addr, "redacting new state", err.Error()))
 	}
-	attrs, err := ctyjson.Marshal(redactedState, ty)
-	if err != nil {
-		ds = append(ds, consistencyDs...)
-		return append(ds, diag.Errorf(addr, "encoding new state", err.Error()))
-	}
 	ex.st.NoteSensitive(addr, spec.Paths())
 	ex.st.Resources[addr] = &state.ResourceState{
-		Type:             typeName,
-		Provider:         providerName,
-		ProviderSource:   providerSource,
-		Attributes:       attrs,
-		Private:          newPrivate,
-		Redacted:         redactedPaths,
-		SensitivePaths:   spec.Paths(),
-		SensitiveScanned: true,
+		Type:                 typeName,
+		Provider:             providerName,
+		ProviderSource:       providerSource,
+		Attributes:           attrs,
+		Private:              newPrivate,
+		SensitiveSetRecovery: recovery,
+		Redacted:             redactedPaths,
+		SensitivePaths:       spec.Paths(),
+		SensitiveScanned:     true,
 	}
 	if len(redactedPaths) != 0 {
 		ds = append(ds, diag.Warnf(addr, "sensitive attributes withheld from state", fmt.Sprintf("withheld paths: %s; capture provider-issued credentials in a secret store", strings.Join(redactedPaths, ", "))))

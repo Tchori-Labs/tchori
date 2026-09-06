@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	FormatVersion       = "1.1"
-	legacyFormatVersion = "1.0"
+	FormatVersion          = "1.2"
+	encryptedFormatVersion = "1.1"
+	legacyFormatVersion    = "1.0"
 )
 
 type Change struct {
@@ -96,8 +97,9 @@ type legacyPlanDocument struct {
 	Summary       Summary                 `json:"summary"`
 }
 
-// MarshalJSON emits format 1.1 and seals each non-empty provider private
-// payload using change metadata as authenticated context.
+// MarshalJSON emits format 1.2 and seals each non-empty provider private
+// payload using change metadata as authenticated context. Version 1.2 also
+// tells older engines not to apply set-sensitive plans they cannot persist.
 func (pl Plan) MarshalJSON() ([]byte, error) {
 	var changes []*changeDocument
 	if pl.Changes != nil {
@@ -130,8 +132,8 @@ func (pl Plan) MarshalJSON() ([]byte, error) {
 	})
 }
 
-// UnmarshalJSON accepts legacy 1.0 plaintext/base64 private fields for
-// migration and requires authenticated 1.1 envelopes.
+// UnmarshalJSON accepts legacy 1.0 plaintext/base64 private fields and
+// authenticated 1.1 and 1.2 envelopes.
 func (pl *Plan) UnmarshalJSON(data []byte) error {
 	var header struct {
 		FormatVersion string `json:"format_version"`
@@ -164,7 +166,7 @@ func (pl *Plan) UnmarshalJSON(data []byte) error {
 			StateSerial: legacy.StateSerial, Changes: changes, Drift: legacy.Drift, Summary: legacy.Summary,
 		}
 		return nil
-	case FormatVersion:
+	case encryptedFormatVersion, FormatVersion:
 		var doc planDocument
 		if err := json.Unmarshal(data, &doc); err != nil {
 			return err
@@ -201,7 +203,7 @@ func (pl *Plan) UnmarshalJSON(data []byte) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("unsupported plan format_version %q (supported: %q and %q)", header.FormatVersion, legacyFormatVersion, FormatVersion)
+		return fmt.Errorf("unsupported plan format_version %q (supported: %q, %q, and %q)", header.FormatVersion, legacyFormatVersion, encryptedFormatVersion, FormatVersion)
 	}
 }
 

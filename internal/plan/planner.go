@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/zclconf/go-cty/cty"
-	ctyjson "github.com/zclconf/go-cty/cty/json"
 	"github.com/zclconf/go-cty/cty/msgpack"
 
 	"github.com/tchori-labs/tchori/internal/config"
@@ -135,20 +134,30 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 			return nil, ds
 		}
 
-		// Prior value from state, decoded against the schema's implied type.
+		// Prior value from state. Sensitive-set recovery is applied before cty
+		// decoding so provider operations receive the original set membership.
 		prior := cty.NullVal(ty)
 		var priorPrivate []byte
-		var redactedPrior cty.Value
+		var recordedAttrs json.RawMessage
 		if hasPrior {
-			pv, err := provider.DecodeJSON(rs.Attributes, ty)
+			pv, err := spec.Restore(rs.Attributes, rs.SensitiveSetRecovery, ty)
 			if err != nil {
 				ds = append(ds, diag.Errorf(addr, "invalid state attributes", err.Error()))
 				return nil, ds
 			}
 			prior = pv
 			priorPrivate = rs.Private
+			storedPublic, err := provider.DecodeJSON(rs.Attributes, ty)
+			if err != nil {
+				ds = append(ds, diag.Errorf(addr, "invalid public state projection", err.Error()))
+				return nil, ds
+			}
 			var legacyPaths []string
-			redactedPrior, legacyPaths, err = spec.Redact(prior)
+			if spec.HasSensitiveSets() {
+				recordedAttrs, legacyPaths, err = sensitive.RedactJSON(rs.Attributes, spec.Paths())
+			} else {
+				recordedAttrs, legacyPaths, _, err = spec.Marshal(storedPublic)
+			}
 			if err != nil {
 				return nil, append(ds, diag.Errorf(addr, "cannot inspect sensitive state", err.Error()))
 			}
@@ -160,14 +169,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		// Refresh: re-read the real object, use the result as prior, and keep
 		// the in-memory state copy in sync.
 		if p.Refresh && hasPrior {
-			// recordedAttrs is the redacted reporting copy of rs.Attributes
-			// used for Drift.Before below, built here (not above) since it is
-			// only ever consumed on this refresh path.
-			recordedAttrs, err := ctyjson.Marshal(redactedPrior, ty)
-			if err != nil {
-				ds = append(ds, diag.Errorf(addr, "cannot encode recorded state", err.Error()))
-				return nil, ds
-			}
+			// recordedAttrs was projected without rebuilding sensitive sets.
 			rv, rpriv, rds := client.ReadResource(ctx, res.Type, prior, priorPrivate)
 			rds = provider.Context(addr, rds)
 			ds = append(ds, rds...)
@@ -185,14 +187,9 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 				prior = cty.NullVal(ty)
 				priorPrivate = nil
 			} else {
-				redactedRefresh, redactedPaths, err := spec.Redact(rv)
+				attrs, redactedPaths, recovery, err := spec.Project(rv)
 				if err != nil {
 					return nil, append(ds, diag.Errorf(addr, "cannot redact refreshed state", err.Error()))
-				}
-				attrs, err := ctyjson.Marshal(redactedRefresh, ty)
-				if err != nil {
-					ds = append(ds, diag.Errorf(addr, "cannot encode refreshed state", err.Error()))
-					return nil, ds
 				}
 				drift, err := newDrift(addr, recordedAttrs, attrs)
 				if err != nil {
@@ -204,6 +201,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 				}
 				rs.Attributes = attrs
 				rs.Private = rpriv
+				rs.SensitiveSetRecovery = recovery
 				rs.Redacted = redactedPaths
 				// spec was built from the union above, so spec.Paths() is
 				// itself the monotonic union of what rs.SensitivePaths held
@@ -366,11 +364,7 @@ func validateStateIdentity(addr string, rs *state.ResourceState, resourceType, p
 func newChange(addr, providerName, providerSource, typeName string, prior, planned cty.Value, ty cty.Type, pc *provider.PlannedChange, spec *sensitive.Spec) (*Change, error) {
 	before := json.RawMessage("null") // JSON null for create
 	if !prior.IsNull() {
-		maskedPrior, _, err := spec.Redact(prior)
-		if err != nil {
-			return nil, fmt.Errorf("before redaction: %w", err)
-		}
-		b, err := ctyjson.Marshal(maskedPrior, ty)
+		b, _, _, err := spec.Marshal(prior)
 		if err != nil {
 			return nil, fmt.Errorf("before: %w", err)
 		}
@@ -386,15 +380,11 @@ func newChange(addr, providerName, providerSource, typeName string, prior, plann
 		if err != nil {
 			return nil, fmt.Errorf("sensitive unknowns: %w", err)
 		}
-		sanitized, paths, err := nullOutUnknowns(plannedForArtifact)
+		b, _, paths, err := spec.Marshal(plannedForArtifact)
 		if err != nil {
 			return nil, fmt.Errorf("after: %w", err)
 		}
 		unknownAfter = paths
-		b, err := ctyjson.Marshal(sanitized, ty)
-		if err != nil {
-			return nil, fmt.Errorf("after: %w", err)
-		}
 		after = b
 	}
 
@@ -532,27 +522,6 @@ func schemaTypeHasPath(ty cty.Type, parts []string) bool {
 		return true
 	}
 	return schemaTypeHasPath(ty.AttributeType(parts[0]), parts[1:])
-}
-
-// nullOutUnknowns is the research-digest workaround for ctyjson.Marshal
-// rejecting unknown values: replace every unknown with a typed null and
-// record its dotted path for the plan's unknown_after list. Paths are
-// stringified inside the callback, so no cty.Path.Copy is needed (the
-// backing array is only reused after the callback returns).
-func nullOutUnknowns(v cty.Value) (cty.Value, []string, error) {
-	var paths []string
-	out, err := cty.Transform(v, func(p cty.Path, val cty.Value) (cty.Value, error) {
-		if !val.IsKnown() {
-			paths = append(paths, PathString(p))
-			return cty.NullVal(val.Type()), nil
-		}
-		return val, nil
-	})
-	if err != nil {
-		return cty.NilVal, nil, err
-	}
-	sort.Strings(paths)
-	return out, paths, nil
 }
 
 // PathString is retained for callers outside plan; implementation lives in the leaf package.

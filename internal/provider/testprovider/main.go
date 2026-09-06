@@ -278,7 +278,7 @@ var _ tfprotov6.ProviderServer = (*server)(nil)
 
 func knownResourceType(typeName string) bool {
 	switch typeName {
-	case "tchoritest_thing", "tchoritest_lossy", "tchoritest_nested_thing", "tchoritest_ingress_thing", "tchoritest_server_assigned", "tchoritest_secretful", "tchoritest_broken_thing":
+	case "tchoritest_thing", "tchoritest_lossy", "tchoritest_nested_thing", "tchoritest_ingress_thing", "tchoritest_server_assigned", "tchoritest_secretful", "tchoritest_set_thing", "tchoritest_broken_thing":
 		return true
 	default:
 		return false
@@ -303,6 +303,7 @@ func (s *server) GetMetadata(ctx context.Context, req *tfprotov6.GetMetadataRequ
 			{TypeName: "tchoritest_ingress_thing"},
 			{TypeName: "tchoritest_server_assigned"},
 			{TypeName: "tchoritest_secretful"},
+			{TypeName: "tchoritest_set_thing"},
 			{TypeName: "tchoritest_broken_thing"},
 		},
 	}, nil
@@ -318,6 +319,7 @@ func (s *server) GetProviderSchema(ctx context.Context, req *tfprotov6.GetProvid
 			"tchoritest_ingress_thing":   ingressThingSchema,
 			"tchoritest_server_assigned": serverAssignedSchema,
 			"tchoritest_secretful":       secretfulSchema,
+			"tchoritest_set_thing":       setThingSchema,
 			"tchoritest_broken_thing":    brokenThingSchema,
 		},
 		DataSourceSchemas: map[string]*tfprotov6.Schema{},
@@ -412,6 +414,12 @@ func (s *server) ValidateResourceConfig(ctx context.Context, req *tfprotov6.Vali
 		}
 		return &tfprotov6.ValidateResourceConfigResponse{}, nil
 	}
+	if req.TypeName == "tchoritest_set_thing" {
+		if _, err := req.Config.Unmarshal(setThingType); err != nil {
+			return nil, err
+		}
+		return &tfprotov6.ValidateResourceConfigResponse{}, nil
+	}
 	cfg, err := req.Config.Unmarshal(thingType)
 	if err != nil {
 		return nil, err
@@ -459,6 +467,8 @@ func (s *server) UpgradeResourceState(ctx context.Context, req *tfprotov6.Upgrad
 		ty = serverAssignedType
 	case "tchoritest_secretful":
 		ty = secretfulType
+	case "tchoritest_set_thing":
+		ty = setThingType
 	}
 	val, err := req.RawState.Unmarshal(ty)
 	if err != nil {
@@ -544,6 +554,9 @@ func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanReso
 	}
 	if req.TypeName == "tchoritest_secretful" {
 		return s.planSecretful(req)
+	}
+	if req.TypeName == "tchoritest_set_thing" {
+		return s.planSetThing(req)
 	}
 	proposed, err := req.ProposedNewState.Unmarshal(thingType)
 	if err != nil {
@@ -764,6 +777,9 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 	}
 	if req.TypeName == "tchoritest_secretful" {
 		return s.applySecretful(req)
+	}
+	if req.TypeName == "tchoritest_set_thing" {
+		return s.applySetThing(req)
 	}
 	planned, err := req.PlannedState.Unmarshal(thingType)
 	if err != nil {
@@ -1069,6 +1085,9 @@ func (s *server) applyIngressThing(req *tfprotov6.ApplyResourceChangeRequest) (*
 // "id-" marker are rejected so the CLI's "resource does not exist" path is
 // testable.
 func (s *server) ImportResourceState(ctx context.Context, req *tfprotov6.ImportResourceStateRequest) (*tfprotov6.ImportResourceStateResponse, error) {
+	if req.TypeName == "tchoritest_set_thing" {
+		return s.importSetThing(req)
+	}
 	if req.TypeName != "tchoritest_thing" {
 		return &tfprotov6.ImportResourceStateResponse{
 			Diagnostics: []*tfprotov6.Diagnostic{{

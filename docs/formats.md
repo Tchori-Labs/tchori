@@ -54,7 +54,7 @@ The guarantee has three deliberate boundaries:
 
 | Field | JSON type | Meaning |
 | --- | --- | --- |
-| `format_version` | string | Plan document schema version. New writes use `"1.1"` (`plan.FormatVersion`). |
+| `format_version` | string | Plan document schema version. New writes use `"1.2"` (`plan.FormatVersion`). |
 | `engine_version` | string | The tchori binary version that produced the plan (e.g. `"0.1.0-dev"`), from `internal/version.Version`. |
 | `state_serial` | integer | The state file's `serial` at the moment this plan was computed (`p.State.Serial`). `apply` compares this against the live state's serial to detect staleness — see below. |
 | `changes` | array of `Change` | Always sorted by `address` (`plan.finalize`). Document order is for byte-stability only; it carries no dependency information (`apply.Apply`'s ordering notes call this out explicitly — execution order comes from the config's topological sort, not from this array). |
@@ -70,20 +70,23 @@ The guarantee has three deliberate boundaries:
 | `provider` | string, omitted when absent in legacy input | Provider local name; required for every executable change and checked against the execution target. |
 | `provider_source` | string, omitted when absent in legacy input | Canonical registry source of the provider selected at plan time; required for every executable change and authenticated with private data. |
 | `action` | string | One of `create`, `update`, `delete`, `replace`, `no-op` — see Action semantics below. |
-| `before` | object or `null` | Prior value, ctyjson-encoded. `null` for `create` (no prior object existed). |
-| `after` | object or `null` | Planned value, ctyjson-encoded, with every attribute unknown at plan time rendered as JSON `null`. `null` for `delete`. |
+| `before` | object or `null` | Prior public projection. `null` for `create`; sensitive-set arrays retain one entry per authoritative element. |
+| `after` | object or `null` | Planned public projection, with every attribute unknown at plan time rendered as JSON `null`. `null` for `delete`; projected set duplicates are retained. |
 | `unknown_after` | array of strings, omitted if empty | Dotted attribute paths inside `after` whose real value won't be known until apply (see Unknowns below). |
 | `requires_replace` | array of strings, omitted if empty | Attribute paths the provider says force replacement *if their value differs from prior*. Presence here does not by itself mean `action` is `replace` — see Action semantics. |
-| `planned_raw` | base64 string, omitted if empty | The exact planned value (including real unknowns), msgpack-encoded via `cty/msgpack`. Opaque; consumed by `apply` to reconstruct the planned state precisely — not meant for humans to read. |
+| `planned_raw` | base64 string, omitted if empty | The exact provider-planned shape, msgpack-encoded via `cty/msgpack`. Provider unknowns remain unknown. Sensitive non-exempt leaves are also encoded as unknown, including inside sets, so config/env secrets are not frozen into the executable artifact. |
 | `private` | object, omitted if empty | Authenticated encrypted envelope for opaque provider recovery data; decrypted bytes are passed unchanged to provider RPCs. Legacy `1.0` used a plaintext base64 string. |
 
-`before` and `after` are JSON objects. `planned_raw` is base64-encoded
-MessagePack. Current `private` is an envelope with integer `version: 1`,
-base64 `nonce` (12 bytes), and base64 `ciphertext` (including the 16-byte
-authentication tag). It uses AES-256-GCM and authenticates the resource
-address, resource type, provider alias, canonical provider source, and artifact
-kind as additional data. It is not interchangeable with `planned_raw`, nor may
-a plaintext private string appear in a `1.1` document.
+`before` and `after` are deterministic JSON projections. A set is sorted by
+its projected element bytes but duplicate projections remain duplicate array
+entries, preserving cardinality when elements differ only in sensitive leaves.
+`planned_raw` is base64-encoded MessagePack. Current `private` is an envelope
+with integer `version: 1`, base64 `nonce` (12 bytes), and base64 `ciphertext`
+(including the 16-byte authentication tag). It uses AES-256-GCM and
+authenticates the resource address, resource type, provider alias, canonical
+provider source, and artifact kind as additional data. It is not
+interchangeable with `planned_raw`, nor may a plaintext private string appear
+in a `1.1` or `1.2` document.
 
 ### Drift fields
 
@@ -113,9 +116,9 @@ field completely, preserving the bytes written before this field existed.
 | --- | --- |
 | `create` | No prior state for this address. |
 | `delete` | Prior state exists and the planned value is null (resource removed from config, or `destroy` mode). |
-| `replace` | `requires_replace` is non-empty **and** the planned value actually differs from prior on at least one of those paths (an unknown planned value on such a path counts as differing — the provider cannot promise it stays the same). |
-| `update` | Planned value differs from prior, but not on a path that forces replacement. |
-| `no-op` | Planned value equals prior exactly (`cty.Value.RawEquals`). |
+| `replace` | `requires_replace` is non-empty **and** the comparison value differs from prior on at least one of those paths (an unknown planned value on such a path counts as differing — the provider cannot promise it stays the same). |
+| `update` | The comparison value differs from prior, but not on a path that forces replacement. |
+| `no-op` | Prior and planned values are equal after masking ordinary sensitive leaves. Sensitive leaves inside sets remain part of the in-memory comparison because they determine membership. |
 
 `no-op` changes are listed in `changes` (so the document always accounts for
 every config resource) but never counted in `summary`, and `tchori plan`'s
@@ -154,7 +157,9 @@ value and:
 Paths use the same dotted/bracket notation for nested attributes and map
 keys, e.g. `echo`, `id`, or `tags["parent"]` for a map key. `planned_raw`
 preserves provider unknowns for apply, but sensitive non-exempt leaves are
-also encoded there as unknown rather than concrete values. `after` is the
+also encoded there as unknown rather than concrete values. A sensitive set
+keeps every unknown-bearing element, so add/remove/member-change transitions
+remain distinguishable without persisting the secret. `after` is the
 reviewable JSON projection; `planned_raw` is the executable one.
 
 At apply time, an unknown left over from planning that turns out to be a
@@ -190,13 +195,15 @@ non-JSON-response hint.
 
 ### format_version compatibility
 
-`plan.Read` accepts current format `"1.1"` and legacy `"1.0"` for migration.
-Missing, empty, and unsupported versions are rejected rather than guessed.
-New writes always use `"1.1"` so an old engine cannot silently consume an
-encrypted private payload as if it were plaintext provider data.
+`plan.Read` accepts current format `"1.2"`, encrypted-private format `"1.1"`,
+and legacy `"1.0"` for migration. Missing, empty, and unsupported versions are
+rejected rather than guessed. New writes always use `"1.2"`. This prevents an
+older engine from applying a plan and then coalescing sensitive set elements
+while it writes state.
 
-The optional `drift` field remains informational and ignored by apply. It did
-not itself require a format increment; authenticated private storage does.
+The optional `drift` field remains informational and ignored by apply.
+Authenticated private storage drove `1.1`; identity-safe sensitive set
+persistence drives `1.2`.
 
 Legacy plans, and early `1.1` plans, with private data but no complete bound
 type/provider/source identity remain readable for diagnosis but cannot be
@@ -216,7 +223,7 @@ doesn't exist yet on a first plan):
 
 ```json
 {
-  "format_version": "1.1",
+  "format_version": "1.2",
   "engine_version": "0.1.0-dev",
   "state_serial": 0,
   "changes": [
@@ -282,7 +289,7 @@ creates.
 
 | Field | JSON type | Meaning |
 | --- | --- | --- |
-| `format_version` | string | State document schema version. New writes use `"1.1"`. |
+| `format_version` | string | State document schema version. New writes use `"1.2"`. |
 | `serial` | integer | Monotonically incremented once per successful `Save` call — see Serial semantics below. |
 | `resources` | object | Map of resource address (`type.name`) to `ResourceState`. |
 | `incomplete_apply` | object, omitted when converged | Durable evidence that the last apply did not complete; see below. |
@@ -293,16 +300,27 @@ creates.
 | --- | --- | --- |
 | `type` | string | Provider resource type, e.g. `tchoritest_thing`. |
 | `provider` | string | Provider local name from config, e.g. `tchoritest`. |
-| `provider_source` | string, omitted in legacy/early `1.1` input | Canonical provider registry source. New state binds this value into private-envelope authentication and checks it before provider RPCs. |
-| `attributes` | object | ctyjson-encoded applied values. Every withheld sensitive leaf is JSON `null`; state never stores unknown values. |
+| `provider_source` | string, omitted in legacy/early `1.1` input | Canonical provider registry source. New state binds this value into encrypted-envelope authentication and checks it before provider RPCs. |
+| `attributes` | object | Deterministic public projection of applied values. Every withheld sensitive leaf is JSON `null`; sensitive sets retain element count and non-sensitive association as array entries; state never stores unknown values. |
 | `private` | object, omitted if empty | Authenticated encrypted envelope with `version`, `nonce`, and `ciphertext`, as described for plans. The opaque plaintext is preserved only in memory for provider RPCs. |
+| `sensitive_set_recovery` | object, omitted if empty | Separate authenticated encrypted envelope containing complete outermost sets whose identity depends on sensitive descendants. It is opened before typed state decoding and never included in read projections. |
 | `redacted` | array of strings, omitted if empty | Sorted paths whose values are withheld, explaining why the corresponding `attributes` leaf is `null`. |
 | `sensitive_paths` | array of strings, omitted if empty | Sorted effective, index-insensitive sensitivity contract. It survives config removal and drives backups, delete plans, orphan handling, and provider-free read masking. |
 | `sensitive_scanned` | boolean, omitted when false | Provenance marker set after live schema/config resolution, including for a definitively non-sensitive resource. Read surfaces use it to distinguish checked entries from legacy entries with unknown provenance. |
 
-Standalone resource JSON used by read surfaces omits private bytes entirely.
-The state document serializer, not an ordinary resource JSON dump, writes
-encrypted private recovery data.
+Standalone resource JSON used by CLI/MCP read surfaces omits both encrypted
+fields entirely. The state document serializer, not an ordinary resource JSON
+dump, writes provider-private and sensitive-set recovery envelopes.
+
+The recovery envelope has a purpose distinct from provider `private` and
+authenticates the resource address, type, provider alias, and canonical source
+as AES-GCM additional data. Its plaintext is versioned and contains a SHA-256
+digest of the exact public projection plus structured attribute/map/list paths
+to msgpack-encoded complete sets. Restoration validates the path set and
+projection digest before replacing set arrays and decoding the authoritative
+cty value. Moving either envelope to another address/type/source/purpose,
+changing the key, editing the public projection, or removing required recovery
+fails before a provider mutation or state checkpoint.
 
 ### Incomplete apply lifecycle
 
@@ -327,7 +345,9 @@ An early `1.1` resource with no `provider_source` remains readable so operators
 can inspect and migrate it, but planning/apply refuse to send its state or
 private bytes to a provider. `tchori state sanitize` validates the stored
 type/provider alias against live configuration and schema, binds the canonical
-source, and re-encrypts state and backup under the stronger identity.
+source, and re-encrypts state and backup under the stronger identity. A
+nonempty redacted sensitive set without recovery is rejected explicitly:
+membership cannot be reconstructed safely from the public projection.
 
 Use `tchori state status` as the convergence gate: exit 0 means converged and
 exit 1 means incomplete. `plan`, `apply`, and `destroy` warn when loading a
@@ -346,7 +366,7 @@ engine.
 ### Serial semantics
 
 - `state.Load` on a missing path returns a fresh, empty state:
-  `format_version: "1.1"`, `serial: 0`, `resources: {}` — not an error.
+  `format_version: "1.2"`, `serial: 0`, `resources: {}` — not an error.
 - Each successful `Save` increments `Serial`, regardless of whether the
   resource data actually changed. A save rejected because another process
   committed from the same base does not increment it.
@@ -384,23 +404,26 @@ side effects between state checkpoints.
    state path and re-run guidance; neither the state nor its backup is touched.
 3. Parses the prior document and sanitizes every entry using persisted paths,
    live resolution, and effective-path hints before writing `path+".backup"`.
-   With no known sensitive path the copy stays byte-identical; otherwise it is
-   canonically re-serialized. Existing `redacted` markers are unioned with
-   newly changed paths. A parse failure aborts rather than copying uninspected
-   bytes. The backup deliberately applies no literal-instance exemptions and
-   retains previously persisted paths, so the prior document is scrubbed under
-   the rules that wrote it even when the current declaration was removed.
-   Because apply now performs bracketing saves, the backup left by a successful
-   apply normally contains a marker-carrying intermediate, not the pre-apply
-   state. The fresh-temp-and-rename symlink, directory, and `0600` hardening
-   remains unchanged.
+   Sensitive-set recovery remains encrypted and coupled to the same public
+   projection. With no known sensitive path the copy stays byte-identical;
+   otherwise it is canonically re-serialized. Existing `redacted` markers are
+   unioned with newly changed paths. A parse or envelope-authentication failure
+   aborts rather than copying uninspected bytes. The backup deliberately applies
+   no literal-instance exemptions and retains previously persisted paths, so the
+   prior document is scrubbed under the rules that wrote it even when the current
+   declaration was removed. Because apply performs bracketing saves, the backup
+   left by a successful apply normally contains a marker-carrying intermediate,
+   not the pre-apply state. The fresh-temp-and-rename symlink, directory, and
+   `0600` hardening remains unchanged.
 4. Sanitizes every live state entry, including resources untouched by this
    apply. Current schema/config paths are unioned with persisted paths and
    effective hints: removing a declaration does not declassify stored secrets.
-   Live resolution honors per-instance literal exemptions. An unresolvable
-   entry falls back to persisted paths and hints without exemptions and is
-   reported. An empty combined path set is definitively non-sensitive only
-   after successful resolution, which records `sensitive_scanned`.
+   Live resolution restores affected sets before typed decoding, then emits a
+   new public projection and recovery payload. It honors per-instance literal
+   exemptions outside sets. An unresolvable entry falls back to persisted paths
+   and hints without exemptions, retains existing recovery, and is reported. An
+   empty combined path set is definitively non-sensitive only after successful
+   resolution, which records `sensitive_scanned`.
 5. Increments `Serial`, marshals with `MarshalIndent`, writes a temp file
    (`.state-*.tmp`) in the same directory, and fsyncs the complete file before
    closing it. It atomically renames the temp file over `path`, then runs the
@@ -463,23 +486,27 @@ leaves `O_RDWR|O_NONBLOCK` FIFO-open behavior undefined.
 
 Both files use two-space JSON indentation and a trailing newline. Plan changes
 are sorted by address; state resource map keys are sorted during JSON
-encoding. Incomplete markers have no timestamp. These guarantees keep the
-reviewable structure stable rather than depending on map insertion order.
+encoding. Incomplete markers have no timestamp. Public set projections are
+sorted by projected element bytes while retaining duplicates. These guarantees
+keep the reviewable structure stable rather than depending on map or
+secret-dependent set iteration order.
 
-Private encryption uses a fresh random nonce on each serialization. Identical
-private plaintext therefore produces different ciphertext; a ciphertext-only
-diff does not imply infrastructure drift. No deterministic nonce is derived
-from content, serial, or address. Artifacts with no private payload retain
-deterministic formatting and ordering.
+Provider-private and sensitive-set recovery encryption use fresh random nonces
+on each serialization and distinct authenticated purposes. Both bind resource
+address, type, provider alias, and canonical source. Identical plaintext
+therefore produces different ciphertext; a ciphertext-only diff does not imply
+infrastructure drift. No deterministic nonce is derived from content, serial,
+or address. Artifacts with neither encrypted payload remain deterministic.
 
 ### format_version compatibility
 
-`state.Load` accepts `"1.1"` and legacy `"1.0"`; it rejects missing, empty,
-and unsupported versions. A nonexistent file instead yields a fresh empty
-state. Every new save upgrades the document to `"1.1"` and protects private
-bytes, including in the backup. The additive `incomplete_apply` field does
-not drive the version change; encrypted private storage requires older
-readers to refuse the document rather than silently discard recovery data.
+`state.Load` accepts current `"1.2"`, encrypted-private `"1.1"`, and legacy
+`"1.0"`; it rejects missing, empty, and unsupported versions. A nonexistent
+file instead yields a fresh empty state. Every new save upgrades the document
+and backup to `"1.2"`. Format `1.1` introduced encrypted provider-private
+storage. Format `1.2` adds encrypted sensitive-set recovery and requires older
+readers to refuse plans/state rather than silently discard or coalesce
+authoritative membership.
 
 ### Example
 
@@ -488,7 +515,7 @@ prefix `demo-`):
 
 ```json
 {
-  "format_version": "1.1",
+  "format_version": "1.2",
   "serial": 4,
   "resources": {
     "tchoritest_thing.a": {

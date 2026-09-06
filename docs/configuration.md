@@ -115,26 +115,29 @@ sensitive-attribute behavior and override mechanism.
 `TCHORI_ARTIFACT_KEY` is an engine setting, separate from provider environment
 wrappers. Supply exactly 32 random bytes encoded with standard base64 through
 the environment. Tchori uses AES-256-GCM to protect opaque provider private
-data in state, backups, plans, and JSON serialization; it never tries to
-interpret or redact those bytes.
+data in state, backups, and plans. State uses a distinct authenticated envelope
+for the full membership of sets containing sensitive leaves; the engine opens
+that recovery only before provider operations and never renders it.
 
 Generate a workspace key once and store it in your secret manager. Inject
 that same key into subsequent CLI/MCP sessions and automation. Do not place
 it in config, command-line arguments, source control, logs, or alongside the
-artifacts it protects. Key loss prevents recovery of encrypted private data.
-There is no plaintext fallback or automatic replacement key.
+artifacts it protects. Key loss prevents recovery of encrypted provider-private
+and sensitive-set data. There is no plaintext fallback or automatic replacement
+key.
 
 Apply and import check the key before resource mutations, even when the
-provider has not yet returned private data. Reading encrypted artifacts and
-writing nonempty private data also require the key. Validation and reads of
-artifacts without private data do not require it merely to parse those
-artifacts. Invalid keys, failed authentication, and tampering produce errors
-without revealing key or private values.
+provider has not yet returned encrypted data. Reading encrypted artifacts and
+writing either nonempty private data class also require the key. Validation and
+reads of artifacts without encrypted fields do not require it merely to parse
+those artifacts. Invalid keys, failed authentication, and address/type/provider
+source/purpose tampering produce errors without revealing protected values.
 
-New state and plan writes use format `1.1`. This build can read legacy `1.0`
-artifacts for migration, but old engines reject `1.1` instead of silently
-discarding encrypted private data. `tchori state sanitize` upgrades legacy
-state and protects its backup without applying infrastructure changes.
+New state and plan writes use format `1.2`. This build can read `1.1`
+encrypted-private artifacts and legacy `1.0` artifacts for migration, but old
+engines reject `1.2` instead of applying a plan whose sensitive set state they
+cannot preserve. `tchori state sanitize` upgrades prior state and protects its
+backup without applying infrastructure changes.
 Previously leaked values still require credential rotation and history
 cleanup; rewriting the working tree does not erase existing commits.
 Legacy plans carrying private bytes without recorded resource identity must
@@ -143,7 +146,7 @@ should receive their private data. Current plans are refused if their recorded
 type/provider differs from the live execution target.
 
 
-Encryption protects private bytes, not the entire document. Resource
-attributes still rely on provider sensitivity metadata and explicit
-`sensitive_attributes`; treat artifacts as sensitive and review them before
-publishing.
+Encryption protects provider-private bytes and sensitive-set identity, not the
+entire document. Resource attributes still rely on provider sensitivity
+metadata and explicit `sensitive_attributes`; treat artifacts as sensitive and
+review them before publishing.

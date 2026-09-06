@@ -1,4 +1,4 @@
-// Package privateblob protects opaque provider private bytes in persisted artifacts.
+// Package privateblob protects engine-owned opaque payloads in persisted artifacts.
 package privateblob
 
 import (

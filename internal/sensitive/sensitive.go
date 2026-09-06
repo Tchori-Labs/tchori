@@ -17,9 +17,10 @@ import (
 // index-insensitive; exemptions bind an individual raw-config instance to the
 // exact authored scalar value.
 type Spec struct {
-	paths       []string
-	exempt      map[string]any
-	setPrefixes []string
+	paths          []string
+	exempt         map[string]any
+	setPrefixes    []string
+	allSetPrefixes []string
 }
 
 // Resolve is the single constructor used by persistence and planning paths.
@@ -39,20 +40,23 @@ func Resolve(block *provider.SchemaBlock, declared []string, rawCfg map[string]a
 		paths = append(paths, path)
 	}
 	sort.Strings(paths)
-	sort.Strings(setPrefixes)
-	for _, path := range paths {
-		for _, prefix := range setPrefixes {
+	allSetPrefixes := sortedUnique(setPrefixes)
+	setPrefixes = affectedSets(allSetPrefixes, paths)
+	s := &Spec{paths: paths, setPrefixes: setPrefixes, allSetPrefixes: allSetPrefixes}
+	return s.Effective(rawCfg), ds
+}
+
+func affectedSets(allSetPrefixes, paths []string) []string {
+	affected := make([]string, 0, len(allSetPrefixes))
+	for _, prefix := range allSetPrefixes {
+		for _, path := range paths {
 			if strings.HasPrefix(path, prefix+".") {
-				ds = append(ds, diag.Errorf("", "sensitive set element cannot be represented safely",
-					fmt.Sprintf("sensitive path %q is inside set %q; redacting element fields can merge distinct set elements, so the resource is rejected before provider execution", path, prefix)))
+				affected = append(affected, prefix)
+				break
 			}
 		}
 	}
-	if ds.HasErrors() {
-		return nil, ds
-	}
-	s := &Spec{paths: paths, setPrefixes: setPrefixes}
-	return s.Effective(rawCfg), ds
+	return affected
 }
 
 func walkSchema(block *provider.SchemaBlock, prefix string, paths map[string]bool, setPrefixes *[]string) {
@@ -164,9 +168,10 @@ func (s *Spec) ExemptInstances() []string {
 // would exempt referenced secrets (and future env wrappers, TC-054/#46).
 func (s *Spec) Effective(rawCfg map[string]any) *Spec {
 	out := &Spec{
-		paths:       s.Paths(),
-		exempt:      map[string]any{},
-		setPrefixes: append([]string(nil), s.setPrefixes...),
+		paths:          s.Paths(),
+		exempt:         map[string]any{},
+		setPrefixes:    append([]string(nil), s.setPrefixes...),
+		allSetPrefixes: append([]string(nil), s.allSetPrefixes...),
 	}
 	if rawCfg == nil {
 		return out
@@ -261,7 +266,9 @@ func (s *Spec) Unknown(v cty.Value) (cty.Value, error) {
 	return out, err
 }
 
-// Mask nulls sensitive non-exempt values unconditionally for comparison.
+// Mask nulls sensitive non-exempt values outside identity-sensitive sets.
+// Leaves inside such sets remain concrete so membership changes cannot vanish
+// when distinct elements share the same public projection.
 func (s *Spec) Mask(v cty.Value) (cty.Value, error) {
 	out, _, err := s.transform(v, transformMask)
 	return out, err
@@ -279,7 +286,11 @@ func (s *Spec) transform(v cty.Value, mode transformMode) (cty.Value, []string, 
 	var changed []string
 	out, err := cty.Transform(v, func(path cty.Path, val cty.Value) (cty.Value, error) {
 		full := PathString(path)
-		if !contains(s.paths, logicalPath(path)) {
+		logical := logicalPath(path)
+		if mode == transformMask && underPrefix(logical, s.setPrefixes) {
+			return val, nil
+		}
+		if !contains(s.paths, logical) {
 			return val, nil
 		}
 		if literal, ok := s.exempt[full]; ok && literalMatches(val, literal) {

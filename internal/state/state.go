@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	formatVersion       = "1.1"
-	legacyFormatVersion = "1.0"
+	formatVersion          = "1.2"
+	encryptedFormatVersion = "1.1"
+	legacyFormatVersion    = "1.0"
 )
 
 // ErrConcurrentModification indicates that state changed on disk after it was
@@ -44,25 +45,26 @@ var (
 
 // ResourceState is the persisted state of a single managed resource.
 type ResourceState struct {
-	Type             string          `json:"type"`
-	Provider         string          `json:"provider"`
-	ProviderSource   string          `json:"provider_source,omitempty"`
-	Attributes       json.RawMessage `json:"attributes"` // ctyjson-encoded object
-	Private          []byte          `json:"-"`
-	Redacted         []string        `json:"redacted,omitempty"`
-	SensitivePaths   []string        `json:"sensitive_paths,omitempty"`
-	SensitiveScanned bool            `json:"sensitive_scanned,omitempty"`
+	Type                 string          `json:"type"`
+	Provider             string          `json:"provider"`
+	ProviderSource       string          `json:"provider_source,omitempty"`
+	Attributes           json.RawMessage `json:"attributes"` // ctyjson-encoded object
+	Private              []byte          `json:"-"`
+	SensitiveSetRecovery []byte          `json:"-"`
+	Redacted             []string        `json:"redacted,omitempty"`
+	SensitivePaths       []string        `json:"sensitive_paths,omitempty"`
+	SensitiveScanned     bool            `json:"sensitive_scanned,omitempty"`
 }
 
 // Resolution is a live schema+config sensitivity lookup result. An empty Paths
 // slice is a valid, definitive non-sensitive result when the resolver's ok is
-// true; nil-vs-empty is never used to signal resolvability. RedactAttributes
-// preserves provider schema structure and binds raw-literal exemptions to
-// their authored values.
+// true; nil-vs-empty is never used to signal resolvability. SanitizeAttributes
+// restores sensitive-set identity before typed decoding, preserves provider
+// schema structure, and binds raw-literal exemptions to authored values.
 type Resolution struct {
-	Paths            []string
-	ProviderSource   string
-	RedactAttributes sensitive.JSONRedactor
+	Paths              []string
+	ProviderSource     string
+	SanitizeAttributes sensitive.JSONSanitizer
 }
 
 // SensitiveResolver reports sensitivity for one entry. ok=false means the
@@ -84,14 +86,15 @@ type State struct {
 }
 
 type resourceDocument struct {
-	Type             string          `json:"type"`
-	Provider         string          `json:"provider"`
-	ProviderSource   string          `json:"provider_source,omitempty"`
-	Attributes       json.RawMessage `json:"attributes"`
-	Private          json.RawMessage `json:"private,omitempty"`
-	Redacted         []string        `json:"redacted,omitempty"`
-	SensitivePaths   []string        `json:"sensitive_paths,omitempty"`
-	SensitiveScanned bool            `json:"sensitive_scanned,omitempty"`
+	Type                 string          `json:"type"`
+	Provider             string          `json:"provider"`
+	ProviderSource       string          `json:"provider_source,omitempty"`
+	Attributes           json.RawMessage `json:"attributes"`
+	Private              json.RawMessage `json:"private,omitempty"`
+	SensitiveSetRecovery json.RawMessage `json:"sensitive_set_recovery,omitempty"`
+	Redacted             []string        `json:"redacted,omitempty"`
+	SensitivePaths       []string        `json:"sensitive_paths,omitempty"`
+	SensitiveScanned     bool            `json:"sensitive_scanned,omitempty"`
 }
 
 type stateDocument struct {
@@ -118,9 +121,9 @@ type legacyStateDocument struct {
 	Incomplete    *IncompleteApply                   `json:"incomplete_apply,omitempty"`
 }
 
-// MarshalJSON emits format 1.1 and seals every non-empty private payload in a
-// resource-address-bound envelope. ResourceState itself omits Private, so only
-// the address-aware whole-state boundary can serialize those bytes.
+// MarshalJSON emits format 1.2 and seals provider-private bytes and sensitive
+// set recovery in distinct resource-identity-bound envelopes. ResourceState
+// omits both plaintext fields outside this address-aware whole-state boundary.
 func (s State) MarshalJSON() ([]byte, error) {
 	doc := stateDocument{
 		FormatVersion: formatVersion,
@@ -136,16 +139,22 @@ func (s State) MarshalJSON() ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		recovery, err := sealSensitiveSetRecovery(addr, rs)
+		if err != nil {
+			return nil, err
+		}
 		doc.Resources[addr] = &resourceDocument{
-			Type: rs.Type, Provider: rs.Provider, ProviderSource: rs.ProviderSource, Attributes: rs.Attributes, Private: private,
+			Type: rs.Type, Provider: rs.Provider, ProviderSource: rs.ProviderSource, Attributes: rs.Attributes,
+			Private: private, SensitiveSetRecovery: recovery,
 			Redacted: rs.Redacted, SensitivePaths: rs.SensitivePaths, SensitiveScanned: rs.SensitiveScanned,
 		}
 	}
 	return json.Marshal(doc)
 }
 
-// UnmarshalJSON accepts legacy 1.0 plaintext/base64 private fields for
-// migration and requires authenticated envelopes for all 1.1 private fields.
+// UnmarshalJSON accepts legacy 1.0 plaintext/base64 private fields, reads 1.1
+// encrypted provider-private fields, and requires authenticated envelopes for
+// both private data classes in format 1.2.
 func (s *State) UnmarshalJSON(data []byte) error {
 	var header struct {
 		FormatVersion string `json:"format_version"`
@@ -172,7 +181,7 @@ func (s *State) UnmarshalJSON(data []byte) error {
 		}
 		*s = State{FormatVersion: legacy.FormatVersion, Serial: legacy.Serial, Resources: resources, Incomplete: legacy.Incomplete}
 		return nil
-	case formatVersion:
+	case encryptedFormatVersion, formatVersion:
 		var doc stateDocument
 		if err := json.Unmarshal(data, &doc); err != nil {
 			return err
@@ -194,12 +203,19 @@ func (s *State) UnmarshalJSON(data []byte) error {
 				}
 				rs.Private = private
 			}
+			if len(persisted.SensitiveSetRecovery) != 0 {
+				recovery, err := privateblob.Open(persisted.SensitiveSetRecovery, resourcePrivateContext("state-sensitive-set-recovery", addr, rs.Provider, rs.ProviderSource, rs.Type))
+				if err != nil {
+					return fmt.Errorf("open sensitive set recovery for %s: %w", addr, err)
+				}
+				rs.SensitiveSetRecovery = recovery
+			}
 			resources[addr] = rs
 		}
 		*s = State{FormatVersion: doc.FormatVersion, Serial: doc.Serial, Resources: resources, Incomplete: doc.Incomplete}
 		return nil
 	default:
-		return fmt.Errorf("unsupported state format_version %q (supported: %q and %q)", header.FormatVersion, legacyFormatVersion, formatVersion)
+		return fmt.Errorf("unsupported state format_version %q (supported: %q, %q, and %q)", header.FormatVersion, legacyFormatVersion, encryptedFormatVersion, formatVersion)
 	}
 }
 
@@ -217,6 +233,20 @@ func sealResourcePrivate(addr string, rs *ResourceState) (json.RawMessage, error
 	return json.RawMessage(sealed), nil
 }
 
+func sealSensitiveSetRecovery(addr string, rs *ResourceState) (json.RawMessage, error) {
+	if len(rs.SensitiveSetRecovery) == 0 {
+		return nil, nil
+	}
+	if rs.Type == "" || rs.Provider == "" || rs.ProviderSource == "" {
+		return nil, fmt.Errorf("seal sensitive set recovery for %s: type, provider, and provider source are required", addr)
+	}
+	sealed, err := privateblob.Seal(rs.SensitiveSetRecovery, resourcePrivateContext("state-sensitive-set-recovery", addr, rs.Provider, rs.ProviderSource, rs.Type))
+	if err != nil {
+		return nil, fmt.Errorf("seal sensitive set recovery for %s: %w", addr, err)
+	}
+	return json.RawMessage(sealed), nil
+}
+
 func resourcePrivateContext(kind, addr, provider, providerSource, resourceType string) string {
 	if providerSource == "" {
 		// Compatibility path for already-persisted 1.1 artifacts. State
@@ -226,9 +256,9 @@ func resourcePrivateContext(kind, addr, provider, providerSource, resourceType s
 	return kind + "\x00" + addr + "\x00" + provider + "\x00" + providerSource + "\x00" + resourceType
 }
 
-// Load returns an empty format 1.1 state when path does not exist. Existing
-// 1.0 documents remain readable for migration; 1.1 private fields are opened
-// only after authenticating their resource address, provider, and type.
+// Load returns an empty format 1.2 state when path does not exist. Existing
+// 1.0 and 1.1 documents remain readable for migration; encrypted fields are
+// opened only after authenticating their resource identity and purpose.
 func Load(path string) (*State, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
 	if err != nil {
@@ -245,7 +275,7 @@ func Load(path string) (*State, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("parse state %s: %w", path, err)
 	}
-	if s.FormatVersion != legacyFormatVersion && s.FormatVersion != formatVersion {
+	if s.FormatVersion != legacyFormatVersion && s.FormatVersion != encryptedFormatVersion && s.FormatVersion != formatVersion {
 		return nil, fmt.Errorf("unsupported state format_version %q", s.FormatVersion)
 	}
 	if s.Resources == nil {
@@ -502,9 +532,9 @@ func verifyLockedSidecar(lock *flock.Flock, lockPath string) error {
 }
 
 // prepareBackup returns a sanitized recovery copy of the previous document
-// without changing the backup path. Existing 1.1 bytes are preserved exactly
-// when no attribute sanitization is needed. Legacy documents are always
-// rewritten as 1.1 so private bytes cannot remain plaintext/base64-only.
+// without changing the backup path. Existing 1.2 bytes are preserved exactly
+// when no attribute sanitization is needed. Earlier documents are rewritten as
+// 1.2 so neither encrypted data class can be lost or left plaintext.
 func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // operator-selected state path
 	if err != nil {
@@ -605,14 +635,14 @@ func (s *State) sanitizeAll() error {
 			continue
 		}
 		paths := unionStrings(rs.SensitivePaths, rs.Redacted, s.sensitiveHints[addr])
-		redactor := sensitive.JSONRedactor(nil)
+		sanitizer := sensitive.JSONSanitizer(nil)
 		resolved := false
 		if s.resolver != nil {
 			if resolution, ok := s.resolver(addr, rs); ok {
 				resolved = true
 				// Removing a config declaration must not declassify a stored secret.
 				paths = unionStrings(paths, resolution.Paths)
-				redactor = resolution.RedactAttributes
+				sanitizer = resolution.SanitizeAttributes
 				if resolution.ProviderSource != "" {
 					rs.ProviderSource = resolution.ProviderSource
 				}
@@ -631,12 +661,13 @@ func (s *State) sanitizeAll() error {
 			continue
 		}
 		var (
-			attrs   json.RawMessage
-			changed []string
-			err     error
+			attrs    json.RawMessage
+			changed  []string
+			recovery []byte
+			err      error
 		)
-		if resolved && redactor != nil {
-			attrs, changed, err = redactor(rs.Attributes, paths)
+		if resolved && sanitizer != nil {
+			attrs, changed, recovery, err = sanitizer(rs.Attributes, rs.SensitiveSetRecovery, paths)
 		} else {
 			// Orphan/config-unavailable state has no trustworthy schema or
 			// literal binding, so provider-free sanitization fails closed.
@@ -646,6 +677,9 @@ func (s *State) sanitizeAll() error {
 			return fmt.Errorf("sanitize state attributes for %s: %w", addr, err)
 		}
 		rs.Attributes = attrs
+		if resolved && sanitizer != nil {
+			rs.SensitiveSetRecovery = recovery
+		}
 		rs.Redacted = unionStrings(rs.Redacted, changed)
 	}
 	sort.Strings(s.unresolved)

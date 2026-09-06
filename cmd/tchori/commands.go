@@ -15,7 +15,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/zclconf/go-cty/cty"
-	ctyjson "github.com/zclconf/go-cty/cty/json"
 	"golang.org/x/term"
 
 	"github.com/tchori-labs/tchori/internal/apply"
@@ -451,9 +450,9 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 			return state.Resolution{}, false
 		}
 		return state.Resolution{
-			Paths:            spec.Paths(),
-			ProviderSource:   rt.Config.Providers[r.Provider].Source,
-			RedactAttributes: spec.Redactor(sch.Block.ImpliedType()),
+			Paths:              spec.Paths(),
+			ProviderSource:     rt.Config.Providers[r.Provider].Source,
+			SanitizeAttributes: spec.Sanitizer(sch.Block.ImpliedType()),
 		}, true
 	})
 
@@ -496,18 +495,14 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 	if sds.HasErrors() {
 		return 1, nil
 	}
-	redacted, redactedPaths, err := spec.Redact(refreshed)
+	attrs, redactedPaths, recovery, err := spec.Project(refreshed)
 	if err != nil {
 		return 1, fmt.Errorf("%s: redacting imported state: %w", address, err)
-	}
-	attrs, err := ctyjson.Marshal(redacted, ty)
-	if err != nil {
-		return 1, fmt.Errorf("%s: encoding imported state: %w", address, err)
 	}
 	st.NoteSensitive(address, spec.Paths())
 	st.Resources[address] = &state.ResourceState{
 		Type: res.Type, Provider: res.Provider, ProviderSource: rt.Config.Providers[res.Provider].Source,
-		Attributes: attrs, Private: refreshedPrivate, Redacted: redactedPaths,
+		Attributes: attrs, Private: refreshedPrivate, SensitiveSetRecovery: recovery, Redacted: redactedPaths,
 		SensitivePaths: spec.Paths(), SensitiveScanned: true,
 	}
 	if len(redactedPaths) != 0 {
@@ -758,9 +753,9 @@ func buildSensitiveContext(ctx context.Context, st *state.State, addresses []str
 			continue
 		}
 		result.resolutions[address] = state.Resolution{
-			Paths:            mergePaths(spec.Paths(), rs.SensitivePaths, rs.Redacted),
-			ProviderSource:   providerConfig.Source,
-			RedactAttributes: spec.Redactor(schema.Block.ImpliedType()),
+			Paths:              mergePaths(spec.Paths(), rs.SensitivePaths, rs.Redacted),
+			ProviderSource:     providerConfig.Source,
+			SanitizeAttributes: spec.Sanitizer(schema.Block.ImpliedType()),
 		}
 		result.resolved[address] = true
 	}

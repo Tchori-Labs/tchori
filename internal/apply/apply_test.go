@@ -168,6 +168,37 @@ func secretful(addrName string, cfg map[string]any) *config.Resource {
 	return &config.Resource{Address: "tchoritest_secretful." + addrName, Type: "tchoritest_secretful", Name: addrName, Provider: "tchoritest", Config: values}
 }
 
+func setMember(token, secret string) map[string]any {
+	return map[string]any{
+		"label": "same",
+		"token": token,
+		"details": []any{map[string]any{
+			"kind":   "same",
+			"secret": secret,
+		}},
+	}
+}
+
+func setThing(addrName, configName string) *config.Resource {
+	return &config.Resource{
+		Address:  "tchoritest_set_thing." + addrName,
+		Type:     "tchoritest_set_thing",
+		Name:     addrName,
+		Provider: "tchoritest",
+		Config: map[string]any{
+			"name": configName,
+			"attribute_members": []any{
+				setMember("attribute-token-one", "attribute-detail-one"),
+				setMember("attribute-token-two", "attribute-detail-two"),
+			},
+			"block_members": []any{
+				setMember("block-token-one", "block-detail-one"),
+				setMember("block-token-two", "block-detail-two"),
+			},
+		},
+	}
+}
+
 // nestedThing returns a tchoritest_nested_thing resource (issue #7's
 // acceptance fixture — see testprovider's nestedThingSchema): "settings" is
 // a nested_type (SINGLE) attribute with two optional leaf attributes. A nil
@@ -495,6 +526,165 @@ func TestApplyWithholdsSensitiveComputedAndReferencedValues(t *testing.T) {
 		if ch.Action != "no-op" {
 			t.Fatalf("post-apply action for %s = %s", ch.Address, ch.Action)
 		}
+	}
+}
+
+func TestApplySensitiveSetLifecyclePreservesIdentity(t *testing.T) {
+	resource := setThing("demo", "demo")
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+
+	pl := h.plan(t, st, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "create" {
+		t.Fatalf("plan = %+v, want sensitive set create", pl.Changes)
+	}
+	artifact := append(append([]byte(nil), pl.Changes[0].After...), pl.Changes[0].PlannedRaw...)
+	for _, secret := range []string{"attribute-token-one", "attribute-token-two", "attribute-detail-one", "attribute-detail-two", "block-token-one", "block-token-two", "block-detail-one", "block-detail-two"} {
+		if bytes.Contains(artifact, []byte(secret)) {
+			t.Fatalf("plan artifact exposed %q", secret)
+		}
+	}
+	if _, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("Apply: %+v", ds)
+	}
+
+	data, err := os.ReadFile(h.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"attribute-token-one", "attribute-token-two", "attribute-detail-one", "attribute-detail-two", "block-token-one", "block-token-two", "block-detail-one", "block-detail-two"} {
+		if bytes.Contains(data, []byte(secret)) {
+			t.Fatalf("state artifact exposed %q", secret)
+		}
+	}
+	if !bytes.Contains(data, []byte(`"sensitive_set_recovery"`)) {
+		t.Fatal("state omitted encrypted sensitive set recovery")
+	}
+	attrs := stateAttrs(t, h.statePath, resource.Address)
+	for _, field := range []string{"attribute_members", "block_members"} {
+		members, ok := attrs[field].([]any)
+		if !ok || len(members) != 2 {
+			t.Fatalf("%s public cardinality = %#v, want two elements", field, attrs[field])
+		}
+		for _, rawMember := range members {
+			member := rawMember.(map[string]any)
+			if member["label"] != "same" || member["token"] != nil {
+				t.Fatalf("%s public member = %#v", field, member)
+			}
+			details := member["details"].([]any)
+			if len(details) != 1 || details[0].(map[string]any)["kind"] != "same" || details[0].(map[string]any)["secret"] != nil {
+				t.Fatalf("%s public nested details = %#v", field, details)
+			}
+		}
+	}
+
+	reloaded := loadState(t, h.statePath)
+	next := h.plan(t, reloaded, false)
+	if len(next.Changes) != 1 || next.Changes[0].Action != "no-op" {
+		t.Fatalf("post-refresh plan = %+v, want no-op with both set elements restored", next.Changes)
+	}
+	destroy := h.plan(t, reloaded, true)
+	if _, ds := apply.Apply(context.Background(), destroy, h.cfg, h.providers, h.schemas, reloaded, h.statePath); ds.HasErrors() {
+		t.Fatalf("destroy: %+v", ds)
+	}
+	if got := loadState(t, h.statePath).Resources[resource.Address]; got != nil {
+		t.Fatal("destroy retained sensitive set resource")
+	}
+}
+
+func TestApplySensitiveSetMembershipTransitionsConverge(t *testing.T) {
+	resource := setThing("transitions", "transitions")
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	transition := func(name string, attributeMembers, blockMembers []any) {
+		t.Helper()
+		resource.Config["attribute_members"] = attributeMembers
+		resource.Config["block_members"] = blockMembers
+		current := loadState(t, h.statePath)
+		pl := h.plan(t, current, false)
+		if len(pl.Changes) != 1 || pl.Changes[0].Action != "update" {
+			t.Fatalf("%s plan = %+v, want update", name, pl.Changes)
+		}
+		if _, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, current, h.statePath); ds.HasErrors() {
+			t.Fatalf("%s Apply: %+v", name, ds)
+		}
+		converged := h.plan(t, loadState(t, h.statePath), false)
+		if len(converged.Changes) != 1 || converged.Changes[0].Action != "no-op" {
+			t.Fatalf("%s second plan = %+v, want no-op", name, converged.Changes)
+		}
+		attrs := stateAttrs(t, h.statePath, resource.Address)
+		if len(attrs["attribute_members"].([]any)) != len(attributeMembers) || len(attrs["block_members"].([]any)) != len(blockMembers) {
+			t.Fatalf("%s public set cardinality did not follow transition", name)
+		}
+	}
+
+	transition("sensitive member change",
+		[]any{
+			setMember("attribute-token-changed", "attribute-detail-one"),
+			setMember("attribute-token-two", "attribute-detail-two"),
+		},
+		[]any{
+			setMember("block-token-changed", "block-detail-one"),
+			setMember("block-token-two", "block-detail-two"),
+		},
+	)
+	transition("sensitive member add",
+		[]any{
+			setMember("attribute-token-changed", "attribute-detail-one"),
+			setMember("attribute-token-two", "attribute-detail-two"),
+			setMember("attribute-token-three", "attribute-detail-three"),
+		},
+		[]any{
+			setMember("block-token-changed", "block-detail-one"),
+			setMember("block-token-two", "block-detail-two"),
+			setMember("block-token-three", "block-detail-three"),
+		},
+	)
+	transition("sensitive member remove",
+		[]any{setMember("attribute-token-two", "attribute-detail-two")},
+		[]any{setMember("block-token-two", "block-detail-two")},
+	)
+	transition("sensitive set emptied", []any{}, []any{})
+}
+
+func TestApplySensitiveSetPartialFailurePersistsRecovery(t *testing.T) {
+	resource := setThing("partial", "partial-set-failure")
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); !ds.HasErrors() {
+		t.Fatal("partial provider failure unexpectedly succeeded")
+	}
+	saved := loadState(t, h.statePath)
+	rs := saved.Resources[resource.Address]
+	if rs == nil || len(rs.SensitiveSetRecovery) == 0 {
+		t.Fatal("partial provider failure discarded sensitive set recovery")
+	}
+	if got := stateAttrs(t, h.statePath, resource.Address)["attribute_members"].([]any); len(got) != 2 {
+		t.Fatalf("partial checkpoint cardinality = %d, want 2", len(got))
+	}
+}
+
+func TestPlanRejectsSensitiveSetStateWithoutRecovery(t *testing.T) {
+	resource := setThing("legacy", "legacy")
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+	ambiguous := loadState(t, h.statePath)
+	ambiguous.Resources[resource.Address].SensitiveSetRecovery = nil
+	p := &plan.Planner{
+		Config: h.cfg, State: ambiguous, Providers: h.providers, Schemas: h.schemas,
+		EngineVersion: "0.1.1", Refresh: true,
+	}
+	_, ds := p.Plan(context.Background())
+	d := diagnosticWithSummary(ds, "invalid state attributes")
+	if d == nil || !strings.Contains(d.Detail, "legacy redacted state cannot safely reconstruct set identity") {
+		t.Fatalf("diagnostics = %#v, want explicit unsafe legacy ambiguity", ds)
 	}
 }
 

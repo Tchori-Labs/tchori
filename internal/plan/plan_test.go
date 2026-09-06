@@ -239,7 +239,7 @@ func TestPlanWriteReadDeterminism(t *testing.T) {
 	if len(b1) == 0 || b1[len(b1)-1] != '\n' {
 		t.Error("plan.json must end with a trailing newline")
 	}
-	if !strings.Contains(string(b1), `"format_version": "1.1"`) {
+	if !strings.Contains(string(b1), `"format_version": "1.2"`) {
 		t.Errorf("plan.json missing two-space-indented format_version:\n%s", b1)
 	}
 

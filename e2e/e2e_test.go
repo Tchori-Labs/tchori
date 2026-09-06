@@ -221,8 +221,8 @@ func TestEndToEnd(t *testing.T) {
 		// proves Configure ran with the composed config).
 		var st stateDoc
 		readJSON(t, filepath.Join(work, "state.json"), &st)
-		if st.FormatVersion != "1.1" {
-			t.Fatalf("state format_version = %q, want %q", st.FormatVersion, "1.1")
+		if st.FormatVersion != "1.2" {
+			t.Fatalf("state format_version = %q, want %q", st.FormatVersion, "1.2")
 		}
 		if st.Incomplete != nil {
 			t.Fatalf("successful end-to-end apply left incomplete marker: %+v", st.Incomplete)

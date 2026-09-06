@@ -15,7 +15,7 @@ Status: **0.1.0-dev** — pre-MVP, under active development, built in public.
 ## The four differentiators
 
 1. **Structured plan API.** `tchori plan -out plan.json` writes a
-   schema-versioned plan document (`"format_version": "1.1"`)
+   schema-versioned plan document (`"format_version": "1.2"`)
    — the reviewable artifact that lives in the PR. `tchori apply plan.json`
    executes exactly that plan and refuses stale ones (state serial mismatch).
    There is no plan-less apply.
@@ -162,9 +162,10 @@ Exit codes follow the Terraform convention agents already know:
 
 State is a structured, git-diffable `state.json` in the working directory
 (flock-protected, with concurrent modifications rejected before sidecars or the
-state file are changed). Opaque provider private bytes are authenticated and
-encrypted; fresh nonces mean ciphertext changes even when its plaintext does
-not. `state.json.backup` is sanitized and encrypted before a rename that never
+state file are changed). Opaque provider private bytes and the authoritative
+membership of sets containing sensitive leaves are authenticated and encrypted
+in distinct envelopes; fresh nonces mean ciphertext changes even when its
+plaintext does not. `state.json.backup` is sanitized and encrypted before a rename that never
 writes through a symlink and always lands
 as a fresh, owner-only regular file on POSIX. Commits fsync the complete temp file before
 atomic replacement and fsync the directory before returning, so reported
@@ -206,12 +207,14 @@ tchori state status
 Tchori withholds provider-computed attributes marked `Sensitive` by the
 provider. State records JSON `null` plus `redacted`, `sensitive_paths`, and
 `sensitive_scanned` metadata; plans represent the value as unknown and ignore
-it for drift classification. Human plan stdout now renders non-sensitive
-attribute values and refresh drift too; schema-sensitive paths are shown only
-as `(sensitive value)`. Treat plan stdout, `plan.json`, and `state.json` as
-sensitive because a provider that omits its sensitivity flag can still return
-secrets. Every save sanitizes every state entry, including the prior document
-written to `state.json.backup`.
+it for drift classification. Sets whose element identity depends on sensitive
+leaves retain one redacted public array entry per real element while a separate
+authenticated encrypted recovery field preserves the provider-visible set.
+Human plan stdout shows non-sensitive attribute values and refresh drift;
+schema-sensitive paths are shown only as `(sensitive value)`. Treat plan stdout,
+`plan.json`, and `state.json` as sensitive because a provider that omits its
+sensitivity flag can still return secrets. Every save sanitizes every state
+entry, including the prior document written to `state.json.backup`.
 
 For a provider that omits its sensitivity flag, declare an override:
 
@@ -226,22 +229,25 @@ For a provider that omits its sensitivity flag, declare an override:
 }
 ```
 
-An operator-authored raw literal is already present in config, so its exact
-collection instance remains in live `state.json` and participates in drift
-only while the provider-returned value still equals that authored scalar.
-Exemptions are per instance: `rules[0].token` may stay literal while a sibling
-`rules[1].token` containing a `${...}` reference is withheld. References and
-`{"env":"VAR"}` wrappers are never literals. Backups, delete plans, orphan
-handling, and `state show`/MCP rendering are deliberately path-level and may
-mask a literal while config remains authoritative.
+Outside sensitive sets, an operator-authored raw literal is already present in
+config, so its exact collection instance remains in live `state.json` and
+participates in drift only while the provider-returned value still equals that
+authored scalar. Exemptions are per instance: `rules[0].token` may stay literal
+while a sibling `rules[1].token` containing a `${...}` reference is withheld.
+References and `{"env":"VAR"}` wrappers are never literals. Sensitive set
+descendants are always withheld because redacting only some elements would make
+their identity unstable. Backups, delete plans, orphan handling, and `state
+show`/MCP rendering are deliberately path-level and may mask a literal while
+config remains authoritative.
 
 Removing a `sensitive_attributes` entry does **not** declassify a path already
 recorded in state. Saves union current schema/config sensitivity with persisted
 paths and hints, including for untouched resources and backups. Provider
 `nested_type` conversion retains per-leaf sensitivity through nested objects,
-lists, and maps. A sensitive descendant inside a set is rejected before any
-provider execution because replacing distinct secret fields with one sentinel
-can merge set elements and silently lose state.
+lists, maps, and sets. For a sensitive descendant inside a set, tchori captures
+the complete outermost affected set before projection, encrypts it separately,
+and restores it before provider operations. Missing recovery for a nonempty
+legacy redacted set is rejected rather than guessed.
 
 Provider-free read commands mask recorded `sensitive_paths` and legacy
 `redacted` hints without writing state. For entries whose sensitivity has not
@@ -258,12 +264,13 @@ An entry without configuration or hints is rejected without writing.
 Neither operation revokes a leaked credential or removes historical commits:
 rotate exposed credentials and purge repository history separately.
 
-Opaque provider private bytes are encrypted with `TCHORI_ARTIFACT_KEY`, a
-base64-encoded 32-byte key supplied only through the environment. Apply and
-import validate it before resource mutations. Keep the same key available for
-reading encrypted state/plans and restoring backups; losing it loses access
-to the private provider data. Do not commit or print the key, or regenerate
-it for each invocation. See [artifact key management](docs/configuration.md#artifact-encryption-key).
+Opaque provider private bytes and sensitive-set recovery are encrypted with
+`TCHORI_ARTIFACT_KEY`, a base64-encoded 32-byte key supplied only through the
+environment. Apply and import validate it before resource mutations. Keep the
+same key available for reading encrypted state/plans and restoring backups;
+losing it loses access to provider-private and sensitive-set recovery data. Do
+not commit or print the key, or regenerate it for each invocation. See
+[artifact key management](docs/configuration.md#artifact-encryption-key).
 
 Private envelopes authenticate the resource address, type, provider alias, and
 canonical provider source. Existing `1.1` artifacts without a source remain

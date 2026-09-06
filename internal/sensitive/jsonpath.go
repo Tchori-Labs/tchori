@@ -70,37 +70,46 @@ func redactJSONValue(v any, logical string, paths []string, changed map[string]b
 	return v
 }
 
-// JSONRedactor sanitizes ctyjson bytes using live schema structure.
-type JSONRedactor func(attrs json.RawMessage, paths []string) (json.RawMessage, []string, error)
+// JSONSanitizer sanitizes ctyjson bytes with a live schema while retaining
+// authenticated sensitive-set recovery separately from the public projection.
+type JSONSanitizer func(attrs json.RawMessage, recovery []byte, paths []string) (json.RawMessage, []string, []byte, error)
 
-// Redactor binds this sensitivity specification to a concrete provider type.
-func (s *Spec) Redactor(ty cty.Type) JSONRedactor {
-	return func(attrs json.RawMessage, paths []string) (json.RawMessage, []string, error) {
-		return s.RedactJSON(attrs, ty, paths)
+// Sanitizer binds this sensitivity specification to a concrete provider type.
+func (s *Spec) Sanitizer(ty cty.Type) JSONSanitizer {
+	return func(attrs json.RawMessage, recovery []byte, paths []string) (json.RawMessage, []string, []byte, error) {
+		return s.SanitizeJSON(attrs, recovery, ty, paths)
 	}
 }
 
-// RedactJSON decodes provider state with its live cty type before redacting.
-// Structural cty paths distinguish schema attributes from map element keys.
-func (s *Spec) RedactJSON(attrs json.RawMessage, ty cty.Type, paths []string) (json.RawMessage, []string, error) {
-	value, err := ctyjson.Unmarshal(attrs, ty)
-	if err != nil {
-		return nil, nil, fmt.Errorf("decode typed attributes: %w", err)
-	}
+// SanitizeJSON restores authoritative set identity before decoding and emits a
+// fresh public projection and recovery payload. A non-empty affected set with
+// no recovery is rejected because its redacted elements may already have
+// coalesced in an older artifact.
+func (s *Spec) SanitizeJSON(attrs json.RawMessage, recovery []byte, ty cty.Type, paths []string) (json.RawMessage, []string, []byte, error) {
+	effectivePaths := sortedUnique(paths)
 	spec := &Spec{
-		paths:       sortedUnique(paths),
-		exempt:      s.exempt,
-		setPrefixes: s.setPrefixes,
+		paths:          effectivePaths,
+		exempt:         s.exempt,
+		setPrefixes:    affectedSets(s.allSetPrefixes, effectivePaths),
+		allSetPrefixes: s.allSetPrefixes,
 	}
-	redacted, changed, err := spec.Redact(value)
+	var (
+		value cty.Value
+		err   error
+	)
+	if spec.HasSensitiveSets() {
+		value, err = spec.Restore(attrs, recovery, ty)
+	} else {
+		value, err = ctyjson.Unmarshal(attrs, ty)
+	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, fmt.Errorf("decode typed attributes: %w", err)
 	}
-	out, err := ctyjson.Marshal(redacted, ty)
+	out, changed, nextRecovery, err := spec.Project(value)
 	if err != nil {
-		return nil, nil, fmt.Errorf("encode typed attributes: %w", err)
+		return nil, nil, nil, err
 	}
-	return out, changed, nil
+	return out, changed, nextRecovery, nil
 }
 
 func sortedUnique(paths []string) []string {

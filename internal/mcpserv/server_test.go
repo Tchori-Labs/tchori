@@ -295,3 +295,42 @@ func TestStateShowMasksRecordedSensitivityWithoutWriting(t *testing.T) {
 		})
 	}
 }
+
+func TestStateShowPreservesSensitiveSetCardinality(t *testing.T) {
+	workdir := t.TempDir()
+	const sentinel = "mcp-sensitive-set-sentinel"
+	stateJSON := `{"format_version":"1.0","serial":1,"resources":{"secret.demo":{"type":"secret","provider":"test","attributes":{"members":[{"label":"same","token":"` + sentinel + `-one"},{"label":"same","token":"` + sentinel + `-two"}]},"sensitive_paths":["members.token"],"sensitive_scanned":true}}}`
+	path := filepath.Join(workdir, "state.json")
+	if err := os.WriteFile(path, []byte(stateJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := &handlers{workdir: workdir}
+	result, _, err := h.stateShow(context.Background(), nil, stateShowInput{Address: "secret.demo"})
+	if err != nil || result.IsError {
+		t.Fatalf("state_show failed: %v", err)
+	}
+	text := result.Content[0].(*mcp.TextContent)
+	var shown struct {
+		Attributes struct {
+			Members []map[string]any `json:"members"`
+		} `json:"attributes"`
+	}
+	if err := json.Unmarshal([]byte(text.Text), &shown); err != nil {
+		t.Fatal(err)
+	}
+	if len(shown.Attributes.Members) != 2 {
+		t.Fatalf("MCP set cardinality = %d, want 2", len(shown.Attributes.Members))
+	}
+	for _, member := range shown.Attributes.Members {
+		if member["label"] != "same" || member["token"] != nil {
+			t.Fatalf("MCP public member = %#v", member)
+		}
+	}
+	if strings.Contains(text.Text, sentinel) {
+		t.Fatal("MCP state_show exposed sensitive set values")
+	}
+	after, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+	if err != nil || !bytes.Equal([]byte(stateJSON), after) {
+		t.Fatal("MCP state_show rewrote the artifact")
+	}
+}

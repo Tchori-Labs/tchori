@@ -19,7 +19,7 @@ import (
 	"github.com/zclconf/go-cty/cty"
 )
 
-// TestLoadMissing verifies Load returns an empty, well-formed format 1.1 state.
+// TestLoadMissing verifies Load returns an empty, well-formed format 1.2 state.
 func TestLoadMissing(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
@@ -28,8 +28,8 @@ func TestLoadMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(%q) = %v, want nil error", path, err)
 	}
-	if s.FormatVersion != "1.1" {
-		t.Fatalf("FormatVersion = %q, want %q", s.FormatVersion, "1.1")
+	if s.FormatVersion != "1.2" {
+		t.Fatalf("FormatVersion = %q, want %q", s.FormatVersion, "1.2")
 	}
 	if s.Serial != 0 {
 		t.Fatalf("Serial = %d, want 0", s.Serial)
@@ -88,8 +88,8 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load after first Save = %v", err)
 	}
-	if reloaded.FormatVersion != "1.1" {
-		t.Fatalf("Load after first Save: FormatVersion = %q, want %q", reloaded.FormatVersion, "1.1")
+	if reloaded.FormatVersion != "1.2" {
+		t.Fatalf("Load after first Save: FormatVersion = %q, want %q", reloaded.FormatVersion, "1.2")
 	}
 	if reloaded.Serial != 1 {
 		t.Fatalf("Load after first Save: Serial = %d, want 1", reloaded.Serial)
@@ -1252,7 +1252,7 @@ func TestSavePreservesLiveMapElementsWhileRedactingSensitiveLeaves(t *testing.T)
 		t.Fatal(ds)
 	}
 	s.SetSensitiveResolver(func(string, *ResourceState) (Resolution, bool) {
-		return Resolution{Paths: spec.Paths(), RedactAttributes: spec.Redactor(resourceType)}, true
+		return Resolution{Paths: spec.Paths(), SanitizeAttributes: spec.Sanitizer(resourceType)}, true
 	})
 	if err := s.Save(path); err != nil {
 		t.Fatal(err)
@@ -1311,7 +1311,7 @@ func TestSavePreservesLiteralAndRecordedSensitivity(t *testing.T) {
 	}
 	s.SetSensitiveResolver(func(addr string, _ *ResourceState) (Resolution, bool) {
 		if addr == "secret.literal" {
-			return Resolution{Paths: spec.Paths(), RedactAttributes: spec.Redactor(cty.Object(map[string]cty.Type{"token": cty.String}))}, true
+			return Resolution{Paths: spec.Paths(), SanitizeAttributes: spec.Sanitizer(cty.Object(map[string]cty.Type{"token": cty.String}))}, true
 		}
 		return Resolution{}, true
 	})
@@ -1380,9 +1380,9 @@ func TestSaveEncryptsPrivateAndLoadRestoresExactBytes(t *testing.T) {
 		bytes.Contains(data, []byte(base64.StdEncoding.EncodeToString([]byte(sentinel)))) {
 		t.Fatal("state.json exposed provider private bytes")
 	}
-	if !bytes.Contains(data, []byte(`"format_version": "1.1"`)) ||
+	if !bytes.Contains(data, []byte(`"format_version": "1.2"`)) ||
 		!bytes.Contains(data, []byte(`"private": {`)) {
-		t.Fatalf("state.json does not contain a 1.1 encrypted private envelope: %s", data)
+		t.Fatalf("state.json does not contain a 1.2 encrypted private envelope: %s", data)
 	}
 	loaded, err := Load(path)
 	if err != nil {
@@ -1549,7 +1549,7 @@ func TestSaveMigratesLegacyPrivateInStateAndBackup(t *testing.T) {
 		}
 		if bytes.Contains(data, []byte(sentinel)) ||
 			bytes.Contains(data, []byte(base64.StdEncoding.EncodeToString([]byte(sentinel)))) ||
-			!bytes.Contains(data, []byte(`"format_version": "1.1"`)) {
+			!bytes.Contains(data, []byte(`"format_version": "1.2"`)) {
 			t.Fatalf("migration left an unsafe artifact at %s: %s", artifact, data)
 		}
 		loaded, err := Load(artifact)
@@ -1655,5 +1655,132 @@ func TestSaveHonorsLegacyRedactedHint(t *testing.T) {
 		if bytes.Contains(data, []byte("legacy-secret")) || !bytes.Contains(data, []byte("public")) {
 			t.Fatal("Save did not preserve public data while masking a legacy redacted hint")
 		}
+	}
+}
+
+func TestSensitiveSetRecoveryIsEncryptedBoundAndBackedUp(t *testing.T) {
+	setStateArtifactKey(t, 31)
+	elementType := cty.Object(map[string]cty.Type{"label": cty.String, "token": cty.String})
+	resourceType := cty.Object(map[string]cty.Type{"members": cty.Set(elementType)})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"members": {
+			Type: cty.Set(elementType),
+			NestedType: map[string]*provider.Attr{
+				"label": {Type: cty.String},
+				"token": {Type: cty.String, Sensitive: true},
+			},
+		},
+	}}
+	spec, ds := sensitive.Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	element := func(token string) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{"label": cty.StringVal("same"), "token": cty.StringVal(token)})
+	}
+	original := cty.ObjectVal(map[string]cty.Value{
+		"members": cty.SetVal([]cty.Value{element("set-secret-one"), element("set-secret-two")}),
+	})
+	public, redacted, recovery, err := spec.Project(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"secret.set": {
+			Type: "secret", Provider: "test", ProviderSource: "example.test/test",
+			Attributes: public, Private: []byte("provider-private"), SensitiveSetRecovery: recovery,
+			Redacted: redacted, SensitivePaths: spec.Paths(), SensitiveScanned: true,
+		},
+	}}
+	s.SetSensitiveResolver(func(string, *ResourceState) (Resolution, bool) {
+		return Resolution{Paths: spec.Paths(), ProviderSource: "example.test/test", SanitizeAttributes: spec.Sanitizer(resourceType)}, true
+	})
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, artifact := range []string{path, path + ".backup"} {
+		data, err := os.ReadFile(artifact) //nolint:gosec // test-controlled artifact
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{"set-secret-one", "set-secret-two"} {
+			if bytes.Contains(data, []byte(secret)) || bytes.Contains(data, []byte(base64.StdEncoding.EncodeToString([]byte(secret)))) {
+				t.Fatalf("%s exposed sensitive set member %q", artifact, secret)
+			}
+		}
+		if !bytes.Contains(data, []byte(`"sensitive_set_recovery"`)) {
+			t.Fatalf("%s omitted sensitive set recovery envelope", artifact)
+		}
+		loaded, err := Load(artifact)
+		if err != nil {
+			t.Fatalf("Load(%s): %v", artifact, err)
+		}
+		rs := loaded.Resources["secret.set"]
+		restored, err := spec.Restore(rs.Attributes, rs.SensitiveSetRecovery, resourceType)
+		if err != nil {
+			t.Fatalf("Restore(%s): %v", artifact, err)
+		}
+		if !restored.RawEquals(original) {
+			t.Fatalf("%s lost sensitive set identity", artifact)
+		}
+	}
+
+	data, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		key    string
+		mutate func(map[string]any)
+	}{
+		{"address", "", func(doc map[string]any) {
+			resources := doc["resources"].(map[string]any)
+			resources["secret.renamed"] = resources["secret.set"]
+			delete(resources, "secret.set")
+		}},
+		{"type", "", func(doc map[string]any) {
+			doc["resources"].(map[string]any)["secret.set"].(map[string]any)["type"] = "other"
+		}},
+		{"source", "", func(doc map[string]any) {
+			doc["resources"].(map[string]any)["secret.set"].(map[string]any)["provider_source"] = "example.test/other"
+		}},
+		{"purpose", "", func(doc map[string]any) {
+			resource := doc["resources"].(map[string]any)["secret.set"].(map[string]any)
+			resource["private"], resource["sensitive_set_recovery"] = resource["sensitive_set_recovery"], resource["private"]
+		}},
+		{"missing key", "missing", func(map[string]any) {}},
+		{"changed key", "changed", func(map[string]any) {}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setStateArtifactKey(t, 31)
+			var doc map[string]any
+			if err := json.Unmarshal(data, &doc); err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(doc)
+			tampered, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tamperedPath := filepath.Join(t.TempDir(), "state.json")
+			if err := os.WriteFile(tamperedPath, tampered, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			switch tc.key {
+			case "missing":
+				t.Setenv("TCHORI_ARTIFACT_KEY", "")
+			case "changed":
+				setStateArtifactKey(t, 32)
+			}
+			if _, err := Load(tamperedPath); err == nil {
+				t.Fatal("Load accepted recovery with invalid key or authenticated identity")
+			}
+		})
 	}
 }

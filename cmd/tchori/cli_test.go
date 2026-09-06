@@ -188,6 +188,37 @@ func writeConfig(t *testing.T, dir, name string) {
 	}
 }
 
+func writeSensitiveSetConfig(t *testing.T, dir string) {
+	t.Helper()
+	cfg := `{
+  "providers": {
+    "tchoritest": {
+      "source": "tchori-labs/tchoritest",
+      "version": "0.0.1",
+      "config": {"prefix": "t-"}
+    }
+  },
+  "resources": {
+    "tchoritest_set_thing.imported": {
+      "config": {
+        "name": "imported",
+        "attribute_members": [
+          {"label":"same","token":"imported-attribute-token-one","details":[{"kind":"same","secret":"imported-attribute-detail-one"}]},
+          {"label":"same","token":"imported-attribute-token-two","details":[{"kind":"same","secret":"imported-attribute-detail-two"}]}
+        ],
+        "block_members": [
+          {"label":"same","token":"imported-block-token-one","details":[{"kind":"same","secret":"imported-block-detail-one"}]},
+          {"label":"same","token":"imported-block-token-two","details":[{"kind":"same","secret":"imported-block-detail-two"}]}
+        ]
+      }
+    }
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
 func writeThingResources(t *testing.T, dir string, resources map[string]string) {
 	t.Helper()
 	writeProtocolThingResources(t, dir, "tchoritest", resources)
@@ -1415,6 +1446,59 @@ func TestImportAdoptsResourceIntoState(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "No changes") {
 		t.Errorf("plan after import stdout = %q, want it to say No changes", stdout)
+	}
+}
+
+func TestImportSensitiveSetsEncryptsIdentityAndPreservesProjection(t *testing.T) {
+	dir := t.TempDir()
+	writeSensitiveSetConfig(t, dir)
+	pd := "--plugin-dir=" + pluginDir
+	const address = "tchoritest_set_thing.imported"
+	if stdout, stderr, code := runCLIWithArtifactKey(t, dir, "import", pd, address, "remote-set-id"); code != 0 {
+		t.Fatalf("import: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // test-controlled artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{
+		"imported-attribute-token-one", "imported-attribute-token-two",
+		"imported-attribute-detail-one", "imported-attribute-detail-two",
+		"imported-block-token-one", "imported-block-token-two",
+		"imported-block-detail-one", "imported-block-detail-two",
+	} {
+		if bytes.Contains(data, []byte(secret)) {
+			t.Fatalf("imported state exposed %q", secret)
+		}
+	}
+	if !bytes.Contains(data, []byte(`"sensitive_set_recovery"`)) {
+		t.Fatal("imported state omitted encrypted sensitive set recovery")
+	}
+	stdout, stderr, code := runCLIWithArtifactKey(t, dir, "state", "show", address)
+	if code != 0 {
+		t.Fatalf("state show: exit %d\nstderr: %s", code, stderr)
+	}
+	var shown struct {
+		Attributes map[string]any `json:"attributes"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &shown); err != nil {
+		t.Fatalf("state show output: %v\n%s", err, stdout)
+	}
+	for _, field := range []string{"attribute_members", "block_members"} {
+		members, ok := shown.Attributes[field].([]any)
+		if !ok || len(members) != 2 {
+			t.Fatalf("state show %s = %#v, want two projected members", field, shown.Attributes[field])
+		}
+		for _, raw := range members {
+			member := raw.(map[string]any)
+			if member["token"] != nil || member["details"].([]any)[0].(map[string]any)["secret"] != nil {
+				t.Fatalf("state show exposed %s member: %#v", field, member)
+			}
+		}
+	}
+	stdout, stderr, code = runCLIWithArtifactKey(t, dir, "plan", pd)
+	if code != 0 || !strings.Contains(stdout, "No changes") {
+		t.Fatalf("plan after sensitive set import: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
 }
 
