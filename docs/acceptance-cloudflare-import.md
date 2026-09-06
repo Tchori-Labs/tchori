@@ -10,29 +10,28 @@ existence alone is not acceptance evidence.
 
 ## Prerequisites
 
-> **Blocked on promotion.** `import` is on `develop`, but is not released.
-> `go install github.com/tchori-labs/tchori/cmd/tchori@latest` and builds from
-> `main` do not contain it. Re-check with `git ls-remote --tags origin` in a
-> tchori checkout: this remote query currently prints nothing. A local `git
-> tag` is not evidence because an unfetched clone is also empty. Until a
-> `develop` → `main` promotion and board-approved release occur, a clean build
-> of the pinned `develop` SHA below is the only supported path. This is the
-> same consumer-facing release gap tracked by issue #57 / TC-058.
+> **Pinned build required.** Public release `v0.1.0` includes `import`, but it
+> predates the `1.1` encrypted-artifact and provider-source identity protections
+> required by this acceptance procedure. `v0.1.1` is not released. Until the
+> reviewed integration is promoted to `main` and receives a board-approved
+> release, build the pinned public `develop` commit below rather than using
+> `go install ...@latest`.
+>
+> **Security rationale for the pin.** This public integration commit includes
+> `import`, authenticated private artifacts, provider-source binding, and the
+> gRPC and `x/text` dependency upgrades that avoid GO-2026-6061 and
+> GO-2026-5970. Before any future repin, prove that the new SHA (a) is an
+> ancestor of `origin/develop`, (b) contains `newImportCmd`, (c) carries
+> `google.golang.org/grpc` >= v1.82.1 and `golang.org/x/text` >= v0.39.0, and
+> (d) retains the artifact protections; then rerun `govulncheck ./...`.
 
-> **Security rationale for the pin.** This SHA includes TC-060's gRPC and
-> `x/text` dependency upgrades, so the operator does not build a binary exposed
-> to GO-2026-6061 or GO-2026-5970. Before any future repin, prove that the new
-> SHA (a) is an ancestor of `origin/develop`, (b) contains `newImportCmd`, and
-> (c) carries `google.golang.org/grpc` >= v1.82.1 and
-> `golang.org/x/text` >= v0.39.0; then rerun `govulncheck ./...`.
-
-- [ ] Build commit `f7c28232ee472aeb346de75bd123bc47467e6f53` from a clean
+- [ ] Build commit `ea73e83f3b4adeec14e40a98e2e80efdd32fc61f` from a clean
       tchori checkout into a dedicated directory:
 
 ```bash
 # Build from the pinned develop commit in a clean checkout
 TCHORI_SRC=/path/to/tchori
-PINNED_SHA=f7c28232ee472aeb346de75bd123bc47467e6f53
+PINNED_SHA=ea73e83f3b4adeec14e40a98e2e80efdd32fc61f
 git -C "$TCHORI_SRC" fetch origin develop
 git -C "$TCHORI_SRC" checkout "$PINNED_SHA"
 
@@ -57,10 +56,11 @@ export TCHORI_BIN="$HOME/.local/tchori-bin/tchori"
   different from `PINNED_SHA` is a hard stop: clean or re-checkout, then rebuild.
 - [ ] Prove resolution before touching infra. Under Discipline A,
       `command -v tchori` must print `$HOME/.local/tchori-bin/tchori`; a path
-      such as `~/go/bin/tchori` or `/usr/local/bin/tchori` is a stale,
-      importless binary, so stop and fix `PATH`. Under Discipline B, verify
-      `ls -l "$TCHORI_BIN"` and use that expansion everywhere. Run `tchori
-      import --help`: it must exit 0 and print `tchori import ADDRESS ID`.
+      such as `~/go/bin/tchori` or `/usr/local/bin/tchori` may resolve to a
+      release binary without the required artifact protections, so stop and fix
+      `PATH`. Under Discipline B, verify `ls -l "$TCHORI_BIN"` and use that
+      expansion everywhere. Run `tchori import --help`: it must exit 0 and
+      print `tchori import ADDRESS ID`.
 - [ ] Capture `tchori version` as metadata only. Source builds normally report
       `0.1.0-dev`; release builds stamp their version through linker flags.
       Neither value alone proves source provenance. Identity comes from the
