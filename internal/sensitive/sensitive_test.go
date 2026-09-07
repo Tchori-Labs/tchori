@@ -313,6 +313,256 @@ func TestWholeSetSensitivityPreservesAuthoritativeMembership(t *testing.T) {
 	}
 }
 
+func TestFlatTypedSetSensitivityPreservesBoundaries(t *testing.T) {
+	memberType := cty.Object(map[string]cty.Type{"label": cty.String, "token": cty.String})
+	member := func(token string) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{
+			"label": cty.StringVal("same"),
+			"token": cty.StringVal(token),
+		})
+	}
+	members := cty.SetVal([]cty.Value{member("first-private"), member("second-private")})
+
+	tests := []struct {
+		name     string
+		block    *provider.SchemaBlock
+		declared []string
+		value    cty.Value
+	}{
+		{
+			name: "protocol5 flat primitive set direct sensitivity",
+			block: &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+				"members": {Type: cty.Set(cty.String), Sensitive: true},
+			}},
+			value: cty.ObjectVal(map[string]cty.Value{
+				"members": cty.SetVal([]cty.Value{cty.StringVal("first"), cty.StringVal("second")}),
+			}),
+		},
+		{
+			name: "protocol6 flat object set declared sensitivity",
+			block: &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+				"members": {Type: cty.Set(memberType)},
+			}},
+			declared: []string{"members"},
+			value:    cty.ObjectVal(map[string]cty.Value{"members": members}),
+		},
+		{
+			name: "flat object contains inherited sensitive set",
+			block: &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+				"container": {
+					Type:      cty.Object(map[string]cty.Type{"members": cty.Set(memberType)}),
+					Sensitive: true,
+				},
+			}},
+			value: cty.ObjectVal(map[string]cty.Value{
+				"container": cty.ObjectVal(map[string]cty.Value{"members": members}),
+			}),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, ds := Resolve(tc.block, tc.declared, nil)
+			if ds.HasErrors() {
+				t.Fatal(ds)
+			}
+			public, _, recovery, err := spec.Project(tc.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(recovery) == 0 {
+				t.Fatalf("flat typed set omitted recovery: %s", public)
+			}
+			restored, err := spec.Restore(public, recovery, tc.value.Type())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !restored.RawEquals(tc.value) {
+				t.Fatal("flat typed set lost authoritative membership")
+			}
+		})
+	}
+
+	flat := tests[0].block
+	for _, tc := range []struct {
+		name         string
+		value        cty.Value
+		wantRecovery bool
+	}{
+		{
+			name: "null",
+			value: cty.ObjectVal(map[string]cty.Value{
+				"members": cty.NullVal(cty.Set(cty.String)),
+			}),
+		},
+		{
+			name: "empty",
+			value: cty.ObjectVal(map[string]cty.Value{
+				"members": cty.SetValEmpty(cty.String),
+			}),
+			wantRecovery: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			spec, ds := Resolve(flat, nil, nil)
+			if ds.HasErrors() {
+				t.Fatal(ds)
+			}
+			public, _, recovery, err := spec.Project(tc.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (len(recovery) != 0) != tc.wantRecovery {
+				t.Fatalf("recovery presence = %v, want %v", len(recovery) != 0, tc.wantRecovery)
+			}
+			restored, err := spec.Restore(public, recovery, tc.value.Type())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !restored.RawEquals(tc.value) {
+				t.Fatalf("%s set did not round-trip", tc.name)
+			}
+		})
+	}
+}
+
+func TestSensitiveMapInsideCapturedSetWithholdsKeys(t *testing.T) {
+	memberType := cty.Object(map[string]cty.Type{
+		"label": cty.String,
+		"meta":  cty.Map(cty.String),
+	})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"members": {
+			Type: cty.Set(memberType),
+			NestedType: map[string]*provider.Attr{
+				"label": {Type: cty.String},
+				"meta":  {Type: cty.Map(cty.String), Sensitive: true},
+			},
+		},
+	}}
+	member := func(key string) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{
+			"label": cty.StringVal("same"),
+			"meta":  cty.MapVal(map[string]cty.Value{key: cty.StringVal("private-value")}),
+		})
+	}
+	original := cty.ObjectVal(map[string]cty.Value{
+		"members": cty.SetVal([]cty.Value{member("PRIVATE_KEY_ONE"), member("PRIVATE_KEY_TWO")}),
+	})
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	public, _, recovery, err := spec.Project(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sentinel := range []string{"PRIVATE_KEY_ONE", "PRIVATE_KEY_TWO"} {
+		if strings.Contains(string(public), sentinel) {
+			t.Fatalf("public projection exposed sensitive map key %q: %s", sentinel, public)
+		}
+	}
+	restored, err := spec.Restore(public, recovery, original.Type())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored.RawEquals(original) {
+		t.Fatal("captured set did not restore sensitive map keys")
+	}
+	unknown, err := spec.Unknown(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planned, _, _, err := spec.Marshal(unknown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(planned), "PRIVATE_KEY") {
+		t.Fatalf("planned projection exposed sensitive map keys: %s", planned)
+	}
+}
+
+func TestSensitiveMapAboveSetWithholdsKeysAndRestores(t *testing.T) {
+	memberType := cty.Object(map[string]cty.Type{"token": cty.String})
+	groupType := cty.Object(map[string]cty.Type{"members": cty.Set(memberType)})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"groups": {
+			Type:      cty.Map(groupType),
+			Sensitive: true,
+			NestedType: map[string]*provider.Attr{
+				"members": {
+					Type: cty.Set(memberType),
+					NestedType: map[string]*provider.Attr{
+						"token": {Type: cty.String},
+					},
+				},
+			},
+		},
+	}}
+	original := cty.ObjectVal(map[string]cty.Value{
+		"groups": cty.MapVal(map[string]cty.Value{
+			"PRIVATE_GROUP_KEY": cty.ObjectVal(map[string]cty.Value{
+				"members": cty.SetVal([]cty.Value{
+					cty.ObjectVal(map[string]cty.Value{"token": cty.StringVal("private-token")}),
+				}),
+			}),
+		}),
+	})
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	public, _, recovery, err := spec.Project(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(public), "PRIVATE_GROUP_KEY") {
+		t.Fatalf("public projection exposed sensitive ancestor map key: %s", public)
+	}
+	if len(recovery) == 0 {
+		t.Fatal("sensitive ancestor map omitted authenticated recovery")
+	}
+	restored, err := spec.Restore(public, recovery, original.Type())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored.RawEquals(original) {
+		t.Fatal("sensitive ancestor map did not restore exact keys and membership")
+	}
+	for name, groups := range map[string]cty.Value{
+		"null":  cty.NullVal(cty.Map(groupType)),
+		"empty": cty.MapValEmpty(groupType),
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := cty.ObjectVal(map[string]cty.Value{"groups": groups})
+			projected, _, edgeRecovery, err := spec.Project(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(edgeRecovery) == 0 {
+				t.Fatalf("%s sensitive map omitted authenticated recovery", name)
+			}
+			roundTrip, err := spec.Restore(projected, edgeRecovery, value.Type())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !roundTrip.RawEquals(value) {
+				t.Fatalf("%s sensitive map did not round-trip exactly", name)
+			}
+			if _, err := spec.Restore(projected, nil, value.Type()); err == nil {
+				t.Fatalf("%s sensitive map accepted missing recovery", name)
+			}
+		})
+	}
+	unknown, err := spec.Unknown(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknown.GetAttr("groups").IsKnown() {
+		t.Fatal("plan retained the sensitive map shape instead of withholding it")
+	}
+}
+
 func countJSONArrays(value any) int {
 	switch value := value.(type) {
 	case []any:
@@ -436,7 +686,7 @@ func TestSensitiveSetRecoveryNestedMapPunctuationAndTamper(t *testing.T) {
 	if err := json.Unmarshal(recovery, &changedRecovery); err != nil {
 		t.Fatal(err)
 	}
-	changedRecovery.Sets[0].Path[1].Name = "other"
+	changedRecovery.Values[0].Path[1].Name = "other"
 	tamperedRecovery, err := json.Marshal(changedRecovery)
 	if err != nil {
 		t.Fatal(err)
@@ -574,6 +824,8 @@ func TestSensitiveSetRecoveryRotatesAcrossPolicyExpansion(t *testing.T) {
 	}
 	legacy.Version = 1
 	legacy.ProjectionPaths = nil
+	legacy.Sets = legacy.Values
+	legacy.Values = nil
 	recovery, err = json.Marshal(legacy)
 	if err != nil {
 		t.Fatal(err)

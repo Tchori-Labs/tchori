@@ -15,13 +15,14 @@ import (
 	"github.com/zclconf/go-cty/cty/msgpack"
 )
 
-const recoveryVersion = 2
+const recoveryVersion = 3
 
 type recoveryPayload struct {
 	Version          int           `json:"version"`
 	ProjectionSHA256 []byte        `json:"projection_sha256"`
 	ProjectionPaths  []string      `json:"projection_paths,omitempty"`
-	Sets             []recoverySet `json:"sets"`
+	Sets             []recoverySet `json:"sets,omitempty"`
+	Values           []recoverySet `json:"values,omitempty"`
 }
 
 type recoverySet struct {
@@ -48,24 +49,25 @@ func (s *Spec) Marshal(v cty.Value) (json.RawMessage, []string, []string, error)
 
 // Project produces the public projection plus the smallest authoritative
 // recovery payload: each outermost set whose identity depends on a sensitive
-// descendant is encoded in full. Callers must encrypt recovery before storage.
+// descendant, and each sensitive dynamic-key map that must be hidden above
+// such a set, is encoded in full. Callers must encrypt recovery before storage.
 func (s *Spec) Project(v cty.Value) (json.RawMessage, []string, []byte, error) {
-	public, redacted, unknown, sets, err := s.project(v, true)
+	public, redacted, unknown, values, err := s.project(v, true)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	if len(unknown) != 0 {
 		return nil, nil, nil, fmt.Errorf("state contains unknown values at %v", unknown)
 	}
-	if len(sets) == 0 {
+	if len(values) == 0 {
 		return public, redacted, nil, nil
 	}
 	sum := sha256.Sum256(public)
 	recovery, err := json.Marshal(recoveryPayload{
-		Version: recoveryVersion, ProjectionSHA256: sum[:], ProjectionPaths: s.Paths(), Sets: sets,
+		Version: recoveryVersion, ProjectionSHA256: sum[:], ProjectionPaths: s.Paths(), Values: values,
 	})
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("encode sensitive set recovery: %w", err)
+		return nil, nil, nil, fmt.Errorf("encode sensitive recovery: %w", err)
 	}
 	return public, redacted, recovery, nil
 }
@@ -77,17 +79,17 @@ func (s *Spec) marshal(v cty.Value, capture bool) (json.RawMessage, []string, []
 
 func (s *Spec) project(v cty.Value, capture bool) (json.RawMessage, []string, []string, []recoverySet, error) {
 	var redacted, unknown []string
-	var sets []recoverySet
-	out, err := s.projectValue(v, nil, "", capture, false, false, &redacted, &unknown, &sets)
+	var values []recoverySet
+	out, err := s.projectValue(v, nil, "", capture, false, false, &redacted, &unknown, &values)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
 	sort.Strings(redacted)
 	sort.Strings(unknown)
-	return json.RawMessage(out), sortedUnique(redacted), sortedUnique(unknown), sets, nil
+	return json.RawMessage(out), sortedUnique(redacted), sortedUnique(unknown), values, nil
 }
 
-func (s *Spec) projectValue(v cty.Value, path cty.Path, logical string, capture, insideCaptured, inheritedSensitive bool, redacted, unknown *[]string, sets *[]recoverySet) ([]byte, error) {
+func (s *Spec) projectValue(v cty.Value, path cty.Path, logical string, capture, insideCaptured, inheritedSensitive bool, redacted, unknown *[]string, values *[]recoverySet) ([]byte, error) {
 	instance := PathString(path)
 	sensitiveHere := inheritedSensitive
 	if contains(s.paths, logical) {
@@ -102,11 +104,24 @@ func (s *Spec) projectValue(v cty.Value, path cty.Path, logical string, capture,
 		*unknown = append(*unknown, instance)
 		return []byte("null"), nil
 	}
+	ty := v.Type()
+	if contains(s.mapRecoveryPrefixes, logical) && !insideCaptured {
+		if capture {
+			raw, err := msgpack.Marshal(v, ty)
+			if err != nil {
+				return nil, fmt.Errorf("encode sensitive map %q: %w", logical, err)
+			}
+			rp, err := recoveryPath(path)
+			if err != nil {
+				return nil, err
+			}
+			*values = append(*values, recoverySet{Path: rp, Value: raw})
+		}
+		return []byte("null"), nil
+	}
 	if v.IsNull() {
 		return []byte("null"), nil
 	}
-
-	ty := v.Type()
 	if ty.IsSetType() && contains(s.setPrefixes, logical) && !insideCaptured {
 		if capture {
 			if !v.IsWhollyKnown() {
@@ -120,12 +135,12 @@ func (s *Spec) projectValue(v cty.Value, path cty.Path, logical string, capture,
 			if err != nil {
 				return nil, err
 			}
-			*sets = append(*sets, recoverySet{Path: rp, Value: raw})
+			*values = append(*values, recoverySet{Path: rp, Value: raw})
 		}
 		insideCaptured = true
 	}
 	composite := ty.IsObjectType() || ty.IsMapType() || ty.IsListType() || ty.IsTupleType() || ty.IsSetType()
-	if sensitiveHere && (!composite || (!insideCaptured && !s.hasSetAtOrBelow(logical))) {
+	if sensitiveHere && (ty.IsMapType() || !composite || (!insideCaptured && !s.hasSetAtOrBelow(logical))) {
 		return []byte("null"), nil
 	}
 
@@ -138,7 +153,7 @@ func (s *Spec) projectValue(v cty.Value, path cty.Path, logical string, capture,
 		sort.Strings(names)
 		fields := make([][]byte, 0, len(names))
 		for _, name := range names {
-			child, err := s.projectValue(v.GetAttr(name), appendPath(path, cty.GetAttrStep{Name: name}), join(logical, name), capture, insideCaptured, sensitiveHere, redacted, unknown, sets)
+			child, err := s.projectValue(v.GetAttr(name), appendPath(path, cty.GetAttrStep{Name: name}), join(logical, name), capture, insideCaptured, sensitiveHere, redacted, unknown, values)
 			if err != nil {
 				return nil, err
 			}
@@ -152,7 +167,7 @@ func (s *Spec) projectValue(v cty.Value, path cty.Path, logical string, capture,
 		for it.Next() {
 			key, value := it.Element()
 			name := key.AsString()
-			child, err := s.projectValue(value, appendPath(path, cty.IndexStep{Key: key}), logical, capture, insideCaptured, sensitiveHere, redacted, unknown, sets)
+			child, err := s.projectValue(value, appendPath(path, cty.IndexStep{Key: key}), logical, capture, insideCaptured, sensitiveHere, redacted, unknown, values)
 			if err != nil {
 				return nil, err
 			}
@@ -165,7 +180,7 @@ func (s *Spec) projectValue(v cty.Value, path cty.Path, logical string, capture,
 		it := v.ElementIterator()
 		for i := 0; it.Next(); i++ {
 			_, value := it.Element()
-			child, err := s.projectValue(value, appendPath(path, cty.IndexStep{Key: cty.NumberIntVal(int64(i))}), logical, capture, insideCaptured, sensitiveHere, redacted, unknown, sets)
+			child, err := s.projectValue(value, appendPath(path, cty.IndexStep{Key: cty.NumberIntVal(int64(i))}), logical, capture, insideCaptured, sensitiveHere, redacted, unknown, values)
 			if err != nil {
 				return nil, err
 			}
@@ -246,8 +261,8 @@ func (s *Spec) Restore(public json.RawMessage, recovery []byte, ty cty.Type) (ct
 }
 
 // RestoreProjected authenticates and reconstructs state using the sensitivity
-// paths recorded with that state. Version 2 recovery authenticates its own
-// generation paths; the argument preserves safe migration of version 1 state.
+// paths recorded with that state. Recovery versions 2 and 3 authenticate their
+// own generation paths; the argument preserves safe migration of version 1 state.
 func (s *Spec) RestoreProjected(public json.RawMessage, recovery []byte, ty cty.Type, generationPaths []string) (cty.Value, error) {
 	return s.restoreGeneration(public, recovery, ty, generationPaths)
 }
@@ -261,11 +276,11 @@ func (s *Spec) restoreGeneration(public json.RawMessage, recovery []byte, ty cty
 	generation := s.withPaths(generationPaths)
 	if len(recovery) == 0 {
 		expected := map[string]expectedSet{}
-		if err := generation.collectExpectedSets(root, ty, "", nil, expected); err != nil {
+		if err := generation.collectExpectedRecovery(root, ty, "", nil, expected, true); err != nil {
 			return cty.NilVal, err
 		}
 		if len(expected) != 0 {
-			return cty.NilVal, errors.New("sensitive set recovery is required; legacy redacted state cannot safely reconstruct set identity")
+			return cty.NilVal, errors.New("sensitive set recovery is required; legacy redacted state cannot safely reconstruct set identity or sensitive map structure")
 		}
 		return ctyjson.Unmarshal(public, ty)
 	}
@@ -274,20 +289,20 @@ func (s *Spec) restoreGeneration(public json.RawMessage, recovery []byte, ty cty
 	dec := json.NewDecoder(bytes.NewReader(recovery))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&payload); err != nil {
-		return cty.NilVal, errors.New("invalid sensitive set recovery payload")
+		return cty.NilVal, errors.New("invalid sensitive recovery payload")
 	}
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
-		return cty.NilVal, errors.New("invalid sensitive set recovery payload")
+		return cty.NilVal, errors.New("invalid sensitive recovery payload")
 	}
-	if payload.Version != 1 && payload.Version != recoveryVersion {
-		return cty.NilVal, errors.New("invalid sensitive set recovery payload")
+	if payload.Version < 1 || payload.Version > recoveryVersion {
+		return cty.NilVal, errors.New("invalid sensitive recovery payload")
 	}
 	if len(payload.ProjectionSHA256) != sha256.Size {
-		return cty.NilVal, errors.New("invalid sensitive set recovery payload")
+		return cty.NilVal, errors.New("invalid sensitive recovery payload")
 	}
-	if payload.Version == recoveryVersion {
+	if payload.Version >= 2 {
 		if !equalStrings(payload.ProjectionPaths, sortedUnique(payload.ProjectionPaths)) {
-			return cty.NilVal, errors.New("invalid sensitive set recovery projection contract")
+			return cty.NilVal, errors.New("invalid sensitive recovery projection contract")
 		}
 		generation = s.withPaths(payload.ProjectionPaths)
 	}
@@ -298,51 +313,61 @@ func (s *Spec) restoreGeneration(public json.RawMessage, recovery []byte, ty cty
 	}
 	publicSum := sha256.Sum256(canonicalPublic)
 	if !bytes.Equal(publicSum[:], payload.ProjectionSHA256) {
-		return cty.NilVal, errors.New("sensitive set recovery does not match public state")
+		return cty.NilVal, errors.New("sensitive recovery does not match public state")
 	}
 
+	includeMaps := payload.Version >= 3
+	recoveredValues := payload.Sets
+	if includeMaps {
+		if len(payload.Sets) != 0 {
+			return cty.NilVal, errors.New("invalid sensitive recovery payload")
+		}
+		recoveredValues = payload.Values
+	} else if len(payload.Values) != 0 {
+		return cty.NilVal, errors.New("invalid sensitive recovery payload")
+	}
 	expected := map[string]expectedSet{}
-	if err := generation.collectExpectedSets(root, ty, "", nil, expected); err != nil {
+	if err := generation.collectExpectedRecovery(root, ty, "", nil, expected, includeMaps); err != nil {
 		return cty.NilVal, err
 	}
-	if len(expected) == 0 || len(payload.Sets) != len(expected) {
-		return cty.NilVal, errors.New("sensitive set recovery path set does not match its generation contract")
+	if len(expected) == 0 || len(recoveredValues) != len(expected) {
+		return cty.NilVal, errors.New("sensitive recovery path set does not match its generation contract")
 	}
 	seen := map[string]bool{}
-	for _, recovered := range payload.Sets {
+	for _, recovered := range recoveredValues {
 		key := recoveryPathKey(recovered.Path)
 		want, ok := expected[key]
 		if !ok || seen[key] {
-			return cty.NilVal, errors.New("sensitive set recovery path does not match public state")
+			return cty.NilVal, errors.New("sensitive recovery path does not match public state")
 		}
 		seen[key] = true
 		value, err := msgpack.Unmarshal(recovered.Value, want.Type)
-		if err != nil || !value.IsKnown() || value.IsNull() || !value.Type().Equals(want.Type) {
-			return cty.NilVal, errors.New("invalid sensitive set recovery value")
+		if err != nil || !value.IsKnown() || (!want.AllowNull && value.IsNull()) || !value.Type().Equals(want.Type) {
+			return cty.NilVal, errors.New("invalid sensitive recovery value")
 		}
 
 		var projectedRedacted, projectedUnknown []string
-		var projectedSets []recoverySet
+		var projectedValues []recoverySet
 		projected, err := generation.projectValue(
 			value, nil, want.Logical, false, false,
 			coveredBySensitivePath(want.Logical, generation.paths),
-			&projectedRedacted, &projectedUnknown, &projectedSets,
+			&projectedRedacted, &projectedUnknown, &projectedValues,
 		)
 		if err != nil || len(projectedUnknown) != 0 {
-			return cty.NilVal, errors.New("invalid sensitive set recovery value")
+			return cty.NilVal, errors.New("invalid sensitive recovery value")
 		}
 		canonicalExpected, err := json.Marshal(want.Public)
 		if err != nil || !bytes.Equal(projected, canonicalExpected) {
-			return cty.NilVal, errors.New("sensitive set recovery value does not match its generation-time projection")
+			return cty.NilVal, errors.New("sensitive recovery value does not match its generation-time projection")
 		}
 
 		encoded, err := ctyjson.Marshal(value, want.Type)
 		if err != nil {
-			return cty.NilVal, errors.New("invalid sensitive set recovery value")
+			return cty.NilVal, errors.New("invalid sensitive recovery value")
 		}
 		decoded, err := decodeJSON(encoded)
 		if err != nil || setJSONPath(root, recovered.Path, decoded) != nil {
-			return cty.NilVal, errors.New("sensitive set recovery path does not match public state")
+			return cty.NilVal, errors.New("sensitive recovery path does not match public state")
 		}
 	}
 	assembled, err := json.Marshal(root)
@@ -358,11 +383,14 @@ func (s *Spec) restoreGeneration(public json.RawMessage, recovery []byte, ty cty
 
 func (s *Spec) withPaths(paths []string) *Spec {
 	paths = sortedUnique(paths)
+	setPrefixes := affectedSets(s.allSetPrefixes, paths)
 	return &Spec{
-		paths:          paths,
-		exempt:         map[string]any{},
-		setPrefixes:    affectedSets(s.allSetPrefixes, paths),
-		allSetPrefixes: s.allSetPrefixes,
+		paths:               paths,
+		exempt:              map[string]any{},
+		setPrefixes:         setPrefixes,
+		allSetPrefixes:      s.allSetPrefixes,
+		mapRecoveryPrefixes: affectedSensitiveMaps(s.allMapPrefixes, setPrefixes, paths),
+		allMapPrefixes:      s.allMapPrefixes,
 	}
 }
 
@@ -379,12 +407,21 @@ func equalStrings(a, b []string) bool {
 }
 
 type expectedSet struct {
-	Type    cty.Type
-	Logical string
-	Public  any
+	Type      cty.Type
+	Logical   string
+	Public    any
+	AllowNull bool
 }
 
-func (s *Spec) collectExpectedSets(v any, ty cty.Type, logical string, path []recoveryPathStep, out map[string]expectedSet) error {
+func (s *Spec) collectExpectedRecovery(v any, ty cty.Type, logical string, path []recoveryPathStep, out map[string]expectedSet, includeMaps bool) error {
+	if includeMaps && contains(s.mapRecoveryPrefixes, logical) {
+		if v != nil {
+			return fmt.Errorf("public state at %q exposes a sensitive map", logical)
+		}
+		cloned := append([]recoveryPathStep(nil), path...)
+		out[recoveryPathKey(cloned)] = expectedSet{Type: ty, Logical: logical, Public: nil, AllowNull: true}
+		return nil
+	}
 	if ty.IsSetType() && contains(s.setPrefixes, logical) {
 		if v == nil {
 			return nil
@@ -410,7 +447,7 @@ func (s *Spec) collectExpectedSets(v any, ty cty.Type, logical string, path []re
 			if !exists {
 				return fmt.Errorf("public state at %q lacks attribute %q", logical, name)
 			}
-			if err := s.collectExpectedSets(child, childType, join(logical, name), appendRecoveryPath(path, recoveryPathStep{Kind: "attr", Name: name}), out); err != nil {
+			if err := s.collectExpectedRecovery(child, childType, join(logical, name), appendRecoveryPath(path, recoveryPathStep{Kind: "attr", Name: name}), out, includeMaps); err != nil {
 				return err
 			}
 		}
@@ -420,7 +457,7 @@ func (s *Spec) collectExpectedSets(v any, ty cty.Type, logical string, path []re
 			return fmt.Errorf("public state at %q is not a map", logical)
 		}
 		for key, child := range object {
-			if err := s.collectExpectedSets(child, ty.ElementType(), logical, appendRecoveryPath(path, recoveryPathStep{Kind: "key", Name: key}), out); err != nil {
+			if err := s.collectExpectedRecovery(child, ty.ElementType(), logical, appendRecoveryPath(path, recoveryPathStep{Kind: "key", Name: key}), out, includeMaps); err != nil {
 				return err
 			}
 		}
@@ -434,7 +471,7 @@ func (s *Spec) collectExpectedSets(v any, ty cty.Type, logical string, path []re
 			return fmt.Errorf("public state at %q has tuple arity %d; want %d", logical, len(items), len(elementTypes))
 		}
 		for i, child := range items {
-			if err := s.collectExpectedSets(child, elementTypes[i], logical, appendRecoveryPath(path, recoveryPathStep{Kind: "index", Index: i}), out); err != nil {
+			if err := s.collectExpectedRecovery(child, elementTypes[i], logical, appendRecoveryPath(path, recoveryPathStep{Kind: "index", Index: i}), out, includeMaps); err != nil {
 				return err
 			}
 		}
@@ -444,7 +481,7 @@ func (s *Spec) collectExpectedSets(v any, ty cty.Type, logical string, path []re
 			return fmt.Errorf("public state at %q is not an array", logical)
 		}
 		for i, child := range items {
-			if err := s.collectExpectedSets(child, ty.ElementType(), logical, appendRecoveryPath(path, recoveryPathStep{Kind: "index", Index: i}), out); err != nil {
+			if err := s.collectExpectedRecovery(child, ty.ElementType(), logical, appendRecoveryPath(path, recoveryPathStep{Kind: "index", Index: i}), out, includeMaps); err != nil {
 				return err
 			}
 		}
@@ -465,7 +502,7 @@ func recoveryPathKey(path []recoveryPathStep) string {
 
 func setJSONPath(root any, path []recoveryPathStep, value any) error {
 	if len(path) == 0 {
-		return errors.New("root sensitive set recovery is unsupported")
+		return errors.New("root sensitive recovery is unsupported")
 	}
 	current := root
 	for i, step := range path {

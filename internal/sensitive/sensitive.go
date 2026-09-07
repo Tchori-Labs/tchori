@@ -17,10 +17,12 @@ import (
 // index-insensitive; exemptions bind an individual raw-config instance to the
 // exact authored scalar value.
 type Spec struct {
-	paths          []string
-	exempt         map[string]any
-	setPrefixes    []string
-	allSetPrefixes []string
+	paths               []string
+	exempt              map[string]any
+	setPrefixes         []string
+	allSetPrefixes      []string
+	mapRecoveryPrefixes []string
+	allMapPrefixes      []string
 }
 
 // Resolve is the single constructor used by persistence and planning paths.
@@ -30,8 +32,9 @@ func Resolve(block *provider.SchemaBlock, declared []string, rawCfg map[string]a
 		return nil, ds
 	}
 	set := map[string]bool{}
-	var setPrefixes []string
+	var setPrefixes, mapPrefixes []string
 	walkSchema(block, "", set, &setPrefixes)
+	walkSchemaMaps(block, "", &mapPrefixes)
 	for _, path := range declared {
 		set[path] = true
 	}
@@ -41,8 +44,15 @@ func Resolve(block *provider.SchemaBlock, declared []string, rawCfg map[string]a
 	}
 	sort.Strings(paths)
 	allSetPrefixes := sortedUnique(setPrefixes)
+	allMapPrefixes := sortedUnique(mapPrefixes)
 	setPrefixes = affectedSets(allSetPrefixes, paths)
-	s := &Spec{paths: paths, setPrefixes: setPrefixes, allSetPrefixes: allSetPrefixes}
+	s := &Spec{
+		paths:               paths,
+		setPrefixes:         setPrefixes,
+		allSetPrefixes:      allSetPrefixes,
+		mapRecoveryPrefixes: affectedSensitiveMaps(allMapPrefixes, setPrefixes, paths),
+		allMapPrefixes:      allMapPrefixes,
+	}
 	return s.Effective(rawCfg), ds
 }
 
@@ -99,13 +109,118 @@ func walkAttributes(attrs map[string]*provider.Attr, prefix string, paths map[st
 		if attr.Sensitive {
 			paths[path] = true
 		}
+		walkTypeSets(attr.Type, path, setPrefixes)
 		if len(attr.NestedType) != 0 {
-			if attr.Type.IsSetType() {
-				*setPrefixes = append(*setPrefixes, path)
-			}
 			walkAttributes(attr.NestedType, path, paths, setPrefixes)
 		}
 	}
+}
+
+// walkTypeSets discovers sets from the cty type independently of provider
+// NestedType metadata. Protocol 5 has no NestedType representation, and flat
+// protocol 6 attributes may also carry arbitrarily nested collection types.
+func walkTypeSets(ty cty.Type, path string, setPrefixes *[]string) {
+	switch {
+	case ty.IsSetType():
+		*setPrefixes = append(*setPrefixes, path)
+		walkTypeSets(ty.ElementType(), path, setPrefixes)
+	case ty.IsListType(), ty.IsMapType():
+		walkTypeSets(ty.ElementType(), path, setPrefixes)
+	case ty.IsTupleType():
+		for _, elementType := range ty.TupleElementTypes() {
+			walkTypeSets(elementType, path, setPrefixes)
+		}
+	case ty.IsObjectType():
+		for name, attributeType := range ty.AttributeTypes() {
+			walkTypeSets(attributeType, join(path, name), setPrefixes)
+		}
+	}
+}
+
+func walkSchemaMaps(block *provider.SchemaBlock, prefix string, mapPrefixes *[]string) {
+	if block == nil {
+		return
+	}
+	for name, attr := range block.Attributes {
+		if attr != nil {
+			walkTypeMaps(attr.Type, join(prefix, name), mapPrefixes)
+		}
+	}
+	for name, nested := range block.Blocks {
+		if nested == nil {
+			continue
+		}
+		path := join(prefix, name)
+		if nested.Nesting == "map" {
+			*mapPrefixes = append(*mapPrefixes, path)
+		}
+		walkSchemaMaps(nested.Block, path, mapPrefixes)
+	}
+}
+
+func walkTypeMaps(ty cty.Type, path string, mapPrefixes *[]string) {
+	switch {
+	case ty.IsMapType():
+		*mapPrefixes = append(*mapPrefixes, path)
+		walkTypeMaps(ty.ElementType(), path, mapPrefixes)
+	case ty.IsListType(), ty.IsSetType():
+		walkTypeMaps(ty.ElementType(), path, mapPrefixes)
+	case ty.IsTupleType():
+		for _, elementType := range ty.TupleElementTypes() {
+			walkTypeMaps(elementType, path, mapPrefixes)
+		}
+	case ty.IsObjectType():
+		for name, attributeType := range ty.AttributeTypes() {
+			walkTypeMaps(attributeType, join(path, name), mapPrefixes)
+		}
+	}
+}
+
+func affectedSensitiveMaps(allMaps, affectedSetPrefixes, paths []string) []string {
+	var candidates []string
+	for _, mapPrefix := range allMaps {
+		insideCapturedSet := false
+		for _, setPrefix := range affectedSetPrefixes {
+			if strings.HasPrefix(mapPrefix, setPrefix+".") {
+				insideCapturedSet = true
+				break
+			}
+		}
+		if insideCapturedSet {
+			continue
+		}
+		containsAffectedSet := false
+		for _, setPrefix := range affectedSetPrefixes {
+			if strings.HasPrefix(setPrefix, mapPrefix+".") {
+				containsAffectedSet = true
+				break
+			}
+		}
+		if !containsAffectedSet {
+			continue
+		}
+		for _, path := range paths {
+			if mapPrefix == path || strings.HasPrefix(mapPrefix, path+".") {
+				candidates = append(candidates, mapPrefix)
+				break
+			}
+		}
+	}
+	candidates = sortedUnique(candidates)
+	var outermost []string
+	for _, candidate := range candidates {
+		covered := false
+		for _, existing := range outermost {
+			if strings.HasPrefix(candidate, existing+".") {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			outermost = append(outermost, candidate)
+		}
+	}
+	return outermost
 }
 
 func join(prefix, name string) string {
@@ -182,10 +297,12 @@ func (s *Spec) ExemptInstances() []string {
 // would exempt referenced secrets (and future env wrappers, TC-054/#46).
 func (s *Spec) Effective(rawCfg map[string]any) *Spec {
 	out := &Spec{
-		paths:          s.Paths(),
-		exempt:         map[string]any{},
-		setPrefixes:    append([]string(nil), s.setPrefixes...),
-		allSetPrefixes: append([]string(nil), s.allSetPrefixes...),
+		paths:               s.Paths(),
+		exempt:              map[string]any{},
+		setPrefixes:         append([]string(nil), s.setPrefixes...),
+		allSetPrefixes:      append([]string(nil), s.allSetPrefixes...),
+		mapRecoveryPrefixes: append([]string(nil), s.mapRecoveryPrefixes...),
+		allMapPrefixes:      append([]string(nil), s.allMapPrefixes...),
 	}
 	if rawCfg == nil {
 		return out
@@ -312,6 +429,21 @@ func (s *Spec) transform(v cty.Value, mode transformMode) (cty.Value, []string, 
 		}
 		ty := val.Type()
 		composite := ty.IsObjectType() || ty.IsMapType() || ty.IsListType() || ty.IsTupleType() || ty.IsSetType()
+		if ty.IsMapType() && mode != transformMask {
+			switch mode {
+			case transformUnknown:
+				if val.IsNull() {
+					return val, nil
+				}
+				return cty.UnknownVal(ty), nil
+			default:
+				if !val.IsKnown() || val.IsNull() {
+					return val, nil
+				}
+				changed = append(changed, full)
+				return cty.NullVal(ty), nil
+			}
+		}
 		if composite && (underPrefix(logical, s.setPrefixes) || prefixAtOrBelow(logical, s.setPrefixes)) {
 			return val, nil
 		}

@@ -20,6 +20,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/plan"
 	"github.com/tchori-labs/tchori/internal/provider"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 	"github.com/tchori-labs/tchori/internal/state"
 )
 
@@ -195,6 +196,19 @@ func setThing(addrName, configName string) *config.Resource {
 				setMember("block-token-one", "block-detail-one"),
 				setMember("block-token-two", "block-detail-two"),
 			},
+		},
+	}
+}
+
+func flatSetThing(addrName, configName string, members []any) *config.Resource {
+	return &config.Resource{
+		Address:  "tchoritest_flat_set_thing." + addrName,
+		Type:     "tchoritest_flat_set_thing",
+		Name:     addrName,
+		Provider: "tchoritest",
+		Config: map[string]any{
+			"name":    configName,
+			"members": members,
 		},
 	}
 }
@@ -624,14 +638,247 @@ func TestApplySensitiveSetRejectsReplanDivergenceBeforeProviderMutation(t *testi
 	members[0].(map[string]any)["label"] = "changed-after-review"
 
 	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
-	if !ds.HasErrors() || diagnosticWithSummary(ds, "sensitive set preflight diverged from reviewed plan") == nil {
-		t.Fatalf("Apply diagnostics = %+v, want sensitive-set preflight divergence", ds)
+	if !ds.HasErrors() || diagnosticWithSummary(ds, "set preflight diverged from reviewed plan") == nil {
+		t.Fatalf("Apply diagnostics = %+v, want set preflight divergence", ds)
 	}
 	if result.Created != 0 || result.Updated != 0 || result.Deleted != 0 || result.Replaced != 0 {
 		t.Fatalf("provider mutation result = %+v, want no completed mutation", result)
 	}
 	if got := loadState(t, h.statePath).Resources[resource.Address]; got != nil {
 		t.Fatalf("divergent re-plan persisted resource: %+v", got)
+	}
+}
+
+func TestApplyReplansUnknownNonSensitiveSetWithoutLosingProviderPlan(t *testing.T) {
+	dependency := thing("dependency", "dependency")
+	resource := flatSetThing("consumer", "consumer", []any{
+		map[string]any{ //nolint:gosec // fake schema token contains only an internal resource reference
+			"label": "same",
+			"token": "${tchoritest_thing.dependency.id}",
+		},
+	})
+	h := newHarness(t, map[string]*config.Resource{
+		dependency.Address: dependency,
+		resource.Address:   resource,
+	})
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+
+	if _, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("Apply left a non-sensitive set reference unresolved: %+v", ds)
+	}
+	attrs := stateAttrs(t, h.statePath, resource.Address)
+	members := attrs["members"].([]any)
+	if len(members) != 1 {
+		t.Fatalf("members = %#v, want one member", members)
+	}
+	member := members[0].(map[string]any)
+	if member["token"] != "id-dependency" {
+		t.Fatalf("members.token = %#v, want concrete dependency id", member["token"])
+	}
+	if member["normalized"] != "normalized-same" {
+		t.Fatalf("members.normalized = %#v, want provider-planned normalization", member["normalized"])
+	}
+}
+
+func TestApplyRejectsSensitiveSetReplaceWhenReplanBecomesNoOp(t *testing.T) {
+	resource := flatSetThing("replace-to-noop", "replace-to-noop", []any{
+		map[string]any{"label": "same", "token": "first-private"},
+	})
+	resource.SensitiveAttributes = []string{"members.token"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	resource.Config["members"] = []any{map[string]any{"label": "same", "token": "second-private"}}
+	current := loadState(t, h.statePath)
+	pl := h.plan(t, current, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "replace" {
+		t.Fatalf("reviewed action = %+v, want replace", pl.Changes)
+	}
+	resource.Config["members"] = []any{map[string]any{"label": "same", "token": "first-private"}}
+
+	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, current, h.statePath)
+	if !ds.HasErrors() || diagnosticWithSummary(ds, "set preflight diverged from reviewed plan") == nil {
+		t.Fatalf("Apply diagnostics = %+v, want action divergence", ds)
+	}
+	if result.Replaced != 0 || result.Deleted != 0 || result.Created != 0 || result.Updated != 0 {
+		t.Fatalf("result = %+v, want no provider mutation", result)
+	}
+}
+
+func TestApplyRejectsSensitiveSetUpdateWhenReplanRequiresReplace(t *testing.T) {
+	resource := flatSetThing("update-to-replace", "before", []any{
+		map[string]any{"label": "same", "token": "first-private"},
+	})
+	resource.SensitiveAttributes = []string{"members.token"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	resource.Config["name"] = "after"
+	current := loadState(t, h.statePath)
+	pl := h.plan(t, current, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "update" {
+		t.Fatalf("reviewed action = %+v, want update", pl.Changes)
+	}
+	resource.Config["members"] = []any{map[string]any{"label": "same", "token": "second-private"}}
+
+	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, current, h.statePath)
+	if !ds.HasErrors() || diagnosticWithSummary(ds, "set preflight diverged from reviewed plan") == nil {
+		t.Fatalf("Apply diagnostics = %+v, want action divergence", ds)
+	}
+	if result.Replaced != 0 || result.Deleted != 0 || result.Created != 0 || result.Updated != 0 {
+		t.Fatalf("result = %+v, want no provider mutation", result)
+	}
+}
+
+func TestPlannerWholeSetRefreshDoesNotReportFalseDrift(t *testing.T) {
+	resource := flatSetThing("whole-refresh", "whole-refresh", []any{
+		map[string]any{"label": "same", "token": "first-private"},
+		map[string]any{"label": "same", "token": "second-private"},
+	})
+	resource.SensitiveAttributes = []string{"members"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	pl := h.plan(t, loadState(t, h.statePath), false)
+	if len(pl.Drift) != 0 {
+		t.Fatalf("unchanged whole sensitive set reported drift: %+v", pl.Drift)
+	}
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "no-op" {
+		t.Fatalf("post-apply changes = %+v, want no-op", pl.Changes)
+	}
+}
+
+func TestPlannerStateOnlyDeletePreservesWholeSetProjection(t *testing.T) {
+	resource := flatSetThing("whole-delete", "whole-delete", []any{
+		map[string]any{"label": "same", "token": "first-private"},
+		map[string]any{"label": "same", "token": "second-private"},
+	})
+	resource.SensitiveAttributes = []string{"members"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	current := loadState(t, h.statePath)
+	delete(h.cfg.Resources, resource.Address)
+	pl := h.plan(t, current, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "delete" {
+		t.Fatalf("state-only changes = %+v, want delete", pl.Changes)
+	}
+	var before map[string]any
+	if err := json.Unmarshal(pl.Changes[0].Before, &before); err != nil {
+		t.Fatal(err)
+	}
+	members, ok := before["members"].([]any)
+	if !ok || len(members) != 2 {
+		t.Fatalf("delete Before members = %#v, want two projected members", before["members"])
+	}
+}
+
+func TestPlannerWholeSetRefreshDetectsMembershipDrift(t *testing.T) {
+	resource := flatSetThing("membership-drift", "drift-flat-members", []any{
+		map[string]any{"label": "same", "token": "first-private"},
+	})
+	resource.SensitiveAttributes = []string{"members"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	pl := h.plan(t, loadState(t, h.statePath), false)
+	if len(pl.Drift) != 1 || pl.Drift[0].Address != resource.Address {
+		t.Fatalf("membership drift = %+v, want one drift record", pl.Drift)
+	}
+}
+
+func TestSensitiveMapAboveSetStaysPrivateThroughPlanApplyAndBackup(t *testing.T) {
+	const (
+		privateKey   = "PRIVATE_GROUP_KEY"
+		privateToken = "PRIVATE_GROUP_TOKEN"
+	)
+	resource := flatSetThing("private-groups", "private-groups", nil)
+	resource.Config["groups"] = map[string]any{
+		privateKey: map[string]any{
+			"members": []any{map[string]any{"token": privateToken}},
+		},
+	}
+	resource.SensitiveAttributes = []string{"groups"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	planBytes, err := json.Marshal(pl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sentinel := range []string{privateKey, privateToken} {
+		if bytes.Contains(planBytes, []byte(sentinel)) {
+			t.Fatalf("plan artifact exposed %q", sentinel)
+		}
+	}
+	if _, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply did not restore the sensitive map for the provider: %+v", ds)
+	}
+
+	persisted := loadState(t, h.statePath)
+	rs := persisted.Resources[resource.Address]
+	if rs == nil || len(rs.SensitiveSetRecovery) == 0 {
+		t.Fatal("state omitted authenticated sensitive map recovery")
+	}
+	if got := stateAttrs(t, h.statePath, resource.Address)["groups"]; got != nil {
+		t.Fatalf("public state groups = %#v, want null", got)
+	}
+	schema := h.schemas["tchoritest"].ResourceTypes[resource.Type]
+	spec, sds := sensitive.ResolveWithPersisted(schema.Block, resource.SensitiveAttributes, rs.SensitivePaths, resource.Config)
+	if sds.HasErrors() {
+		t.Fatal(sds)
+	}
+	restored, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, schema.Block.ImpliedType(), rs.SensitivePaths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := restored.GetAttr("groups").Index(cty.StringVal(privateKey))
+	members := group.GetAttr("members").AsValueSlice()
+	if len(members) != 1 || members[0].GetAttr("token").AsString() != privateToken {
+		t.Fatalf("restored provider authority = %#v, want exact key and membership", restored)
+	}
+
+	resource.Config["name"] = "private-groups-updated"
+	current := loadState(t, h.statePath)
+	update := h.plan(t, current, false)
+	updateBytes, err := json.Marshal(update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sentinel := range []string{privateKey, privateToken} {
+		if bytes.Contains(updateBytes, []byte(sentinel)) {
+			t.Fatalf("update plan artifact exposed %q", sentinel)
+		}
+	}
+	if _, ds := apply.Apply(context.Background(), update, h.cfg, h.providers, h.schemas, current, h.statePath); ds.HasErrors() {
+		t.Fatalf("update Apply did not restore the sensitive map for the provider: %+v", ds)
+	}
+	for _, path := range []string{h.statePath, h.statePath + ".backup"} {
+		data, err := os.ReadFile(path) //nolint:gosec // test-controlled state path
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, sentinel := range []string{privateKey, privateToken} {
+			if bytes.Contains(data, []byte(sentinel)) {
+				t.Fatalf("%s exposed %q", filepath.Base(path), sentinel)
+			}
+		}
 	}
 }
 

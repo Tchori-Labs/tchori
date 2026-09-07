@@ -88,11 +88,14 @@ func (s *Spec) Sanitizer(ty cty.Type) JSONSanitizer {
 // without weakening the authenticated association of existing set recovery.
 func (s *Spec) SanitizeJSON(attrs json.RawMessage, recovery []byte, ty cty.Type, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error) {
 	effectivePaths := sortedUnique(currentPaths)
+	setPrefixes := affectedSets(s.allSetPrefixes, effectivePaths)
 	spec := &Spec{
-		paths:          effectivePaths,
-		exempt:         s.exempt,
-		setPrefixes:    affectedSets(s.allSetPrefixes, effectivePaths),
-		allSetPrefixes: s.allSetPrefixes,
+		paths:               effectivePaths,
+		exempt:              s.exempt,
+		setPrefixes:         setPrefixes,
+		allSetPrefixes:      s.allSetPrefixes,
+		mapRecoveryPrefixes: affectedSensitiveMaps(s.allMapPrefixes, setPrefixes, effectivePaths),
+		allMapPrefixes:      s.allMapPrefixes,
 	}
 	value, err := spec.restoreGeneration(attrs, recovery, ty, generationPaths)
 	if err != nil {

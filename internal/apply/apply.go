@@ -575,7 +575,7 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	}
 	planned := reviewed
 	plannedPrivate := ch.Private
-	if spec.HasSensitiveSets() && !reviewed.IsWhollyKnown() {
+	if reviewedSetNeedsReplan(reviewed) {
 		proposed := provider.ProposedNew(schema.Block, prior, cfgVal)
 		replanned, pds := client.PlanResource(ctx, typeName, prior, proposed, cfgVal, priorPrivate)
 		pds = provider.Context(addr, pds)
@@ -583,10 +583,12 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 		if pds.HasErrors() {
 			return ds
 		}
+		replannedAction := plan.Classify(prior, replanned.State, replanned.RequiresReplace, spec)
 		if !plannedContractMatches(reviewed, replanned.State) ||
-			!sameStrings(ch.RequiresReplace, replanned.RequiresReplace) {
-			return append(ds, diag.Errorf(addr, "sensitive set preflight diverged from reviewed plan",
-				"provider re-plan changed a reviewed non-sensitive value, collection membership, or replacement requirement; no resource mutation was attempted"))
+			!sameStrings(ch.RequiresReplace, replanned.RequiresReplace) ||
+			replannedAction != ch.Action {
+			return append(ds, diag.Errorf(addr, "set preflight diverged from reviewed plan",
+				fmt.Sprintf("provider re-plan changed a reviewed non-sensitive value, collection membership, replacement requirement, or action (%s to %s); no resource mutation was attempted", ch.Action, replannedAction)))
 		}
 		planned = replanned.State
 		plannedPrivate = replanned.Private
@@ -889,6 +891,73 @@ func resolvePlannedUnknowns(planned, cfgVal cty.Value) cty.Value {
 	}
 }
 
+// reviewedSetNeedsReplan reports whether a reviewed unknown is at or below a
+// set boundary. Sets have no positional merge rule, so every such value must
+// be concretized by asking the provider to plan again.
+func reviewedSetNeedsReplan(value cty.Value) bool {
+	return unknownAtOrBelowSet(value, false)
+}
+
+func unknownAtOrBelowSet(value cty.Value, insideSet bool) bool {
+	ty := value.Type()
+	if !value.IsKnown() {
+		return insideSet || typeContainsSet(ty)
+	}
+	if value.IsNull() {
+		return false
+	}
+	if ty.IsSetType() {
+		if !value.IsWhollyKnown() {
+			return true
+		}
+		for it := value.ElementIterator(); it.Next(); {
+			_, element := it.Element()
+			if unknownAtOrBelowSet(element, true) {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case ty.IsObjectType():
+		for name := range ty.AttributeTypes() {
+			if unknownAtOrBelowSet(value.GetAttr(name), insideSet) {
+				return true
+			}
+		}
+	case ty.IsMapType(), ty.IsListType(), ty.IsTupleType():
+		for it := value.ElementIterator(); it.Next(); {
+			_, element := it.Element()
+			if unknownAtOrBelowSet(element, insideSet) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func typeContainsSet(ty cty.Type) bool {
+	switch {
+	case ty.IsSetType():
+		return true
+	case ty.IsListType(), ty.IsMapType():
+		return typeContainsSet(ty.ElementType())
+	case ty.IsTupleType():
+		for _, elementType := range ty.TupleElementTypes() {
+			if typeContainsSet(elementType) {
+				return true
+			}
+		}
+	case ty.IsObjectType():
+		for _, attributeType := range ty.AttributeTypes() {
+			if typeContainsSet(attributeType) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // plannedContractMatches checks that an apply-time provider re-plan preserves
 // every reviewed known value and collection membership. Unknown reviewed
 // leaves are wildcards. Sets use a full bipartite match rather than index
@@ -944,30 +1013,50 @@ func plannedContractMatches(reviewed, current cty.Value) bool {
 		if len(reviewedValues) != len(currentValues) {
 			return false
 		}
-		matched := make([]bool, len(currentValues))
-		var match func(int, []bool) bool
-		match = func(i int, seen []bool) bool {
-			if i == len(reviewedValues) {
-				return true
-			}
+		edges := make([][]int, len(reviewedValues))
+		for i := range reviewedValues {
 			for j := range currentValues {
-				if seen[j] || !plannedContractMatches(reviewedValues[i], currentValues[j]) {
-					continue
+				if plannedContractMatches(reviewedValues[i], currentValues[j]) {
+					edges[i] = append(edges[i], j)
 				}
-				seen[j] = true
-				matched[j] = true
-				if match(i+1, seen) {
-					return true
-				}
-				matched[j] = false
-				seen[j] = false
 			}
-			return false
 		}
-		return match(0, matched)
+		return perfectBipartiteMatch(edges, len(currentValues))
 	default:
 		return reviewed.RawEquals(current)
 	}
+}
+
+// perfectBipartiteMatch uses augmenting paths to find a complete assignment in
+// O(VE). It never enumerates permutations of wildcard-compatible set members.
+func perfectBipartiteMatch(edges [][]int, rightCount int) bool {
+	if len(edges) != rightCount {
+		return false
+	}
+	rightOwner := make([]int, rightCount)
+	for i := range rightOwner {
+		rightOwner[i] = -1
+	}
+	var augment func(int, []bool) bool
+	augment = func(left int, seen []bool) bool {
+		for _, right := range edges[left] {
+			if right < 0 || right >= rightCount || seen[right] {
+				continue
+			}
+			seen[right] = true
+			if rightOwner[right] == -1 || augment(rightOwner[right], seen) {
+				rightOwner[right] = left
+				return true
+			}
+		}
+		return false
+	}
+	for left := range edges {
+		if !augment(left, make([]bool, rightCount)) {
+			return false
+		}
+	}
+	return true
 }
 
 func sameStrings(a, b []string) bool {

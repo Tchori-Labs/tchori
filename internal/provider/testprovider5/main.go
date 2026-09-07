@@ -54,6 +54,7 @@ var thingType = tftypes.Object{
 		"replace_me": tftypes.String,                           // Optional: change forces replacement
 		"rules":      tftypes.List{ElementType: thingRuleType}, // Optional: list-of-object
 		"tags":       tftypes.Map{ElementType: tftypes.String}, // Optional
+		"members":    tftypes.Set{ElementType: tftypes.String}, // Optional flat protocol-5 set
 	},
 }
 
@@ -67,6 +68,7 @@ var thingSchema = &tfprotov5.Schema{
 			{Name: "replace_me", Type: tftypes.String, Optional: true},
 			{Name: "rules", Type: tftypes.List{ElementType: thingRuleType}, Optional: true},
 			{Name: "tags", Type: tftypes.Map{ElementType: tftypes.String}, Optional: true},
+			{Name: "members", Type: tftypes.Set{ElementType: tftypes.String}, Optional: true, Sensitive: true},
 		},
 	},
 }
@@ -407,6 +409,7 @@ func (s *server) ImportResourceState(ctx context.Context, req *tfprotov5.ImportR
 		"replace_me": tftypes.NewValue(tftypes.String, nil),
 		"rules":      tftypes.NewValue(tftypes.List{ElementType: thingRuleType}, nil),
 		"tags":       tftypes.NewValue(tftypes.Map{ElementType: tftypes.String}, nil),
+		"members":    tftypes.NewValue(tftypes.Set{ElementType: tftypes.String}, nil),
 	}
 	dv, err := tfprotov5.NewDynamicValue(thingType, tftypes.NewValue(thingType, attrs))
 	if err != nil {

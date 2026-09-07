@@ -1560,9 +1560,13 @@ func TestImportErrorPaths(t *testing.T) {
 
 func TestStateShowMasksRecordedSensitivityAndNotesOnlyUnscanned(t *testing.T) {
 	dir := t.TempDir()
-	const sentinel = "tchori-e2e-super-secret-value"
+	const (
+		sentinel    = "tchori-e2e-super-secret-value"
+		mapSentinel = "tchori-e2e-private-map-name"
+	)
 	stateDoc := `{"format_version":"1.0","serial":1,"resources":{` +
 		`"secret.masked":{"type":"secret","provider":"test","attributes":{"client_secret":"` + sentinel + `"},"sensitive_paths":["client_secret"]},` +
+		`"secret.map":{"type":"secret","provider":"test","attributes":{"groups":{"` + mapSentinel + `":{"members":[{"token":"` + sentinel + `"}]}}},"sensitive_paths":["groups"],"sensitive_scanned":true},` +
 		`"thing.scanned":{"type":"thing","provider":"test","attributes":{"value":"ok"},"sensitive_scanned":true},` +
 		`"thing.legacy":{"type":"thing","provider":"test","attributes":{"value":"legacy"}}}}`
 	path := filepath.Join(dir, "state.json")
@@ -1573,6 +1577,11 @@ func TestStateShowMasksRecordedSensitivityAndNotesOnlyUnscanned(t *testing.T) {
 	stdout, stderr, code := runCLI(t, dir, "state", "show", "secret.masked")
 	if code != 0 || strings.Contains(stdout+stderr, sentinel) || !strings.Contains(stderr, "not checked") {
 		t.Fatalf("masked show: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI(t, dir, "state", "show", "secret.map")
+	if code != 0 || strings.Contains(stdout+stderr, mapSentinel) || strings.Contains(stdout+stderr, sentinel) ||
+		!strings.Contains(stdout, `"groups": null`) {
+		t.Fatalf("sensitive map show: code=%d stdout=%s stderr=%s", code, stdout, stderr)
 	}
 	stdout, stderr, code = runCLI(t, dir, "state", "show", "thing.scanned")
 	if code != 0 || strings.Contains(stderr, "not checked") {

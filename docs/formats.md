@@ -167,11 +167,13 @@ At apply time, an unknown left over from planning that turns out to be a
 resolved against that resource's real, just-applied value before the provider
 is called. Objects, maps, lists, and tuples use their key or positional
 correspondence. Sets have no stable positional correspondence, so tchori never
-substitutes raw configuration for an unknown-bearing planned set. It asks the
-provider to plan again with the concrete configuration, verifies the re-plan
-against every reviewed known value, collection membership, and replacement
-requirement, and then applies that provider-produced value. A divergence fails
-before any provider mutation, including the destroy leg of a replacement.
+substitutes raw configuration for a reviewed unknown at or below any set,
+whether sensitive or not. It asks the provider to plan again with the concrete
+configuration and builds the set compatibility graph once; augmenting-path
+matching must find a perfect multiset match against every reviewed known value
+and collection membership. Replacement paths and the shared value-sensitive
+action classification must also remain identical. Any divergence fails before
+the provider's apply RPC, including the destroy leg of a replacement.
 
 ### Exit-code contract
 
@@ -303,9 +305,9 @@ creates.
 | `type` | string | Provider resource type, e.g. `tchoritest_thing`. |
 | `provider` | string | Provider local name from config, e.g. `tchoritest`. |
 | `provider_source` | string, omitted in legacy/early `1.1` input | Canonical provider registry source. New state binds this value into encrypted-envelope authentication and checks it before provider RPCs. |
-| `attributes` | object | Deterministic public projection of applied values. Every withheld sensitive leaf is JSON `null`; sensitive sets retain element count and non-sensitive association as array entries; state never stores unknown values. |
+| `attributes` | object | Deterministic public projection of applied values. Every withheld sensitive leaf is JSON `null`; sensitive sets retain element count and non-sensitive association as array entries. A sensitive map inside a captured set is withheld as a whole so its keys do not leak. A sensitive map above an affected set is also whole-value `null` and uses authenticated recovery. State never stores unknown values. |
 | `private` | object, omitted if empty | Authenticated encrypted envelope with `version`, `nonce`, and `ciphertext`, as described for plans. The opaque plaintext is preserved only in memory for provider RPCs. |
-| `sensitive_set_recovery` | object, omitted if empty | Separate authenticated encrypted envelope containing complete outermost sets whose identity depends on sensitive descendants. It is opened before typed state decoding and never included in read projections. |
+| `sensitive_set_recovery` | object, omitted if empty | Separate authenticated encrypted envelope containing complete outermost sets whose identity depends on sensitive descendants and any smallest sensitive map boundary needed to hide dynamic keys above such a set. It is opened before typed state decoding and never included in read projections. |
 | `redacted` | array of strings, omitted if empty | Sorted paths whose values are withheld, explaining why the corresponding `attributes` leaf is `null`. |
 | `sensitive_paths` | array of strings, omitted if empty | Sorted effective, index-insensitive sensitivity contract. It survives config removal and drives backups, delete plans, orphan handling, and provider-free read masking. |
 | `sensitive_scanned` | boolean, omitted when false | Provenance marker set after live schema/config resolution, including for a definitively non-sensitive resource. Read surfaces use it to distinguish checked entries from legacy entries with unknown provenance. |
@@ -318,15 +320,19 @@ The recovery envelope has a purpose distinct from provider `private` and
 authenticates the resource address, type, provider alias, and canonical source
 as AES-GCM additional data. Its plaintext is versioned and contains a SHA-256
 digest of the exact public projection plus structured attribute/map/list paths
-to msgpack-encoded complete sets. Recovery payload version 2 also records the
-sensitivity paths that produced the projection, so expanding sensitivity can
-authenticate and restore the old set membership before emitting a new
-projection/recovery pair. Version 1 payloads use the resource's recorded
-`sensitive_paths` for the same migration. Restoration validates the path set
-and projection digest before replacing set arrays and decoding the authoritative
-cty value. Moving either envelope to another address/type/source/purpose,
-changing the key, editing the public projection, or removing required recovery
-fails before a provider mutation or state checkpoint.
+to msgpack-encoded authoritative values. Recovery payload version 3 stores
+outermost affected sets and sensitive map boundaries in `values`; map recovery
+preserves null, empty, keys, structure, and nested set membership exactly.
+Version 2 stores sets in `sets` and records the sensitivity paths that produced
+the projection, so expanding sensitivity can authenticate and restore old set
+membership before emitting a new projection/recovery pair. Version 1 payloads
+use the resource's recorded `sensitive_paths` for the same migration.
+Restoration validates the generation paths, complete recovery path set,
+projection digest, and typed generation-time projection before replacing
+public placeholders and decoding the authoritative cty value. Moving either
+envelope to another address/type/source/purpose, changing the key, editing the
+public projection, or removing required recovery fails before a provider
+mutation or state checkpoint.
 
 ### Incomplete apply lifecycle
 
@@ -728,10 +734,17 @@ same instance is redacted. References, explicit nulls, absent values, and
 Set elements have no stable identity after a sensitive leaf becomes null or
 unknown: distinct elements can become equal and coalesce. Tchori therefore
 retains each redacted public element and separately encrypts the authoritative
-outermost affected set. Provider-declared sensitivity on the whole set, an
-explicit whole-set declaration, and a sensitive ancestor all use the same
-recovery mechanism. Per-attribute sensitivity inside provider `nested_type`
-objects, lists, maps, and sets is retained recursively.
+outermost affected set. Flat cty types are traversed independently of provider
+`nested_type` metadata, including sets nested in objects, maps, lists, tuples,
+or other sets; protocol 5 and flat protocol 6 schemas therefore use the same
+boundaries. Provider-declared sensitivity on the whole set, an explicit
+whole-set declaration, and a sensitive ancestor all use the same recovery
+mechanism. Per-attribute sensitivity inside provider `nested_type` objects,
+lists, maps, and sets is retained recursively.
+Sensitive maps are withheld as whole values rather than exposing their dynamic
+keys with null leaves. Inside a captured set the set recovery already preserves
+the map. Above a captured set, the smallest sensitive map boundary is itself
+authenticated and recovered, including null versus empty.
 
 Every save sanitizes the whole state document. Live, resolvable entries use the
 provider schema's cty type, preserving map elements even when a map key matches
@@ -740,6 +753,12 @@ sensitivity is unioned with previously recorded paths, so removing a
 declaration cannot restore a previously withheld secret. Backups, delete
 `before` values, orphans, and read rendering are conservative path-level copies
 with no exemption.
+
+Refresh drift and state-only delete projections are derived from authenticated,
+restored typed state before applying the set-aware public projection. A
+legitimate recovered set is not treated as legacy plaintext; legacy plaintext
+detection remains a separate comparison against the persisted public bytes.
+Typed masked comparison still reports genuine hidden membership drift.
 
 Default `state show` and MCP `state_show` mask persisted `sensitive_paths`
 and legacy `redacted` hints in memory and never save or launch providers. An entry with

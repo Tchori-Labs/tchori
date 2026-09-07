@@ -131,22 +131,23 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 			}
 			prior = pv
 			priorPrivate = rs.Private
-			storedPublic, err := provider.DecodeJSON(rs.Attributes, ty)
+			var projectedRedacted []string
+			recordedAttrs, projectedRedacted, _, err = spec.Project(prior)
 			if err != nil {
-				ds = append(ds, diag.Errorf(addr, "invalid public state projection", err.Error()))
-				return nil, ds
+				return nil, append(ds, diag.Errorf(addr, "cannot project recorded state", err.Error()))
 			}
-			var legacyPaths []string
-			if spec.HasSensitiveSets() {
-				recordedAttrs, legacyPaths, err = sensitive.RedactJSON(rs.Attributes, spec.Paths())
-			} else {
-				recordedAttrs, legacyPaths, _, err = spec.Marshal(storedPublic)
-			}
+			publicDifference, err := newDrift(addr, rs.Attributes, recordedAttrs)
 			if err != nil {
 				return nil, append(ds, diag.Errorf(addr, "cannot inspect sensitive state", err.Error()))
 			}
-			if len(legacyPaths) != 0 {
-				ds = append(ds, diag.Warnf(addr, "plaintext sensitive value already exists in state", fmt.Sprintf("rotate credentials at paths %s and purge state.json, state.json.backup, and git history; plan writes no state and a no-op apply saves nothing, so manual purge may be required", strings.Join(legacyPaths, ", "))))
+			if publicDifference != nil {
+				_, legacyPaths, redactErr := sensitive.RedactJSON(rs.Attributes, projectedRedacted)
+				if redactErr != nil {
+					return nil, append(ds, diag.Errorf(addr, "cannot inspect sensitive state", redactErr.Error()))
+				}
+				if len(legacyPaths) != 0 {
+					ds = append(ds, diag.Warnf(addr, "plaintext sensitive value already exists in state", fmt.Sprintf("rotate credentials at paths %s and purge state.json, state.json.backup, and git history; plan writes no state and a no-op apply saves nothing, so manual purge may be required", strings.Join(legacyPaths, ", "))))
+				}
 			}
 		}
 
@@ -175,7 +176,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 				if err != nil {
 					return nil, append(ds, diag.Errorf(addr, "cannot redact refreshed state", err.Error()))
 				}
-				drift, err := newDrift(addr, recordedAttrs, attrs)
+				drift, err := newTypedDrift(addr, recordedAttrs, attrs, prior, rv, spec)
 				if err != nil {
 					ds = append(ds, diag.Errorf(addr, "cannot compare refreshed state", err.Error()))
 					return nil, ds
@@ -304,11 +305,14 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 	if sds.HasErrors() {
 		return nil, lds
 	}
-	paths := spec.Paths()
-	p.State.NoteSensitive(addr, paths)
+	p.State.NoteSensitive(addr, spec.Paths())
+	prior, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, ty, rs.SensitivePaths)
+	if err != nil {
+		return nil, diag.Diagnostics{diag.Errorf(addr, "cannot restore delete state", err.Error())}
+	}
 	// A state-only delete has no raw config and therefore no stable literal
-	// instance exemptions; its reporting copy is scrubbed path-level.
-	before, _, err := sensitive.RedactJSON(rs.Attributes, paths)
+	// instance exemptions; spec is already resolved without any exemptions.
+	before, _, _, err := spec.Project(prior)
 	if err != nil {
 		return nil, diag.Diagnostics{diag.Errorf(addr, "cannot sanitize delete state", err.Error())}
 	}
@@ -384,7 +388,7 @@ func newChange(addr, providerName, providerSource, typeName string, prior, plann
 		Type:            typeName,
 		Provider:        providerName,
 		ProviderSource:  providerSource,
-		Action:          classify(prior, planned, pc.RequiresReplace, spec),
+		Action:          Classify(prior, planned, pc.RequiresReplace, spec),
 		Before:          before,
 		After:           after,
 		UnknownAfter:    unknownAfter,
@@ -394,11 +398,12 @@ func newChange(addr, providerName, providerSource, typeName string, prior, plann
 	}, nil
 }
 
-// classify implements the contract's action classification: no prior =>
-// create; prior and null planned => delete; RequiresReplace non-empty AND
-// planned differs on those paths => replace; planned == prior => no-op;
-// else update.
-func classify(prior, planned cty.Value, requiresReplace []string, spec *sensitive.Spec) string {
+// Classify implements the plan/apply action contract: no prior => create;
+// prior and null planned => delete; RequiresReplace non-empty and changed on
+// one of those paths => replace; planned equal to prior => no-op; else update.
+// Apply reuses this after concretizing an unknown-bearing set re-plan so a
+// reviewed replacement cannot destroy an object after its action changes.
+func Classify(prior, planned cty.Value, requiresReplace []string, spec *sensitive.Spec) string {
 	if prior.IsNull() {
 		return "create"
 	}
@@ -473,6 +478,32 @@ func newDrift(address string, before, after json.RawMessage) (*Drift, error) {
 		Before:  append(json.RawMessage(nil), before...),
 		After:   append(json.RawMessage(nil), after...),
 		Paths:   paths,
+	}, nil
+}
+
+func newTypedDrift(address string, before, after json.RawMessage, prior, refreshed cty.Value, spec *sensitive.Spec) (*Drift, error) {
+	maskedPrior, err := spec.Mask(prior)
+	if err != nil {
+		return nil, fmt.Errorf("mask recorded value: %w", err)
+	}
+	maskedRefreshed, err := spec.Mask(refreshed)
+	if err != nil {
+		return nil, fmt.Errorf("mask refreshed value: %w", err)
+	}
+	if maskedPrior.RawEquals(maskedRefreshed) {
+		return nil, nil
+	}
+	drift, err := newDrift(address, before, after)
+	if err != nil || drift != nil {
+		return drift, err
+	}
+	// Sensitive set membership can change while both review projections remain
+	// identical. Preserve the truthful drift event without exposing the hidden
+	// member difference.
+	return &Drift{
+		Address: address,
+		Before:  append(json.RawMessage(nil), before...),
+		After:   append(json.RawMessage(nil), after...),
 	}, nil
 }
 

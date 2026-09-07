@@ -587,16 +587,20 @@ func TestProviderRPCDialogueProtocol5(t *testing.T) {
 	}
 
 	// 2. Validate ok: no diagnostics.
-	okCfg := thingVal(cty.StringVal("foo"), cty.NullVal(cty.String),
-		cty.NullVal(cty.String), cty.NullVal(cty.String))
+	okCfg, cds := Compose(map[string]any{"name": "foo"}, thingTy, EnvResolve, nil)
+	if cds.HasErrors() {
+		t.Fatalf("Compose(ok): %v", cds)
+	}
 	if ds := c.ValidateResource(ctx, "tchoritest5_thing", okCfg); len(ds) != 0 {
 		t.Fatalf("ValidateResource(ok): unexpected diagnostics %v", ds)
 	}
 
 	// 3. Validate name="invalid": error diagnostic converted through the
 	// adapter's Diagnostic/AttributePath translation.
-	badCfg := thingVal(cty.StringVal("invalid"), cty.NullVal(cty.String),
-		cty.NullVal(cty.String), cty.NullVal(cty.String))
+	badCfg, cds := Compose(map[string]any{"name": "invalid"}, thingTy, EnvResolve, nil)
+	if cds.HasErrors() {
+		t.Fatalf("Compose(invalid): %v", cds)
+	}
 	ds = c.ValidateResource(ctx, "tchoritest5_thing", badCfg)
 	if !ds.HasErrors() {
 		t.Fatalf("ValidateResource(invalid): want error diagnostics, got %v", ds)
@@ -661,8 +665,10 @@ func TestProviderRPCDialogueProtocol5(t *testing.T) {
 
 	// 9. Apply "explode": diagnostics-carrying apply failure, proving
 	// Diagnostic conversion on a real wire exchange that actually fails.
-	explodeCfg := thingVal(cty.StringVal("explode"), cty.NullVal(cty.String),
-		cty.NullVal(cty.String), cty.NullVal(cty.String))
+	explodeCfg, cds := Compose(map[string]any{"name": "explode"}, thingTy, EnvResolve, nil)
+	if cds.HasErrors() {
+		t.Fatalf("Compose(explode): %v", cds)
+	}
 	pc2, ds := c.PlanResource(ctx, "tchoritest5_thing", prior, explodeCfg, explodeCfg, nil)
 	if ds.HasErrors() {
 		t.Fatalf("PlanResource(explode): %v", ds)

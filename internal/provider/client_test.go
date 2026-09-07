@@ -91,10 +91,15 @@ func TestLaunchProtocol5AndSchemas(t *testing.T) {
 		"replace_me": cty.String,
 		"rules":      cty.List(cty.Object(map[string]cty.Type{"token_id": cty.String})),
 		"id":         cty.String,
+		"members":    cty.Set(cty.String),
 		"echo":       cty.String,
 	})
 	if got := thing.Block.ImpliedType(); !got.Equals(want) {
 		t.Errorf("ImpliedType = %#v, want %#v", got, want)
+	}
+	members := thing.Block.Attributes["members"]
+	if members == nil || !members.Sensitive || members.NestedType != nil || !members.Type.Equals(cty.Set(cty.String)) {
+		t.Fatalf("members = %+v, want sensitive flat set(string) without nested metadata", members)
 	}
 
 	// Close terminates the subprocess (the Stop mapping through the adapter).
@@ -219,6 +224,17 @@ func TestLaunchAndSchemas(t *testing.T) {
 	})
 	if got := thing.Block.ImpliedType(); !got.Equals(want) {
 		t.Errorf("ImpliedType = %#v, want %#v", got, want)
+	}
+	flat := schemas.ResourceTypes["tchoritest_flat_set_thing"]
+	if flat == nil {
+		t.Fatal("missing tchoritest_flat_set_thing resource schema")
+	}
+	flatMembers := flat.Block.Attributes["members"]
+	wantMembers := cty.Set(cty.Object(map[string]cty.Type{
+		"label": cty.String, "token": cty.String, "normalized": cty.String,
+	}))
+	if flatMembers == nil || flatMembers.NestedType != nil || !flatMembers.Type.Equals(wantMembers) {
+		t.Fatalf("flat members = %+v, want flat protocol-6 set(object) without nested metadata", flatMembers)
 	}
 
 	// Schemas must cache: the second call returns the identical pointer.

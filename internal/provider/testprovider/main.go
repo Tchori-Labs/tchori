@@ -278,7 +278,7 @@ var _ tfprotov6.ProviderServer = (*server)(nil)
 
 func knownResourceType(typeName string) bool {
 	switch typeName {
-	case "tchoritest_thing", "tchoritest_lossy", "tchoritest_nested_thing", "tchoritest_ingress_thing", "tchoritest_server_assigned", "tchoritest_secretful", "tchoritest_set_thing", "tchoritest_broken_thing":
+	case "tchoritest_thing", "tchoritest_lossy", "tchoritest_nested_thing", "tchoritest_ingress_thing", "tchoritest_server_assigned", "tchoritest_secretful", "tchoritest_set_thing", "tchoritest_flat_set_thing", "tchoritest_broken_thing":
 		return true
 	default:
 		return false
@@ -304,6 +304,7 @@ func (s *server) GetMetadata(ctx context.Context, req *tfprotov6.GetMetadataRequ
 			{TypeName: "tchoritest_server_assigned"},
 			{TypeName: "tchoritest_secretful"},
 			{TypeName: "tchoritest_set_thing"},
+			{TypeName: "tchoritest_flat_set_thing"},
 			{TypeName: "tchoritest_broken_thing"},
 		},
 	}, nil
@@ -320,6 +321,7 @@ func (s *server) GetProviderSchema(ctx context.Context, req *tfprotov6.GetProvid
 			"tchoritest_server_assigned": serverAssignedSchema,
 			"tchoritest_secretful":       secretfulSchema,
 			"tchoritest_set_thing":       setThingSchema,
+			"tchoritest_flat_set_thing":  flatSetThingSchema,
 			"tchoritest_broken_thing":    brokenThingSchema,
 		},
 		DataSourceSchemas: map[string]*tfprotov6.Schema{},
@@ -420,6 +422,12 @@ func (s *server) ValidateResourceConfig(ctx context.Context, req *tfprotov6.Vali
 		}
 		return &tfprotov6.ValidateResourceConfigResponse{}, nil
 	}
+	if req.TypeName == "tchoritest_flat_set_thing" {
+		if _, err := req.Config.Unmarshal(flatSetThingType); err != nil {
+			return nil, err
+		}
+		return &tfprotov6.ValidateResourceConfigResponse{}, nil
+	}
 	cfg, err := req.Config.Unmarshal(thingType)
 	if err != nil {
 		return nil, err
@@ -469,6 +477,8 @@ func (s *server) UpgradeResourceState(ctx context.Context, req *tfprotov6.Upgrad
 		ty = secretfulType
 	case "tchoritest_set_thing":
 		ty = setThingType
+	case "tchoritest_flat_set_thing":
+		ty = flatSetThingType
 	}
 	val, err := req.RawState.Unmarshal(ty)
 	if err != nil {
@@ -529,6 +539,9 @@ func (s *server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 			}
 		}
 	}
+	if req.TypeName == "tchoritest_flat_set_thing" {
+		return s.readFlatSetThing(req)
+	}
 	// No backing store: echo current state (and private) unchanged.
 	return &tfprotov6.ReadResourceResponse{
 		NewState: req.CurrentState,
@@ -557,6 +570,9 @@ func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanReso
 	}
 	if req.TypeName == "tchoritest_set_thing" {
 		return s.planSetThing(req)
+	}
+	if req.TypeName == "tchoritest_flat_set_thing" {
+		return s.planFlatSetThing(req)
 	}
 	proposed, err := req.ProposedNewState.Unmarshal(thingType)
 	if err != nil {
@@ -780,6 +796,9 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 	}
 	if req.TypeName == "tchoritest_set_thing" {
 		return s.applySetThing(req)
+	}
+	if req.TypeName == "tchoritest_flat_set_thing" {
+		return s.applyFlatSetThing(req)
 	}
 	planned, err := req.PlannedState.Unmarshal(thingType)
 	if err != nil {
