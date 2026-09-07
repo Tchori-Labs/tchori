@@ -132,11 +132,12 @@ report(
 for key, label in (
     ("require_code_owner_review", "CODEOWNER review"),
     ("dismiss_stale_reviews_on_push", "stale review dismissal"),
-    ("require_last_push_approval", "last-push approval"),
     ("required_review_thread_resolution", "review thread resolution"),
 ):
     value = pull.get(key)
     report(value is True, label, f"{key}={value!r}")
+last_push = pull.get("require_last_push_approval")
+report(last_push is False, "compatible sole-CODEOWNER approval", f"require_last_push_approval={last_push!r}")
 
 status_rules = by_type.get("required_status_checks", [])
 report(len(status_rules) == 1, "required status checks rule", f"rule count={len(status_rules)}")

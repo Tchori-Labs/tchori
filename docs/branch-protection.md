@@ -12,12 +12,18 @@ the JSON in Git does not apply it by itself.
 | Requirement | Ruleset definition |
 | --- | --- |
 | Changes use a pull request with at least one approval from the owner selected by [`.github/CODEOWNERS`](../.github/CODEOWNERS). | `pull_request.required_approving_review_count` is `1` and `require_code_owner_review` is `true`. The current CODEOWNER is `@VictorCano`; change CODEOWNERS rather than duplicating the identity in the ruleset. |
-| New pushes invalidate stale approval, the last pusher cannot supply the final approval, and review conversations are resolved. | `dismiss_stale_reviews_on_push`, `require_last_push_approval`, and `required_review_thread_resolution` are `true`. |
+| New pushes invalidate stale approval and review conversations are resolved. | `dismiss_stale_reviews_on_push` and `required_review_thread_resolution` are `true`. `require_last_push_approval` is deliberately `false`; the sole CODEOWNER is also the mandatory human merger of agent PRs into `develop`, so enabling it deadlocks the `develop` → `main` promotion instead of adding an independent reviewer. |
 | CI succeeds on the current base branch before merge. | `required_status_checks` contains only the `check` context and `strict_required_status_checks_policy` is `true`. The `check` job directly runs the repository's formatting, vet, lint, and test gates. |
 | Force pushes and deletion of `main` are blocked. | `non_fast_forward` and `deletion` rules are present. |
 | No bot, App, deploy key, role, team, or agent has standing bypass. | `bypass_actors` is empty. This is stricter than a repository-wide Admin-role exception and prevents a present or future admin bot from inheriting bypass. |
 | Tchorizo cannot push directly to `main`. | The pull-request rule is active and Tchorizo has no bypass. The operator proof below must also record an actually rejected direct-push attempt; the committed payload alone is not evidence of live enforcement. |
 | Pull requests into `main` originate only from `develop`. | Rulesets cannot condition on a pull request's head ref, so this is carried by the required `pr-source` status context instead — see [Develop-only source gate](#develop-only-source-gate). |
+
+The CODEOWNER approval still has to target the current head: stale-review
+dismissal invalidates it after every new push. A bot cannot satisfy the
+CODEOWNER rule, and `bypass_actors` remains empty. This preserves independent
+human review without requiring the sole reviewer to be different from the
+human who merged the last reviewed integration into `develop`.
 
 There is no standing break-glass bypass. In an emergency, a repository admin
 must obtain the same recorded human authorization used for other apply

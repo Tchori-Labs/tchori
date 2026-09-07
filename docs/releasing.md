@@ -146,12 +146,12 @@ Release-readiness also requires non-secret evidence of credential revocation
 and history remediation for
 [internal #72](https://github.com/Tchori-Labs/tchori-internal/issues/72) /
 [infra #138](https://github.com/Tchori-Labs/infra/issues/138).
-The current product writes `plan.json`, `state.json`, and `state.json.backup`
-in format `1.2`; it reads `1.0`, `1.1`, and `1.2` as documented in
-[formats.md](formats.md). Consumers such as
-[infra #150](https://github.com/Tchori-Labs/infra/issues/150) must plan this
-migration to the current `1.2` write format; `1.1` is only a legacy input
-format supported for reading.
+The current product writes plan documents in format `1.2` and fully reprojected
+state in format `1.3`; it reads state `1.0`, `1.1`, `1.2`, and `1.3` as
+documented in [formats.md](formats.md). Consumers such as
+[infra #150](https://github.com/Tchori-Labs/infra/issues/150) must plan the
+state migration to current generation `4`; older state formats and recovery
+generations remain migration inputs, not current write formats.
 When existing state or its backup has no canonical `provider_source`, run
 `tchori state sanitize` with the matching configuration, provider schemas, and
 artifact key before planning or applying. When an existing plan lacks complete
