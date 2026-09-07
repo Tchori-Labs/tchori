@@ -11,7 +11,7 @@ the JSON in Git does not apply it by itself.
 
 | Requirement | Ruleset definition |
 | --- | --- |
-| Changes use a pull request with at least one approval from the owner selected by [`.github/CODEOWNERS`](../.github/CODEOWNERS). | `pull_request.required_approving_review_count` is `1` and `require_code_owner_review` is `true`. The current CODEOWNER is `@VictorCano`; change CODEOWNERS rather than duplicating the identity in the ruleset. |
+| Changes use a pull request with at least one approval from the owner selected by [`.github/CODEOWNERS`](../.github/CODEOWNERS); unattributed changes require an extra approval. | `pull_request.required_approving_review_count` is `1`, `require_code_owner_review` is `true`, and `require_extra_approval_for_unattributed_changes` is `true`. The current CODEOWNER is `@VictorCano`; change CODEOWNERS rather than duplicating the identity in the ruleset. |
 | New pushes invalidate stale approval and review conversations are resolved. | `dismiss_stale_reviews_on_push` and `required_review_thread_resolution` are `true`. `require_last_push_approval` is deliberately `false`; the sole CODEOWNER is also the mandatory human merger of agent PRs into `develop`, so enabling it deadlocks the `develop` → `main` promotion instead of adding an independent reviewer. |
 | CI succeeds on the current base branch before merge. | `required_status_checks` contains only the `check` context and `strict_required_status_checks_policy` is `true`. The `check` job directly runs the repository's formatting, vet, lint, and test gates. |
 | Force pushes and deletion of `main` are blocked. | `non_fast_forward` and `deletion` rules are present. |

@@ -136,6 +136,8 @@ for key, label in (
 ):
     value = pull.get(key)
     report(value is True, label, f"{key}={value!r}")
+extra_unattributed = pull.get("require_extra_approval_for_unattributed_changes")
+report(extra_unattributed is True, "extra review for unattributed changes", f"require_extra_approval_for_unattributed_changes={extra_unattributed!r}")
 last_push = pull.get("require_last_push_approval")
 report(last_push is False, "compatible sole-CODEOWNER approval", f"require_last_push_approval={last_push!r}")
 
