@@ -18,14 +18,6 @@ import (
 // RecoveryVersion is the current authenticated sensitive projection generation.
 const RecoveryVersion = 3
 
-// RecoveryGeneration reports the persisted generation marker for a payload.
-func RecoveryGeneration(recovery []byte) int {
-	if len(recovery) == 0 {
-		return 0
-	}
-	return RecoveryVersion
-}
-
 type recoveryPayload struct {
 	Version          int           `json:"version"`
 	ProjectionSHA256 []byte        `json:"projection_sha256"`

@@ -125,12 +125,16 @@ type legacyStateDocument struct {
 	Incomplete    *IncompleteApply                   `json:"incomplete_apply,omitempty"`
 }
 
-// MarshalJSON emits format 1.3 with a mandatory per-resource sensitive
-// projection generation, and seals provider-private bytes and sensitive set
-// recovery in distinct resource-identity-bound envelopes.
+// MarshalJSON emits format 1.3 only when every resource carries the current
+// projection generation. A wholly legacy generation-zero state remains 1.2
+// until live schemas can restore and reproject it.
 func (s State) MarshalJSON() ([]byte, error) {
+	documentFormat, err := persistedFormatVersion(s.Resources)
+	if err != nil {
+		return nil, err
+	}
 	doc := stateDocument{
-		FormatVersion: formatVersion,
+		FormatVersion: documentFormat,
 		Serial:        s.Serial,
 		Resources:     make(map[string]*resourceDocument, len(s.Resources)),
 		Incomplete:    s.Incomplete,
@@ -155,6 +159,33 @@ func (s State) MarshalJSON() ([]byte, error) {
 		}
 	}
 	return json.Marshal(doc)
+}
+
+func persistedFormatVersion(resources map[string]*ResourceState) (string, error) {
+	hasLegacy, hasCurrent := false, false
+	for addr, rs := range resources {
+		if rs == nil {
+			continue
+		}
+		switch rs.SensitiveRecoveryVersion {
+		case 0:
+			hasLegacy = true
+		case sensitive.RecoveryVersion:
+			hasCurrent = true
+		default:
+			return "", fmt.Errorf(
+				"invalid state: resource %q has unsupported sensitive recovery version %d",
+				addr, rs.SensitiveRecoveryVersion,
+			)
+		}
+	}
+	if hasLegacy && hasCurrent {
+		return "", errors.New("invalid state: legacy and current sensitive recovery generations cannot share one document")
+	}
+	if hasLegacy {
+		return recoveryFormatVersion, nil
+	}
+	return formatVersion, nil
 }
 
 // UnmarshalJSON accepts legacy 1.0 plaintext/base64 private fields, reads 1.1
@@ -203,6 +234,12 @@ func (s *State) UnmarshalJSON(data []byte) error {
 			recoveryVersion := 0
 			if persisted.SensitiveRecoveryVersion != nil {
 				recoveryVersion = *persisted.SensitiveRecoveryVersion
+			}
+			if header.FormatVersion == formatVersion && recoveryVersion != sensitive.RecoveryVersion {
+				return fmt.Errorf(
+					"invalid state: resource %q has sensitive recovery version %d; format %s requires %d",
+					addr, recoveryVersion, formatVersion, sensitive.RecoveryVersion,
+				)
 			}
 			if recoveryVersion != 0 && recoveryVersion != sensitive.RecoveryVersion {
 				return fmt.Errorf("open sensitive set recovery for %s: unsupported projection version %d", addr, recoveryVersion)
@@ -393,8 +430,15 @@ func (s *State) Save(path string) error {
 	// Marshal a copy with the next serial so pre-rename failures do not mutate
 	// the caller's serial or format version. Once rename succeeds, the visible
 	// replacement and in-memory CAS fields advance together.
+	nextFormat, err := persistedFormatVersion(s.Resources)
+	if err != nil {
+		return err
+	}
+	if nextFormat != formatVersion && s.Incomplete != nil {
+		return errors.New("apply refused to mutate because legacy state could not be restored and reprojected with live schemas")
+	}
 	next := *s
-	next.FormatVersion = formatVersion
+	next.FormatVersion = nextFormat
 	next.Serial++
 	data, err := json.MarshalIndent(&next, "", "  ")
 	if err != nil {
@@ -431,7 +475,7 @@ func (s *State) Save(path string) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("rename temp state file: %w", err)
 	}
-	s.FormatVersion = formatVersion
+	s.FormatVersion = next.FormatVersion
 	s.Serial = next.Serial
 	s.baseSerial = next.Serial
 	if err := syncDir(dir); err != nil {
@@ -561,8 +605,8 @@ func verifyLockedSidecar(lock *flock.Flock, lockPath string) error {
 
 // prepareBackup returns a sanitized recovery copy of the previous document
 // without changing the backup path. Existing 1.3 bytes are preserved exactly
-// when no attribute sanitization is needed. Earlier documents are rewritten as
-// 1.3 so neither encrypted data class nor generation provenance can be lost.
+// when no attribute sanitization is needed. Earlier documents are upgraded
+// only when every resource has a current projection generation.
 func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // operator-selected state path
 	if err != nil {
@@ -591,8 +635,10 @@ func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 			}
 		}
 		var backupSanitizer sensitive.JSONSanitizer
+		resolved := false
 		if s.resolver != nil {
 			if resolution, ok := s.resolver(addr, prior); ok {
+				resolved = true
 				if err := bindResolvedProviderSource(addr, prior, resolution.ProviderSource); err != nil {
 					return nil, false, err
 				}
@@ -601,6 +647,10 @@ func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 			}
 		}
 		if len(paths) == 0 {
+			if resolved {
+				prior.SensitiveRecoveryVersion = sensitive.RecoveryVersion
+				changedDocument = true
+			}
 			continue
 		}
 		if backupSanitizer != nil {
@@ -612,11 +662,7 @@ func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 			}
 			prior.Attributes = attrs
 			prior.SensitiveSetRecovery = recovery
-			if len(recovery) != 0 {
-				prior.SensitiveRecoveryVersion = sensitive.RecoveryVersion
-			} else {
-				prior.SensitiveRecoveryVersion = 0
-			}
+			prior.SensitiveRecoveryVersion = sensitive.RecoveryVersion
 			prior.Redacted = unionStrings(prior.Redacted, changed)
 			changedDocument = true
 			continue
@@ -687,9 +733,13 @@ func writeBackup(path string, data []byte) error {
 
 func (s *State) sanitizeAll() error {
 	s.unresolved = nil
+	currentProjection := s.FormatVersion == "" || s.FormatVersion == formatVersion
 	for addr, rs := range s.Resources {
 		if rs == nil {
 			continue
+		}
+		if currentProjection && rs.SensitiveRecoveryVersion == 0 {
+			rs.SensitiveRecoveryVersion = sensitive.RecoveryVersion
 		}
 		generationPaths := append([]string(nil), rs.SensitivePaths...)
 		paths := unionStrings(generationPaths, rs.Redacted, s.sensitiveHints[addr])
@@ -716,6 +766,7 @@ func (s *State) sanitizeAll() error {
 				rs.SensitivePaths = nil
 				rs.Redacted = nil
 			}
+			rs.SensitiveRecoveryVersion = sensitive.RecoveryVersion
 			continue
 		}
 		var (
@@ -740,11 +791,7 @@ func (s *State) sanitizeAll() error {
 		rs.Attributes = attrs
 		if resolved && sanitizer != nil {
 			rs.SensitiveSetRecovery = recovery
-			if len(recovery) != 0 {
-				rs.SensitiveRecoveryVersion = sensitive.RecoveryVersion
-			} else {
-				rs.SensitiveRecoveryVersion = 0
-			}
+			rs.SensitiveRecoveryVersion = sensitive.RecoveryVersion
 		}
 		rs.Redacted = unionStrings(rs.Redacted, changed)
 	}

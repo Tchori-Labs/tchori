@@ -187,7 +187,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 				rs.Attributes = attrs
 				rs.Private = rpriv
 				rs.SensitiveSetRecovery = recovery
-				rs.SensitiveRecoveryVersion = sensitive.RecoveryGeneration(recovery)
+				rs.SensitiveRecoveryVersion = sensitive.RecoveryVersion
 				rs.Redacted = redactedPaths
 				// spec was built from the union above, so spec.Paths() is
 				// itself the monotonic union of what rs.SensitivePaths held

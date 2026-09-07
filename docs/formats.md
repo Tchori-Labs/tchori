@@ -293,7 +293,7 @@ creates.
 
 | Field | JSON type | Meaning |
 | --- | --- | --- |
-| `format_version` | string | State document schema version. New writes use `"1.3"`. |
+| `format_version` | string | State document schema version. Fresh/current projections use `"1.3"`; a legacy projection remains `"1.2"` until it can be restored and reprojected with live schemas. |
 | `serial` | integer | Monotonically incremented once per successful `Save` call — see Serial semantics below. |
 | `resources` | object | Map of resource address (`type.name`) to `ResourceState`. |
 | `incomplete_apply` | object, omitted when converged | Durable evidence that the last apply did not complete; see below. |
@@ -308,7 +308,7 @@ creates.
 | `attributes` | object | Deterministic public projection of applied values. Every withheld sensitive leaf is JSON `null`; sensitive sets retain element count and non-sensitive association as array entries. A sensitive map inside a captured set is withheld as a whole so its keys do not leak. A sensitive map above an affected set is also whole-value `null` and uses authenticated recovery. State never stores unknown values. |
 | `private` | object, omitted if empty | Authenticated encrypted envelope with `version`, `nonce`, and `ciphertext`, as described for plans. The opaque plaintext is preserved only in memory for provider RPCs. |
 | `sensitive_set_recovery` | object, omitted if empty | Separate authenticated encrypted envelope containing complete outermost sets whose identity depends on sensitive descendants and any smallest sensitive map boundary needed to hide dynamic keys above such a set. It is opened before typed state decoding and never included in read projections. |
-| `sensitive_recovery_version` | integer | Mandatory per-resource sensitive projection generation in state format `1.3`; `0` identifies a legacy projection and `3` identifies the current recovery contract. Presence is the non-downgradable resource boundary; nonzero values are also authenticated as part of the recovery envelope's AES-GCM additional data. |
+| `sensitive_recovery_version` | integer | Mandatory per-resource sensitive projection generation. Format `1.3` requires the current value `3`; generation `0` is valid only in legacy formats. A nonzero value is also authenticated as part of the recovery envelope's AES-GCM additional data. |
 | `redacted` | array of strings, omitted if empty | Sorted paths whose values are withheld, explaining why the corresponding `attributes` leaf is `null`. |
 | `sensitive_paths` | array of strings, omitted if empty | Sorted effective, index-insensitive sensitivity contract. It survives config removal and drives backups, delete plans, orphan handling, and provider-free read masking. |
 | `sensitive_scanned` | boolean, omitted when false | Provenance marker set after live schema/config resolution, including for a definitively non-sensitive resource. Read surfaces use it to distinguish checked entries from legacy entries with unknown provenance. |
@@ -340,6 +340,15 @@ Moving either envelope to another address/type/source/purpose, changing the
 key or generation marker, editing the public projection, or removing recovery
 required by a current-generation marker fails before a provider mutation or
 state checkpoint.
+
+This is a current-format integrity boundary, not a globally non-downgradable
+file marker. AES-GCM additional data detects ciphertext or bound-context
+tampering, and format `1.3` rejects a missing, null, zero, or unsupported
+generation marker. An attacker who can replace the whole document can instead
+substitute or relabel a separately valid `1.0`, `1.1`, or `1.2` artifact; that
+rollback is indistinguishable from an authentic legacy input to file-local
+cryptography. Preventing it requires trusted repository/storage history or an
+external monotonic trust anchor.
 
 ### Incomplete apply lifecycle
 
@@ -531,13 +540,18 @@ or address. Artifacts with neither encrypted payload remain deterministic.
 `state.Load` accepts current `"1.3"`, recovery-envelope format `"1.2"`,
 encrypted-private format `"1.1"`, and legacy `"1.0"`; it rejects missing,
 empty, and unsupported versions. A nonexistent file instead yields a fresh
-empty state. Every new save upgrades the document and backup to `"1.3"`.
-Format `1.1` introduced encrypted provider-private storage. Format `1.2`
-added encrypted sensitive-set recovery. Format `1.3` requires every resource
-to carry `sensitive_recovery_version`, so deleting both a current recovery
-envelope and its generation marker cannot be interpreted as legacy state.
-Older readers refuse newer plans/state rather than silently discarding or
-coalescing authoritative membership.
+empty state. A save declares format `1.3` only after every resource has been
+restored and reprojected to generation `3`. A wholly generation-zero legacy
+state remains truthfully `1.2` when live schemas are unavailable; apply refuses
+such a state before writing its incomplete marker or calling a provider
+mutation. Format `1.1` introduced encrypted provider-private storage. Format
+`1.2` added encrypted sensitive-set recovery. Format `1.3` requires every
+resource to carry the value `3`, so removing a current recovery envelope and
+resetting its generation to `0` remains invalid while the document still
+declares `1.3`. Older readers refuse newer plans/state rather than silently
+discarding or coalescing authoritative membership. Whole-document replacement
+or relabeling to a valid legacy artifact remains outside this file-local
+boundary, as described above.
 
 ### Example
 
@@ -560,7 +574,7 @@ prefix `demo-`):
         "replace_me": null,
         "tags": null
       },
-      "sensitive_recovery_version": 0
+      "sensitive_recovery_version": 3
     },
     "tchoritest_thing.b": {
       "type": "tchoritest_thing",
@@ -575,7 +589,7 @@ prefix `demo-`):
           "parent": "demo-id-alpha"
         }
       },
-      "sensitive_recovery_version": 0
+      "sensitive_recovery_version": 3
     }
   }
 }
