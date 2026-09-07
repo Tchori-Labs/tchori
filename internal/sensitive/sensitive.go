@@ -17,12 +17,10 @@ import (
 // index-insensitive; exemptions bind an individual raw-config instance to the
 // exact authored scalar value.
 type Spec struct {
-	paths               []string
-	exempt              map[string]any
-	setPrefixes         []string
-	allSetPrefixes      []string
-	mapRecoveryPrefixes []string
-	allMapPrefixes      []string
+	paths          []string
+	exempt         map[string]any
+	setPrefixes    []string
+	allSetPrefixes []string
 }
 
 // Resolve is the single constructor used by persistence and planning paths.
@@ -32,9 +30,8 @@ func Resolve(block *provider.SchemaBlock, declared []string, rawCfg map[string]a
 		return nil, ds
 	}
 	set := map[string]bool{}
-	var setPrefixes, mapPrefixes []string
+	var setPrefixes []string
 	walkSchema(block, "", set, &setPrefixes)
-	walkSchemaMaps(block, "", &mapPrefixes)
 	for _, path := range declared {
 		set[path] = true
 	}
@@ -44,15 +41,8 @@ func Resolve(block *provider.SchemaBlock, declared []string, rawCfg map[string]a
 	}
 	sort.Strings(paths)
 	allSetPrefixes := sortedUnique(setPrefixes)
-	allMapPrefixes := sortedUnique(mapPrefixes)
 	setPrefixes = affectedSets(allSetPrefixes, paths)
-	s := &Spec{
-		paths:               paths,
-		setPrefixes:         setPrefixes,
-		allSetPrefixes:      allSetPrefixes,
-		mapRecoveryPrefixes: affectedSensitiveMaps(allMapPrefixes, setPrefixes, paths),
-		allMapPrefixes:      allMapPrefixes,
-	}
+	s := &Spec{paths: paths, setPrefixes: setPrefixes, allSetPrefixes: allSetPrefixes}
 	return s.Effective(rawCfg), ds
 }
 
@@ -137,92 +127,6 @@ func walkTypeSets(ty cty.Type, path string, setPrefixes *[]string) {
 	}
 }
 
-func walkSchemaMaps(block *provider.SchemaBlock, prefix string, mapPrefixes *[]string) {
-	if block == nil {
-		return
-	}
-	for name, attr := range block.Attributes {
-		if attr != nil {
-			walkTypeMaps(attr.Type, join(prefix, name), mapPrefixes)
-		}
-	}
-	for name, nested := range block.Blocks {
-		if nested == nil {
-			continue
-		}
-		path := join(prefix, name)
-		if nested.Nesting == "map" {
-			*mapPrefixes = append(*mapPrefixes, path)
-		}
-		walkSchemaMaps(nested.Block, path, mapPrefixes)
-	}
-}
-
-func walkTypeMaps(ty cty.Type, path string, mapPrefixes *[]string) {
-	switch {
-	case ty.IsMapType():
-		*mapPrefixes = append(*mapPrefixes, path)
-		walkTypeMaps(ty.ElementType(), path, mapPrefixes)
-	case ty.IsListType(), ty.IsSetType():
-		walkTypeMaps(ty.ElementType(), path, mapPrefixes)
-	case ty.IsTupleType():
-		for _, elementType := range ty.TupleElementTypes() {
-			walkTypeMaps(elementType, path, mapPrefixes)
-		}
-	case ty.IsObjectType():
-		for name, attributeType := range ty.AttributeTypes() {
-			walkTypeMaps(attributeType, join(path, name), mapPrefixes)
-		}
-	}
-}
-
-func affectedSensitiveMaps(allMaps, affectedSetPrefixes, paths []string) []string {
-	var candidates []string
-	for _, mapPrefix := range allMaps {
-		insideCapturedSet := false
-		for _, setPrefix := range affectedSetPrefixes {
-			if strings.HasPrefix(mapPrefix, setPrefix+".") {
-				insideCapturedSet = true
-				break
-			}
-		}
-		if insideCapturedSet {
-			continue
-		}
-		containsAffectedSet := false
-		for _, setPrefix := range affectedSetPrefixes {
-			if strings.HasPrefix(setPrefix, mapPrefix+".") {
-				containsAffectedSet = true
-				break
-			}
-		}
-		if !containsAffectedSet {
-			continue
-		}
-		for _, path := range paths {
-			if mapPrefix == path || strings.HasPrefix(mapPrefix, path+".") {
-				candidates = append(candidates, mapPrefix)
-				break
-			}
-		}
-	}
-	candidates = sortedUnique(candidates)
-	var outermost []string
-	for _, candidate := range candidates {
-		covered := false
-		for _, existing := range outermost {
-			if strings.HasPrefix(candidate, existing+".") {
-				covered = true
-				break
-			}
-		}
-		if !covered {
-			outermost = append(outermost, candidate)
-		}
-	}
-	return outermost
-}
-
 func join(prefix, name string) string {
 	if prefix == "" {
 		return name
@@ -269,6 +173,14 @@ func typePathExists(ty cty.Type, parts []string) bool {
 	for ty.IsListType() || ty.IsSetType() || ty.IsMapType() {
 		ty = ty.ElementType()
 	}
+	if ty.IsTupleType() {
+		for _, elementType := range ty.TupleElementTypes() {
+			if typePathExists(elementType, parts) {
+				return true
+			}
+		}
+		return false
+	}
 	if !ty.IsObjectType() || len(parts) == 0 || !ty.HasAttribute(parts[0]) {
 		return false
 	}
@@ -297,12 +209,10 @@ func (s *Spec) ExemptInstances() []string {
 // would exempt referenced secrets (and future env wrappers, TC-054/#46).
 func (s *Spec) Effective(rawCfg map[string]any) *Spec {
 	out := &Spec{
-		paths:               s.Paths(),
-		exempt:              map[string]any{},
-		setPrefixes:         append([]string(nil), s.setPrefixes...),
-		allSetPrefixes:      append([]string(nil), s.allSetPrefixes...),
-		mapRecoveryPrefixes: append([]string(nil), s.mapRecoveryPrefixes...),
-		allMapPrefixes:      append([]string(nil), s.allMapPrefixes...),
+		paths:          s.Paths(),
+		exempt:         map[string]any{},
+		setPrefixes:    append([]string(nil), s.setPrefixes...),
+		allSetPrefixes: append([]string(nil), s.allSetPrefixes...),
 	}
 	if rawCfg == nil {
 		return out

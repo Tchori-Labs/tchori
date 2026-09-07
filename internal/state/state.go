@@ -45,15 +45,16 @@ var (
 
 // ResourceState is the persisted state of a single managed resource.
 type ResourceState struct {
-	Type                 string          `json:"type"`
-	Provider             string          `json:"provider"`
-	ProviderSource       string          `json:"provider_source,omitempty"`
-	Attributes           json.RawMessage `json:"attributes"` // ctyjson-encoded object
-	Private              []byte          `json:"-"`
-	SensitiveSetRecovery []byte          `json:"-"`
-	Redacted             []string        `json:"redacted,omitempty"`
-	SensitivePaths       []string        `json:"sensitive_paths,omitempty"`
-	SensitiveScanned     bool            `json:"sensitive_scanned,omitempty"`
+	Type                     string          `json:"type"`
+	Provider                 string          `json:"provider"`
+	ProviderSource           string          `json:"provider_source,omitempty"`
+	Attributes               json.RawMessage `json:"attributes"` // ctyjson-encoded object
+	Private                  []byte          `json:"-"`
+	SensitiveSetRecovery     []byte          `json:"-"`
+	SensitiveRecoveryVersion int             `json:"-"`
+	Redacted                 []string        `json:"redacted,omitempty"`
+	SensitivePaths           []string        `json:"sensitive_paths,omitempty"`
+	SensitiveScanned         bool            `json:"sensitive_scanned,omitempty"`
 }
 
 // Resolution is a live schema+config sensitivity lookup result. An empty Paths
@@ -87,15 +88,16 @@ type State struct {
 }
 
 type resourceDocument struct {
-	Type                 string          `json:"type"`
-	Provider             string          `json:"provider"`
-	ProviderSource       string          `json:"provider_source,omitempty"`
-	Attributes           json.RawMessage `json:"attributes"`
-	Private              json.RawMessage `json:"private,omitempty"`
-	SensitiveSetRecovery json.RawMessage `json:"sensitive_set_recovery,omitempty"`
-	Redacted             []string        `json:"redacted,omitempty"`
-	SensitivePaths       []string        `json:"sensitive_paths,omitempty"`
-	SensitiveScanned     bool            `json:"sensitive_scanned,omitempty"`
+	Type                     string          `json:"type"`
+	Provider                 string          `json:"provider"`
+	ProviderSource           string          `json:"provider_source,omitempty"`
+	Attributes               json.RawMessage `json:"attributes"`
+	Private                  json.RawMessage `json:"private,omitempty"`
+	SensitiveSetRecovery     json.RawMessage `json:"sensitive_set_recovery,omitempty"`
+	SensitiveRecoveryVersion int             `json:"sensitive_recovery_version,omitempty"`
+	Redacted                 []string        `json:"redacted,omitempty"`
+	SensitivePaths           []string        `json:"sensitive_paths,omitempty"`
+	SensitiveScanned         bool            `json:"sensitive_scanned,omitempty"`
 }
 
 type stateDocument struct {
@@ -146,7 +148,7 @@ func (s State) MarshalJSON() ([]byte, error) {
 		}
 		doc.Resources[addr] = &resourceDocument{
 			Type: rs.Type, Provider: rs.Provider, ProviderSource: rs.ProviderSource, Attributes: rs.Attributes,
-			Private: private, SensitiveSetRecovery: recovery,
+			Private: private, SensitiveSetRecovery: recovery, SensitiveRecoveryVersion: rs.SensitiveRecoveryVersion,
 			Redacted: rs.Redacted, SensitivePaths: rs.SensitivePaths, SensitiveScanned: rs.SensitiveScanned,
 		}
 	}
@@ -195,7 +197,8 @@ func (s *State) UnmarshalJSON(data []byte) error {
 			}
 			rs := &ResourceState{
 				Type: persisted.Type, Provider: persisted.Provider, ProviderSource: persisted.ProviderSource, Attributes: persisted.Attributes,
-				Redacted: persisted.Redacted, SensitivePaths: persisted.SensitivePaths, SensitiveScanned: persisted.SensitiveScanned,
+				SensitiveRecoveryVersion: persisted.SensitiveRecoveryVersion,
+				Redacted:                 persisted.Redacted, SensitivePaths: persisted.SensitivePaths, SensitiveScanned: persisted.SensitiveScanned,
 			}
 			if len(persisted.Private) != 0 {
 				private, err := privateblob.Open(persisted.Private, resourcePrivateContext("state", addr, rs.Provider, rs.ProviderSource, rs.Type))
@@ -205,7 +208,10 @@ func (s *State) UnmarshalJSON(data []byte) error {
 				rs.Private = private
 			}
 			if len(persisted.SensitiveSetRecovery) != 0 {
-				recovery, err := privateblob.Open(persisted.SensitiveSetRecovery, resourcePrivateContext("state-sensitive-set-recovery", addr, rs.Provider, rs.ProviderSource, rs.Type))
+				if rs.SensitiveRecoveryVersion != 0 && rs.SensitiveRecoveryVersion != sensitive.RecoveryVersion {
+					return fmt.Errorf("open sensitive set recovery for %s: unsupported projection version %d", addr, rs.SensitiveRecoveryVersion)
+				}
+				recovery, err := privateblob.Open(persisted.SensitiveSetRecovery, sensitiveRecoveryContext(addr, rs))
 				if err != nil {
 					return fmt.Errorf("open sensitive set recovery for %s: %w", addr, err)
 				}
@@ -241,11 +247,22 @@ func sealSensitiveSetRecovery(addr string, rs *ResourceState) (json.RawMessage, 
 	if rs.Type == "" || rs.Provider == "" || rs.ProviderSource == "" {
 		return nil, fmt.Errorf("seal sensitive set recovery for %s: type, provider, and provider source are required", addr)
 	}
-	sealed, err := privateblob.Seal(rs.SensitiveSetRecovery, resourcePrivateContext("state-sensitive-set-recovery", addr, rs.Provider, rs.ProviderSource, rs.Type))
+	if rs.SensitiveRecoveryVersion != 0 && rs.SensitiveRecoveryVersion != sensitive.RecoveryVersion {
+		return nil, fmt.Errorf("seal sensitive set recovery for %s: unsupported projection version %d", addr, rs.SensitiveRecoveryVersion)
+	}
+	sealed, err := privateblob.Seal(rs.SensitiveSetRecovery, sensitiveRecoveryContext(addr, rs))
 	if err != nil {
 		return nil, fmt.Errorf("seal sensitive set recovery for %s: %w", addr, err)
 	}
 	return json.RawMessage(sealed), nil
+}
+
+func sensitiveRecoveryContext(addr string, rs *ResourceState) string {
+	kind := "state-sensitive-set-recovery"
+	if rs.SensitiveRecoveryVersion != 0 {
+		kind = fmt.Sprintf("%s-v%d", kind, rs.SensitiveRecoveryVersion)
+	}
+	return resourcePrivateContext(kind, addr, rs.Provider, rs.ProviderSource, rs.Type)
 }
 
 func resourcePrivateContext(kind, addr, provider, providerSource, resourceType string) string {
@@ -578,13 +595,18 @@ func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 		}
 		if backupSanitizer != nil {
 			attrs, changed, recovery, err := backupSanitizer(
-				prior.Attributes, prior.SensitiveSetRecovery, generationPaths, paths,
+				prior.Attributes, prior.SensitiveSetRecovery, prior.SensitiveRecoveryVersion, generationPaths, paths,
 			)
 			if err != nil {
 				return nil, false, fmt.Errorf("sanitize backup attributes for %s: %w", addr, err)
 			}
 			prior.Attributes = attrs
 			prior.SensitiveSetRecovery = recovery
+			if len(recovery) != 0 {
+				prior.SensitiveRecoveryVersion = sensitive.RecoveryVersion
+			} else {
+				prior.SensitiveRecoveryVersion = 0
+			}
 			prior.Redacted = unionStrings(prior.Redacted, changed)
 			changedDocument = true
 			continue
@@ -693,7 +715,7 @@ func (s *State) sanitizeAll() error {
 			err      error
 		)
 		if resolved && sanitizer != nil {
-			attrs, changed, recovery, err = sanitizer(rs.Attributes, rs.SensitiveSetRecovery, generationPaths, paths)
+			attrs, changed, recovery, err = sanitizer(rs.Attributes, rs.SensitiveSetRecovery, rs.SensitiveRecoveryVersion, generationPaths, paths)
 		} else {
 			if len(rs.SensitiveSetRecovery) != 0 {
 				return fmt.Errorf("sanitize state attributes for %s: live schema is required to preserve the authenticated sensitive set projection", addr)
@@ -708,6 +730,11 @@ func (s *State) sanitizeAll() error {
 		rs.Attributes = attrs
 		if resolved && sanitizer != nil {
 			rs.SensitiveSetRecovery = recovery
+			if len(recovery) != 0 {
+				rs.SensitiveRecoveryVersion = sensitive.RecoveryVersion
+			} else {
+				rs.SensitiveRecoveryVersion = 0
+			}
 		}
 		rs.Redacted = unionStrings(rs.Redacted, changed)
 	}

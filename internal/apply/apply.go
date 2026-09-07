@@ -543,7 +543,7 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	var priorPrivate []byte
 	if ch.Action != "create" {
 		if rs := ex.st.Resources[addr]; rs != nil {
-			v, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, ty, rs.SensitivePaths)
+			v, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, ty, rs.SensitivePaths, rs.SensitiveRecoveryVersion)
 			if err != nil {
 				return diag.Diagnostics{diag.Errorf(addr, "corrupt state attributes", err.Error())}
 			}
@@ -666,15 +666,16 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 		}
 		ex.st.NoteSensitive(addr, spec.Paths())
 		ex.st.Resources[addr] = &state.ResourceState{
-			Type:                 typeName,
-			Provider:             providerName,
-			ProviderSource:       providerSource,
-			Attributes:           attrs,
-			Private:              newPrivate,
-			SensitiveSetRecovery: recovery,
-			Redacted:             redactedPaths,
-			SensitivePaths:       spec.Paths(),
-			SensitiveScanned:     true,
+			Type:                     typeName,
+			Provider:                 providerName,
+			ProviderSource:           providerSource,
+			Attributes:               attrs,
+			Private:                  newPrivate,
+			SensitiveSetRecovery:     recovery,
+			SensitiveRecoveryVersion: sensitive.RecoveryGeneration(recovery),
+			Redacted:                 redactedPaths,
+			SensitivePaths:           spec.Paths(),
+			SensitiveScanned:         true,
 		}
 		if err := ex.save(); err != nil {
 			if old != nil {
@@ -741,15 +742,16 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	}
 	ex.st.NoteSensitive(addr, spec.Paths())
 	ex.st.Resources[addr] = &state.ResourceState{
-		Type:                 typeName,
-		Provider:             providerName,
-		ProviderSource:       providerSource,
-		Attributes:           attrs,
-		Private:              newPrivate,
-		SensitiveSetRecovery: recovery,
-		Redacted:             redactedPaths,
-		SensitivePaths:       spec.Paths(),
-		SensitiveScanned:     true,
+		Type:                     typeName,
+		Provider:                 providerName,
+		ProviderSource:           providerSource,
+		Attributes:               attrs,
+		Private:                  newPrivate,
+		SensitiveSetRecovery:     recovery,
+		SensitiveRecoveryVersion: sensitive.RecoveryGeneration(recovery),
+		Redacted:                 redactedPaths,
+		SensitivePaths:           spec.Paths(),
+		SensitiveScanned:         true,
 	}
 	if len(redactedPaths) != 0 {
 		ds = append(ds, diag.Warnf(addr, "sensitive attributes withheld from state", fmt.Sprintf("withheld paths: %s; capture provider-issued credentials in a secret store", strings.Join(redactedPaths, ", "))))

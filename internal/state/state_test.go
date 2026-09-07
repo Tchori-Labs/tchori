@@ -1754,15 +1754,19 @@ func TestSensitiveSetRecoveryIsEncryptedBoundAndBackedUp(t *testing.T) {
 				t.Fatalf("%s exposed sensitive set member %q", artifact, secret)
 			}
 		}
-		if !bytes.Contains(data, []byte(`"sensitive_set_recovery"`)) {
-			t.Fatalf("%s omitted sensitive set recovery envelope", artifact)
+		if !bytes.Contains(data, []byte(`"sensitive_set_recovery"`)) ||
+			!bytes.Contains(data, []byte(`"sensitive_recovery_version"`)) {
+			t.Fatalf("%s omitted sensitive recovery envelope or generation marker", artifact)
 		}
 		loaded, err := Load(artifact)
 		if err != nil {
 			t.Fatalf("Load(%s): %v", artifact, err)
 		}
 		rs := loaded.Resources["secret.set"]
-		restored, err := spec.Restore(rs.Attributes, rs.SensitiveSetRecovery, resourceType)
+		if rs.SensitiveRecoveryVersion != sensitive.RecoveryVersion {
+			t.Fatalf("Load(%s) recovery version = %d", artifact, rs.SensitiveRecoveryVersion)
+		}
+		restored, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, resourceType, rs.SensitivePaths, rs.SensitiveRecoveryVersion)
 		if err != nil {
 			t.Fatalf("Restore(%s): %v", artifact, err)
 		}
@@ -1795,6 +1799,9 @@ func TestSensitiveSetRecoveryIsEncryptedBoundAndBackedUp(t *testing.T) {
 			resource := doc["resources"].(map[string]any)["secret.set"].(map[string]any)
 			resource["private"], resource["sensitive_set_recovery"] = resource["sensitive_set_recovery"], resource["private"]
 		}},
+		{"generation", "", func(doc map[string]any) {
+			doc["resources"].(map[string]any)["secret.set"].(map[string]any)["sensitive_recovery_version"] = 0
+		}},
 		{"missing key", "missing", func(map[string]any) {}},
 		{"changed key", "changed", func(map[string]any) {}},
 	} {
@@ -1823,6 +1830,28 @@ func TestSensitiveSetRecoveryIsEncryptedBoundAndBackedUp(t *testing.T) {
 				t.Fatal("Load accepted recovery with invalid key or authenticated identity")
 			}
 		})
+	}
+
+	var stripped map[string]any
+	if err := json.Unmarshal(data, &stripped); err != nil {
+		t.Fatal(err)
+	}
+	delete(stripped["resources"].(map[string]any)["secret.set"].(map[string]any), "sensitive_set_recovery")
+	strippedData, err := json.Marshal(stripped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	strippedPath := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(strippedPath, strippedData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	strippedState, err := Load(strippedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := strippedState.Resources["secret.set"]
+	if _, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, resourceType, rs.SensitivePaths, rs.SensitiveRecoveryVersion); err == nil {
+		t.Fatal("RestoreProjected accepted stripped version 3 recovery")
 	}
 }
 

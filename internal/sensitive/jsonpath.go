@@ -71,14 +71,14 @@ func redactJSONValue(v any, logical string, paths []string, changed map[string]b
 
 // JSONSanitizer sanitizes ctyjson bytes with a live schema while retaining
 // authenticated sensitive-set recovery separately from the public projection.
-// generationPaths describe the authenticated projection being opened;
-// currentPaths describe the policy to emit.
-type JSONSanitizer func(attrs json.RawMessage, recovery []byte, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error)
+// generationVersion and generationPaths describe the authenticated projection
+// being opened; currentPaths describe the policy to emit.
+type JSONSanitizer func(attrs json.RawMessage, recovery []byte, generationVersion int, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error)
 
 // Sanitizer binds this sensitivity specification to a concrete provider type.
 func (s *Spec) Sanitizer(ty cty.Type) JSONSanitizer {
-	return func(attrs json.RawMessage, recovery []byte, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error) {
-		return s.SanitizeJSON(attrs, recovery, ty, generationPaths, currentPaths)
+	return func(attrs json.RawMessage, recovery []byte, generationVersion int, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error) {
+		return s.SanitizeJSON(attrs, recovery, ty, generationVersion, generationPaths, currentPaths)
 	}
 }
 
@@ -86,18 +86,16 @@ func (s *Spec) Sanitizer(ty cty.Type) JSONSanitizer {
 // contract, then emits a fresh projection and recovery payload under the
 // current policy. A new policy may therefore withhold additional fields
 // without weakening the authenticated association of existing set recovery.
-func (s *Spec) SanitizeJSON(attrs json.RawMessage, recovery []byte, ty cty.Type, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error) {
+func (s *Spec) SanitizeJSON(attrs json.RawMessage, recovery []byte, ty cty.Type, generationVersion int, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error) {
 	effectivePaths := sortedUnique(currentPaths)
 	setPrefixes := affectedSets(s.allSetPrefixes, effectivePaths)
 	spec := &Spec{
-		paths:               effectivePaths,
-		exempt:              s.exempt,
-		setPrefixes:         setPrefixes,
-		allSetPrefixes:      s.allSetPrefixes,
-		mapRecoveryPrefixes: affectedSensitiveMaps(s.allMapPrefixes, setPrefixes, effectivePaths),
-		allMapPrefixes:      s.allMapPrefixes,
+		paths:          effectivePaths,
+		exempt:         s.exempt,
+		setPrefixes:    setPrefixes,
+		allSetPrefixes: s.allSetPrefixes,
 	}
-	value, err := spec.restoreGeneration(attrs, recovery, ty, generationPaths)
+	value, err := spec.restoreGeneration(attrs, recovery, ty, generationPaths, generationVersion)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("decode typed attributes: %w", err)
 	}

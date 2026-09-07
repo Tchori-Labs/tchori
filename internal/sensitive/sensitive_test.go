@@ -757,7 +757,7 @@ func TestSensitiveSetRecoverySurvivesRemovedDeclarationAndEmptySet(t *testing.T)
 	if ds.HasErrors() {
 		t.Fatal(ds)
 	}
-	nextPublic, _, nextRecovery, err := withoutDeclaration.SanitizeJSON(public, recovery, resourceType, declared.Paths(), declared.Paths())
+	nextPublic, _, nextRecovery, err := withoutDeclaration.SanitizeJSON(public, recovery, resourceType, RecoveryVersion, declared.Paths(), declared.Paths())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -830,14 +830,14 @@ func TestSensitiveSetRecoveryRotatesAcrossPolicyExpansion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	restoredLegacy, err := newSpec.RestoreProjected(public, recovery, resourceType, oldSpec.Paths())
+	restoredLegacy, err := newSpec.RestoreProjected(public, recovery, resourceType, oldSpec.Paths(), 0)
 	if err != nil {
 		t.Fatalf("version 1 recovery could not use recorded generation paths: %v", err)
 	}
 	if !restoredLegacy.GetAttr("members").RawEquals(original.GetAttr("members")) {
 		t.Fatal("version 1 recovery lost authoritative membership")
 	}
-	rotatedPublic, _, rotatedRecovery, err := newSpec.SanitizeJSON(public, recovery, resourceType, oldSpec.Paths(), newSpec.Paths())
+	rotatedPublic, _, rotatedRecovery, err := newSpec.SanitizeJSON(public, recovery, resourceType, 0, oldSpec.Paths(), newSpec.Paths())
 	if err != nil {
 		t.Fatalf("policy expansion could not rotate recovery: %v", err)
 	}
@@ -889,7 +889,7 @@ func TestNewlyAffectedSensitiveSetRotatesFromPublicState(t *testing.T) {
 	if len(recovery) != 0 {
 		t.Fatal("non-sensitive generation unexpectedly emitted recovery")
 	}
-	rotatedPublic, _, rotatedRecovery, err := newSpec.SanitizeJSON(public, recovery, resourceType, oldSpec.Paths(), newSpec.Paths())
+	rotatedPublic, _, rotatedRecovery, err := newSpec.SanitizeJSON(public, recovery, resourceType, 0, oldSpec.Paths(), newSpec.Paths())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -961,6 +961,160 @@ func TestSensitiveSetRecoveryReturnsTupleArityCorruption(t *testing.T) {
 	if _, err := spec.Restore(tamperedPublic, tamperedRecovery, resourceType); err == nil ||
 		!strings.Contains(err.Error(), "tuple") {
 		t.Fatalf("Restore error = %v, want tuple arity corruption", err)
+	}
+}
+
+func TestSensitiveFlatMapSetPreservesAuthority(t *testing.T) {
+	setType := cty.Set(cty.String)
+	mapType := cty.Map(setType)
+	resourceType := cty.Object(map[string]cty.Type{"groups": mapType})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"groups": {Type: mapType, Sensitive: true},
+	}}
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		value cty.Value
+	}{
+		{"null", cty.NullVal(mapType)},
+		{"empty", cty.MapValEmpty(setType)},
+		{"nonempty", cty.MapVal(map[string]cty.Value{
+			"private-key": cty.SetVal([]cty.Value{cty.StringVal("first"), cty.StringVal("second")}),
+		})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original := cty.ObjectVal(map[string]cty.Value{"groups": tc.value})
+			public, _, recovery, err := spec.Project(original)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(public) != `{"groups":null}` || len(recovery) == 0 {
+				t.Fatalf("Project = public %s recovery=%d bytes, want withheld map with authority", public, len(recovery))
+			}
+			restored, err := spec.Restore(public, recovery, resourceType)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !restored.RawEquals(original) {
+				t.Fatalf("Restore = %#v, want %#v", restored, original)
+			}
+		})
+	}
+}
+
+func TestLegacyNullSensitiveMapWithoutRecoveryRemainsOperable(t *testing.T) {
+	mapType := cty.Map(cty.Set(cty.String))
+	resourceType := cty.Object(map[string]cty.Type{"groups": mapType})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"groups": {Type: mapType, Sensitive: true},
+	}}
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	public := json.RawMessage(`{"groups":null}`)
+	restored, err := spec.RestoreProjected(public, nil, resourceType, spec.Paths(), 0)
+	if err != nil {
+		t.Fatalf("legacy null projection was rejected: %v", err)
+	}
+	if !restored.GetAttr("groups").RawEquals(cty.NullVal(mapType)) {
+		t.Fatalf("legacy null projection restored as %#v", restored)
+	}
+	if _, err := spec.RestoreProjected(public, nil, resourceType, spec.Paths(), RecoveryVersion); err == nil {
+		t.Fatal("stripped current-generation recovery was accepted")
+	}
+}
+
+func TestLegacySetRecoveryWithSensitiveMapMigratesToConfidentialProjection(t *testing.T) {
+	memberType := cty.Object(map[string]cty.Type{"meta": cty.Map(cty.String)})
+	resourceType := cty.Object(map[string]cty.Type{"members": cty.Set(memberType)})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"members": {
+			Type: cty.Set(memberType),
+			NestedType: map[string]*provider.Attr{
+				"meta": {Type: cty.Map(cty.String), Sensitive: true},
+			},
+		},
+	}}
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	original := cty.ObjectVal(map[string]cty.Value{
+		"members": cty.SetVal([]cty.Value{
+			cty.ObjectVal(map[string]cty.Value{
+				"meta": cty.MapVal(map[string]cty.Value{"privateKey": cty.StringVal("private-value")}),
+			}),
+		}),
+	})
+	_, _, currentRecovery, err := spec.Project(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var current recoveryPayload
+	if err := json.Unmarshal(currentRecovery, &current); err != nil {
+		t.Fatal(err)
+	}
+	legacyPublic := json.RawMessage(`{"members":[{"meta":{"privateKey":null}}]}`)
+	sum := sha256.Sum256(legacyPublic)
+
+	for _, version := range []int{1, 2} {
+		t.Run(fmt.Sprintf("version_%d", version), func(t *testing.T) {
+			legacy := current
+			legacy.Version = version
+			legacy.ProjectionSHA256 = sum[:]
+			if version == 1 {
+				legacy.ProjectionPaths = nil
+			}
+			legacy.Sets = legacy.Values
+			legacy.Values = nil
+			legacyRecovery, err := json.Marshal(legacy)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			restored, err := spec.RestoreProjected(legacyPublic, legacyRecovery, resourceType, spec.Paths(), 0)
+			if err != nil {
+				t.Fatalf("RestoreProjected rejected valid legacy projection: %v", err)
+			}
+			if !restored.RawEquals(original) {
+				t.Fatal("legacy recovery lost sensitive map authority")
+			}
+
+			public, _, recovery, err := spec.SanitizeJSON(
+				legacyPublic, legacyRecovery, resourceType, 0, spec.Paths(), spec.Paths(),
+			)
+			if err != nil {
+				t.Fatalf("SanitizeJSON rejected valid legacy projection: %v", err)
+			}
+			if strings.Contains(string(public), "privateKey") || strings.Contains(string(public), "private-value") {
+				t.Fatalf("v3 projection disclosed a sensitive map: %s", public)
+			}
+			rotated, err := spec.Restore(public, recovery, resourceType)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !rotated.RawEquals(original) {
+				t.Fatal("v3 migration lost sensitive map authority")
+			}
+		})
+	}
+}
+
+func TestTupleAlternativeDeclaredPathUsesIndexInsensitiveTraversal(t *testing.T) {
+	containerType := cty.Tuple([]cty.Type{
+		cty.Object(map[string]cty.Type{"members": cty.Set(cty.String)}),
+		cty.String,
+	})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"container": {Type: containerType},
+	}}
+	if _, ds := Resolve(block, []string{"container.members"}, nil); ds.HasErrors() {
+		t.Fatalf("tuple alternative path was rejected: %v", ds)
 	}
 }
 

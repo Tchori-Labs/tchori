@@ -124,7 +124,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		var priorPrivate []byte
 		var recordedAttrs json.RawMessage
 		if hasPrior {
-			pv, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, ty, rs.SensitivePaths)
+			pv, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, ty, rs.SensitivePaths, rs.SensitiveRecoveryVersion)
 			if err != nil {
 				ds = append(ds, diag.Errorf(addr, "invalid state attributes", err.Error()))
 				return nil, ds
@@ -187,6 +187,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 				rs.Attributes = attrs
 				rs.Private = rpriv
 				rs.SensitiveSetRecovery = recovery
+				rs.SensitiveRecoveryVersion = sensitive.RecoveryGeneration(recovery)
 				rs.Redacted = redactedPaths
 				// spec was built from the union above, so spec.Paths() is
 				// itself the monotonic union of what rs.SensitivePaths held
@@ -306,7 +307,7 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 		return nil, lds
 	}
 	p.State.NoteSensitive(addr, spec.Paths())
-	prior, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, ty, rs.SensitivePaths)
+	prior, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, ty, rs.SensitivePaths, rs.SensitiveRecoveryVersion)
 	if err != nil {
 		return nil, diag.Diagnostics{diag.Errorf(addr, "cannot restore delete state", err.Error())}
 	}

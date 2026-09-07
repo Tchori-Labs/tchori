@@ -503,7 +503,7 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 	st.NoteSensitive(address, spec.Paths())
 	st.Resources[address] = &state.ResourceState{
 		Type: res.Type, Provider: res.Provider, ProviderSource: rt.Config.Providers[res.Provider].Source,
-		Attributes: attrs, Private: refreshedPrivate, SensitiveSetRecovery: recovery, Redacted: redactedPaths,
+		Attributes: attrs, Private: refreshedPrivate, SensitiveSetRecovery: recovery, SensitiveRecoveryVersion: sensitive.RecoveryGeneration(recovery), Redacted: redactedPaths,
 		SensitivePaths: spec.Paths(), SensitiveScanned: true,
 	}
 	if len(redactedPaths) != 0 {

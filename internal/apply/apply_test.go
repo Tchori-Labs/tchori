@@ -844,7 +844,7 @@ func TestSensitiveMapAboveSetStaysPrivateThroughPlanApplyAndBackup(t *testing.T)
 	if sds.HasErrors() {
 		t.Fatal(sds)
 	}
-	restored, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, schema.Block.ImpliedType(), rs.SensitivePaths)
+	restored, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, schema.Block.ImpliedType(), rs.SensitivePaths, rs.SensitiveRecoveryVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
