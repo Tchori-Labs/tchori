@@ -550,12 +550,12 @@ or address. Artifacts with neither encrypted payload remain deterministic.
 encrypted-private format `"1.1"`, and legacy `"1.0"`; it rejects missing,
 empty, and unsupported versions. A nonexistent file instead yields a fresh
 empty state. A save declares format `1.3` only after every resource has been
-restored and reprojected to generation `3`. A wholly generation-zero legacy
+restored and reprojected to generation `4`. A wholly generation-zero legacy
 state remains truthfully `1.2` when live schemas are unavailable; apply refuses
 such a state before writing its incomplete marker or calling a provider
 mutation. Format `1.1` introduced encrypted provider-private storage. Format
 `1.2` added encrypted sensitive-set recovery. Format `1.3` requires every
-resource to carry the value `3`, so removing a current recovery envelope and
+resource to carry the value `4`, so removing a current recovery envelope and
 resetting its generation to `0` remains invalid while the document still
 declares `1.3`. Older readers refuse newer plans/state rather than silently
 discarding or coalescing authoritative membership. Whole-document replacement
@@ -583,7 +583,7 @@ prefix `demo-`):
         "replace_me": null,
         "tags": null
       },
-      "sensitive_recovery_version": 3
+      "sensitive_recovery_version": 4
     },
     "tchoritest_thing.b": {
       "type": "tchoritest_thing",
@@ -598,7 +598,7 @@ prefix `demo-`):
           "parent": "demo-id-alpha"
         }
       },
-      "sensitive_recovery_version": 3
+      "sensitive_recovery_version": 4
     }
   }
 }
