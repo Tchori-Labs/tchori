@@ -293,7 +293,7 @@ creates.
 
 | Field | JSON type | Meaning |
 | --- | --- | --- |
-| `format_version` | string | State document schema version. New writes use `"1.2"`. |
+| `format_version` | string | State document schema version. New writes use `"1.3"`. |
 | `serial` | integer | Monotonically incremented once per successful `Save` call — see Serial semantics below. |
 | `resources` | object | Map of resource address (`type.name`) to `ResourceState`. |
 | `incomplete_apply` | object, omitted when converged | Durable evidence that the last apply did not complete; see below. |
@@ -308,14 +308,15 @@ creates.
 | `attributes` | object | Deterministic public projection of applied values. Every withheld sensitive leaf is JSON `null`; sensitive sets retain element count and non-sensitive association as array entries. A sensitive map inside a captured set is withheld as a whole so its keys do not leak. A sensitive map above an affected set is also whole-value `null` and uses authenticated recovery. State never stores unknown values. |
 | `private` | object, omitted if empty | Authenticated encrypted envelope with `version`, `nonce`, and `ciphertext`, as described for plans. The opaque plaintext is preserved only in memory for provider RPCs. |
 | `sensitive_set_recovery` | object, omitted if empty | Separate authenticated encrypted envelope containing authoritative values for directly sensitive paths plus complete outermost sets whose identity depends on sensitive descendants and any smallest sensitive map boundary needed to hide dynamic keys above such a set. It is opened before typed state decoding and never included in read projections. |
-| `sensitive_recovery_version` | integer, omitted for legacy projections or when recovery is empty | Persisted sensitive projection generation. Current writes use `4`; versions `1` through `3` remain readable. The marker selects whether an absent recovery envelope is valid legacy state or a fail-closed current projection, and is authenticated as part of the recovery envelope's AES-GCM additional data. |
+| `sensitive_recovery_version` | integer | Mandatory per-resource sensitive projection generation in state format `1.3`; `0` identifies a legacy projection, current writes use `4`, and versions `1` through `3` remain readable. The marker selects whether an absent recovery envelope is valid legacy state or a fail-closed current projection, and nonzero values are authenticated as part of the recovery envelope's AES-GCM additional data. |
 | `redacted` | array of strings, omitted if empty | Sorted paths whose values are withheld, explaining why the corresponding `attributes` leaf is `null`. |
 | `sensitive_paths` | array of strings, omitted if empty | Sorted effective, index-insensitive sensitivity contract. It survives config removal and drives backups, delete plans, orphan handling, and provider-free read masking. |
 | `sensitive_scanned` | boolean, omitted when false | Provenance marker set after live schema/config resolution, including for a definitively non-sensitive resource. Read surfaces use it to distinguish checked entries from legacy entries with unknown provenance. |
 
 Standalone resource JSON used by CLI/MCP read surfaces omits both encrypted
-fields entirely. The state document serializer, not an ordinary resource JSON
-dump, writes provider-private and sensitive-set recovery envelopes.
+fields and the state-only generation marker. The state document serializer,
+not an ordinary resource JSON dump, writes provider-private and sensitive-set
+recovery envelopes plus the mandatory marker.
 
 The recovery envelope has a purpose distinct from provider `private` and
 authenticates the resource address, type, provider alias, canonical source, and
@@ -396,7 +397,7 @@ engine.
 ### Serial semantics
 
 - `state.Load` on a missing path returns a fresh, empty state:
-  `format_version: "1.2"`, `serial: 0`, `resources: {}` — not an error.
+  `format_version: "1.3"`, `serial: 0`, `resources: {}` — not an error.
 - Each successful `Save` increments `Serial`, regardless of whether the
   resource data actually changed. A save rejected because another process
   committed from the same base does not increment it.
@@ -536,13 +537,16 @@ or address. Artifacts with neither encrypted payload remain deterministic.
 
 ### format_version compatibility
 
-`state.Load` accepts current `"1.2"`, encrypted-private `"1.1"`, and legacy
-`"1.0"`; it rejects missing, empty, and unsupported versions. A nonexistent
-file instead yields a fresh empty state. Every new save upgrades the document
-and backup to `"1.2"`. Format `1.1` introduced encrypted provider-private
-storage. Format `1.2` adds encrypted sensitive-set recovery and requires older
-readers to refuse plans/state rather than silently discard or coalesce
-authoritative membership.
+`state.Load` accepts current `"1.3"`, recovery-envelope format `"1.2"`,
+encrypted-private format `"1.1"`, and legacy `"1.0"`; it rejects missing,
+empty, and unsupported versions. A nonexistent file instead yields a fresh
+empty state. Every new save upgrades the document and backup to `"1.3"`.
+Format `1.1` introduced encrypted provider-private storage. Format `1.2`
+added encrypted sensitive-set recovery. Format `1.3` requires every resource
+to carry `sensitive_recovery_version`, so deleting both a current recovery
+envelope and its generation marker cannot be interpreted as legacy state.
+Older readers refuse newer plans/state rather than silently discarding or
+coalescing authoritative membership.
 
 ### Example
 
@@ -551,7 +555,7 @@ prefix `demo-`):
 
 ```json
 {
-  "format_version": "1.2",
+  "format_version": "1.3",
   "serial": 4,
   "resources": {
     "tchoritest_thing.a": {
@@ -564,7 +568,8 @@ prefix `demo-`):
         "name": "alpha",
         "replace_me": null,
         "tags": null
-      }
+      },
+      "sensitive_recovery_version": 0
     },
     "tchoritest_thing.b": {
       "type": "tchoritest_thing",
@@ -578,7 +583,8 @@ prefix `demo-`):
         "tags": {
           "parent": "demo-id-alpha"
         }
-      }
+      },
+      "sensitive_recovery_version": 0
     }
   }
 }

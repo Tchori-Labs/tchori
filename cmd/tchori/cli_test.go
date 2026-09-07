@@ -1509,9 +1509,8 @@ func TestImportRefreshReplacesOnlyNamedResource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if !bytes.Contains(afterState, []byte(`"format_version": "1.2"`)) {
-		t.Fatalf("refresh did not persist format 1.2 state: %s", afterState)
+	if !bytes.Contains(afterState, []byte(`"format_version": "1.3"`)) {
+		t.Fatalf("refresh did not persist format 1.3 state: %s", afterState)
 	}
 	if afterSerial != beforeSerial+1 {
 		t.Fatalf("refresh serial = %d, want exactly one increment from %d", afterSerial, beforeSerial)
@@ -1743,12 +1742,13 @@ func TestImportRefreshScanFailureRollsBackState(t *testing.T) {
 	}
 	resources := document["resources"].(map[string]any)
 	resources["tchoritest_thing.other"] = map[string]any{
-		"type":              "tchoritest_thing",
-		"provider":          "tchoritest",
-		"provider_source":   "tchori-labs/tchoritest",
-		"attributes":        map[string]any{"echo": "other", "id": "t-id-other", "name": map[string]any{"unexpected": true}},
-		"sensitive_paths":   []string{"name"},
-		"sensitive_scanned": true,
+		"type":                       "tchoritest_thing",
+		"provider":                   "tchoritest",
+		"provider_source":            "tchori-labs/tchoritest",
+		"attributes":                 map[string]any{"echo": "other", "id": "t-id-other", "name": map[string]any{"unexpected": true}},
+		"sensitive_recovery_version": 0,
+		"sensitive_paths":            []string{"name"},
+		"sensitive_scanned":          true,
 	}
 	corrupt, err := json.MarshalIndent(document, "", "  ")
 	if err != nil {

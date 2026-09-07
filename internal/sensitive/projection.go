@@ -126,6 +126,9 @@ func (s *Spec) projectValue(v cty.Value, path cty.Path, logical string, capture,
 	ty := v.Type()
 	if !legacyMapProjection && s.recoversMap(ty, logical) && !insideCaptured {
 		if capture {
+			if !v.IsWhollyKnown() {
+				return nil, fmt.Errorf("sensitive map %q contains unknown values", logical)
+			}
 			if err := appendRecoveryValue(v, path, logical, "sensitive map", values); err != nil {
 				return nil, err
 			}
@@ -397,7 +400,9 @@ func (s *Spec) restoreGeneration(public json.RawMessage, recovery []byte, ty cty
 		}
 		seen[key] = true
 		value, err := msgpack.Unmarshal(recovered.Value, want.Type)
-		if err != nil || !value.IsKnown() || (!want.AllowNull && value.IsNull()) || !value.Type().Equals(want.Type) {
+		if err != nil || !value.IsKnown() ||
+			(payload.Version >= 3 && want.Type.IsMapType() && !value.IsWhollyKnown()) ||
+			(!want.AllowNull && value.IsNull()) || !value.Type().Equals(want.Type) {
 			return cty.NilVal, errors.New("invalid sensitive recovery value")
 		}
 

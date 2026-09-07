@@ -21,7 +21,8 @@ import (
 )
 
 const (
-	formatVersion          = "1.2"
+	formatVersion          = "1.3"
+	recoveryFormatVersion  = "1.2"
 	encryptedFormatVersion = "1.1"
 	legacyFormatVersion    = "1.0"
 )
@@ -94,7 +95,7 @@ type resourceDocument struct {
 	Attributes               json.RawMessage `json:"attributes"`
 	Private                  json.RawMessage `json:"private,omitempty"`
 	SensitiveSetRecovery     json.RawMessage `json:"sensitive_set_recovery,omitempty"`
-	SensitiveRecoveryVersion int             `json:"sensitive_recovery_version,omitempty"`
+	SensitiveRecoveryVersion *int            `json:"sensitive_recovery_version"`
 	Redacted                 []string        `json:"redacted,omitempty"`
 	SensitivePaths           []string        `json:"sensitive_paths,omitempty"`
 	SensitiveScanned         bool            `json:"sensitive_scanned,omitempty"`
@@ -124,9 +125,9 @@ type legacyStateDocument struct {
 	Incomplete    *IncompleteApply                   `json:"incomplete_apply,omitempty"`
 }
 
-// MarshalJSON emits format 1.2 and seals provider-private bytes and sensitive
-// set recovery in distinct resource-identity-bound envelopes. ResourceState
-// omits both plaintext fields outside this address-aware whole-state boundary.
+// MarshalJSON emits format 1.3 with a mandatory per-resource sensitive
+// projection generation, and seals provider-private bytes and sensitive set
+// recovery in distinct resource-identity-bound envelopes.
 func (s State) MarshalJSON() ([]byte, error) {
 	doc := stateDocument{
 		FormatVersion: formatVersion,
@@ -146,9 +147,10 @@ func (s State) MarshalJSON() ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		recoveryVersion := rs.SensitiveRecoveryVersion
 		doc.Resources[addr] = &resourceDocument{
 			Type: rs.Type, Provider: rs.Provider, ProviderSource: rs.ProviderSource, Attributes: rs.Attributes,
-			Private: private, SensitiveSetRecovery: recovery, SensitiveRecoveryVersion: rs.SensitiveRecoveryVersion,
+			Private: private, SensitiveSetRecovery: recovery, SensitiveRecoveryVersion: &recoveryVersion,
 			Redacted: rs.Redacted, SensitivePaths: rs.SensitivePaths, SensitiveScanned: rs.SensitiveScanned,
 		}
 	}
@@ -156,8 +158,8 @@ func (s State) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON accepts legacy 1.0 plaintext/base64 private fields, reads 1.1
-// encrypted provider-private fields, and requires authenticated envelopes for
-// both private data classes in format 1.2.
+// encrypted provider-private fields and 1.2 recovery envelopes, and requires
+// the per-resource projection generation boundary in format 1.3.
 func (s *State) UnmarshalJSON(data []byte) error {
 	var header struct {
 		FormatVersion string `json:"format_version"`
@@ -184,7 +186,7 @@ func (s *State) UnmarshalJSON(data []byte) error {
 		}
 		*s = State{FormatVersion: legacy.FormatVersion, Serial: legacy.Serial, Resources: resources, Incomplete: legacy.Incomplete}
 		return nil
-	case encryptedFormatVersion, formatVersion:
+	case encryptedFormatVersion, recoveryFormatVersion, formatVersion:
 		var doc stateDocument
 		if err := json.Unmarshal(data, &doc); err != nil {
 			return err
@@ -195,9 +197,19 @@ func (s *State) UnmarshalJSON(data []byte) error {
 				resources[addr] = nil
 				continue
 			}
+			if header.FormatVersion == formatVersion && persisted.SensitiveRecoveryVersion == nil {
+				return fmt.Errorf("invalid state: resource %q omits mandatory sensitive recovery version", addr)
+			}
+			recoveryVersion := 0
+			if persisted.SensitiveRecoveryVersion != nil {
+				recoveryVersion = *persisted.SensitiveRecoveryVersion
+			}
+			if recoveryVersion != 0 && !sensitive.RecoveryVersionSupported(recoveryVersion) {
+				return fmt.Errorf("open sensitive set recovery for %s: unsupported projection version %d", addr, recoveryVersion)
+			}
 			rs := &ResourceState{
 				Type: persisted.Type, Provider: persisted.Provider, ProviderSource: persisted.ProviderSource, Attributes: persisted.Attributes,
-				SensitiveRecoveryVersion: persisted.SensitiveRecoveryVersion,
+				SensitiveRecoveryVersion: recoveryVersion,
 				Redacted:                 persisted.Redacted, SensitivePaths: persisted.SensitivePaths, SensitiveScanned: persisted.SensitiveScanned,
 			}
 			if len(persisted.Private) != 0 {
@@ -208,9 +220,6 @@ func (s *State) UnmarshalJSON(data []byte) error {
 				rs.Private = private
 			}
 			if len(persisted.SensitiveSetRecovery) != 0 {
-				if rs.SensitiveRecoveryVersion != 0 && !sensitive.RecoveryVersionSupported(rs.SensitiveRecoveryVersion) {
-					return fmt.Errorf("open sensitive set recovery for %s: unsupported projection version %d", addr, rs.SensitiveRecoveryVersion)
-				}
 				recovery, err := privateblob.Open(persisted.SensitiveSetRecovery, sensitiveRecoveryContext(addr, rs))
 				if err != nil {
 					return fmt.Errorf("open sensitive set recovery for %s: %w", addr, err)
@@ -222,7 +231,7 @@ func (s *State) UnmarshalJSON(data []byte) error {
 		*s = State{FormatVersion: doc.FormatVersion, Serial: doc.Serial, Resources: resources, Incomplete: doc.Incomplete}
 		return nil
 	default:
-		return fmt.Errorf("unsupported state format_version %q (supported: %q, %q, and %q)", header.FormatVersion, legacyFormatVersion, encryptedFormatVersion, formatVersion)
+		return fmt.Errorf("unsupported state format_version %q (supported: %q, %q, %q, and %q)", header.FormatVersion, legacyFormatVersion, encryptedFormatVersion, recoveryFormatVersion, formatVersion)
 	}
 }
 
@@ -274,9 +283,9 @@ func resourcePrivateContext(kind, addr, provider, providerSource, resourceType s
 	return kind + "\x00" + addr + "\x00" + provider + "\x00" + providerSource + "\x00" + resourceType
 }
 
-// Load returns an empty format 1.2 state when path does not exist. Existing
-// 1.0 and 1.1 documents remain readable for migration; encrypted fields are
-// opened only after authenticating their resource identity and purpose.
+// Load returns an empty format 1.3 state when path does not exist. Existing
+// 1.0, 1.1, and 1.2 documents remain readable for migration; encrypted fields
+// are opened only after authenticating their resource identity and purpose.
 func Load(path string) (*State, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // G304: path is operator-supplied (CLI flag / fixed state.json location), not attacker-controlled
 	if err != nil {
@@ -293,7 +302,8 @@ func Load(path string) (*State, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("parse state %s: %w", path, err)
 	}
-	if s.FormatVersion != legacyFormatVersion && s.FormatVersion != encryptedFormatVersion && s.FormatVersion != formatVersion {
+	if s.FormatVersion != legacyFormatVersion && s.FormatVersion != encryptedFormatVersion &&
+		s.FormatVersion != recoveryFormatVersion && s.FormatVersion != formatVersion {
 		return nil, fmt.Errorf("unsupported state format_version %q", s.FormatVersion)
 	}
 	if s.Resources == nil {
@@ -550,9 +560,9 @@ func verifyLockedSidecar(lock *flock.Flock, lockPath string) error {
 }
 
 // prepareBackup returns a sanitized recovery copy of the previous document
-// without changing the backup path. Existing 1.2 bytes are preserved exactly
+// without changing the backup path. Existing 1.3 bytes are preserved exactly
 // when no attribute sanitization is needed. Earlier documents are rewritten as
-// 1.2 so neither encrypted data class can be lost or left plaintext.
+// 1.3 so neither encrypted data class nor generation provenance can be lost.
 func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 	data, err := os.ReadFile(path) //nolint:gosec // operator-selected state path
 	if err != nil {

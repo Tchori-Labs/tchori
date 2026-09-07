@@ -881,6 +881,21 @@ func TestSensitiveMapAboveSetStaysPrivateThroughPlanApplyAndBackup(t *testing.T)
 		}
 	}
 }
+func TestApplyRejectsUnknownDescendantInSensitiveRecoveryMap(t *testing.T) {
+	resource := flatSetThing("unknown-group-result", "unknown-group-result", nil)
+	resource.SensitiveAttributes = []string{"groups"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+
+	_, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() {
+		t.Fatal("Apply accepted a provider result with an unknown descendant in a sensitive recovery map")
+	}
+	saved := loadState(t, h.statePath)
+	if saved.Resources[resource.Address] != nil {
+		t.Fatal("Apply persisted a provider result with an unknown descendant in a sensitive recovery map")
+	}
+}
 
 func TestApplyRetainsPersistedConfigOnlySensitiveSetPolicy(t *testing.T) {
 	resource := setThing("declared", "declared")

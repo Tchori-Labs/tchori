@@ -334,6 +334,13 @@ func (s *server) applyFlatSetThing(req *tfprotov6.ApplyResourceChangeRequest) (*
 	if !attrs["id"].IsKnown() {
 		attrs["id"] = tftypes.NewValue(tftypes.String, s.prefix+"id-"+name)
 	}
+	if name == "unknown-group-result" {
+		attrs["groups"] = tftypes.NewValue(tftypes.Map{ElementType: flatSetGroupType}, map[string]tftypes.Value{
+			"private-key": tftypes.NewValue(flatSetGroupType, map[string]tftypes.Value{
+				"members": tftypes.NewValue(tftypes.Set{ElementType: flatSetNestedMemberType}, tftypes.UnknownValue),
+			}),
+		})
+	}
 	newState, err := tfprotov6.NewDynamicValue(flatSetThingType, tftypes.NewValue(flatSetThingType, attrs))
 	if err != nil {
 		return nil, err
