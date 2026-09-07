@@ -11,6 +11,24 @@ runs on GitHub-hosted `ubuntu-latest` runners. Self-hosted runners
 private repositories: the runner group does not admit public repositories,
 and fork pull-request code must never reach those machines.
 
+## Public integration boundary
+
+All workflow jobs in this public repository use GitHub-hosted runners. The
+protected `release` environment is an approval boundary for publishing; it is
+not a reason to route untrusted pull-request code to a self-hosted machine.
+
+The organization `Default` self-hosted runner group remains closed to public
+repositories. Do not relax that setting or add a public self-hosted runner:
+fork pull-request code must never reach organization infrastructure.
+
+The public repository intentionally has no `github-tchori-manager` webhook,
+review-bot installation, or Coolify deployment hook. Fusion is managed outside
+this repository. Its `githubTrackingDefaultRepo` must remain
+`Tchori-Labs/tchori`; `includeTaskIdInCommit` and `commitAuthorEnabled` must
+remain disabled before Fusion is reactivated. If the Fusion settings API does
+not expose either field, record that limitation in the infrastructure issue
+instead of adding a repository-side workaround.
+
 ## Required PR suites
 
 The required `check` job runs the repository checks from `AGENTS.md`, including

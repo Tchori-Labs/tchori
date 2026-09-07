@@ -25,6 +25,9 @@ import (
 	tchoricli "github.com/tchori-labs/tchori/cmd/tchori"
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/plan"
+	"github.com/tchori-labs/tchori/internal/privateblob"
+	"github.com/tchori-labs/tchori/internal/sensitive"
+	"github.com/tchori-labs/tchori/internal/state"
 )
 
 // The CLI is tested end to end: TestMain builds the real tchori binary and
@@ -35,6 +38,10 @@ var (
 	tchoriBin string // built tchori binary
 	pluginDir string // directory containing terraform-provider-tchoritest
 )
+
+// testArtifactKey is an explicitly non-production key used only to cross the
+// environment-only artifact-key boundary in CLI acceptance tests.
+const testArtifactKey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 
 // TestMain both registers the CLI as testscript's "tchori" command (the txtar
 // scripts in testdata/script re-exec this binary under that name; see
@@ -98,15 +105,24 @@ func runCLI(t *testing.T, dir string, args ...string) (string, string, int) {
 	return runCLIEnv(t, dir, nil, args...)
 }
 
-// runCLIEnv is runCLI with selected environment variables replaced. It is
-// used for options whose contract is intentionally environment-based, while
-// keeping all other inherited variables (including PATH) intact.
+func runCLIWithArtifactKey(t *testing.T, dir string, args ...string) (string, string, int) {
+	t.Helper()
+	return runCLIEnv(t, dir, map[string]string{"TCHORI_ARTIFACT_KEY": testArtifactKey}, args...)
+}
+
+// runCLIEnv is runCLI with a deterministic test-only artifact key and selected
+// environment variables replaced. Callers testing missing or malformed keys
+// override TCHORI_ARTIFACT_KEY explicitly.
 func runCLIEnv(t *testing.T, dir string, env map[string]string, args ...string) (string, string, int) {
 	t.Helper()
 	cmd := exec.Command(tchoriBin, args...) //nolint:gosec // binary built by TestMain into a temp dir
 	cmd.Dir = dir
 	cmd.Env = os.Environ()
+	overrides := map[string]string{"TCHORI_ARTIFACT_KEY": testArtifactKey}
 	for key, value := range env {
+		overrides[key] = value
+	}
+	for key, value := range overrides {
 		prefix := key + "="
 		filtered := cmd.Env[:0]
 		for _, entry := range cmd.Env {
@@ -175,6 +191,57 @@ func writeConfig(t *testing.T, dir, name string) {
 	}
 }
 
+func writeSensitiveSetConfig(t *testing.T, dir string) {
+	t.Helper()
+	cfg := `{
+  "providers": {
+    "tchoritest": {
+      "source": "tchori-labs/tchoritest",
+      "version": "0.0.1",
+      "config": {"prefix": "t-"}
+    }
+  },
+  "resources": {
+    "tchoritest_set_thing.imported": {
+      "config": {
+        "name": "imported",
+        "attribute_members": [
+          {"label":"same","token":"imported-attribute-token-one","details":[{"kind":"same","secret":"imported-attribute-detail-one"}]},
+          {"label":"same","token":"imported-attribute-token-two","details":[{"kind":"same","secret":"imported-attribute-detail-two"}]}
+        ],
+        "block_members": [
+          {"label":"same","token":"imported-block-token-one","details":[{"kind":"same","secret":"imported-block-detail-one"}]},
+          {"label":"same","token":"imported-block-token-two","details":[{"kind":"same","secret":"imported-block-detail-two"}]}
+        ]
+      }
+    }
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+func writeRefreshSensitiveConfig(t *testing.T, dir string) {
+	t.Helper()
+	const cfg = `{
+  "providers": {
+    "tchoritest": {
+      "source": "tchori-labs/tchoritest",
+      "version": "0.0.1",
+      "config": {"prefix": "t-"}
+    }
+  },
+  "resources": {
+    "tchoritest_refresh_sensitive.demo": {
+      "config": {"name": "omit-sensitive"}
+    }
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
 func writeThingResources(t *testing.T, dir string, resources map[string]string) {
 	t.Helper()
 	writeProtocolThingResources(t, dir, "tchoritest", resources)
@@ -447,12 +514,22 @@ func TestCLIApplyReportsInconsistentProviderResult(t *testing.T) {
 		t.Fatalf("apply stdout = %q, want executed create accounting", stdout)
 	}
 	ds := decodeDiagnosticLines(t, stderr)
-	if len(ds) != 2 {
-		t.Fatalf("diagnostics = %#v, want inconsistent-result error and incomplete-state warning", ds)
+	if len(ds) != 3 {
+		t.Fatalf("diagnostic count = %d: %#v, want sensitive-state warning, inconsistent-result error, and incomplete-state warning", len(ds), ds)
 	}
-	d := ds[0]
-	if d.Severity != "error" || d.Address != "tchoritest_lossy.svc" || !strings.Contains(d.Detail, "flag: planned true, applied false") || strings.Contains(d.Detail, "do-not-print") {
-		t.Fatalf("diagnostic = %#v", d)
+	foundInconsistent := false
+	for _, d := range ds {
+		if strings.Contains(d.Detail, "do-not-print") {
+			t.Fatalf("diagnostic leaked sensitive value: %#v", d)
+		}
+		if d.Summary == "provider produced inconsistent result after apply" {
+			foundInconsistent = d.Severity == "error" &&
+				d.Address == "tchoritest_lossy.svc" &&
+				strings.Contains(d.Detail, "flag: planned true, applied false")
+		}
+	}
+	if !foundInconsistent {
+		t.Fatalf("diagnostics = %#v, want attributed inconsistent-result error", ds)
 	}
 	stateBytes, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // dir is a test-owned t.TempDir
 	if err != nil {
@@ -623,8 +700,8 @@ func assertSavedDrift(t *testing.T, path, address, changedPath string) {
 	t.Helper()
 	var pl plan.Plan
 	readJSONFile(t, path, &pl)
-	if pl.FormatVersion != "1.0" {
-		t.Fatalf("format_version = %q, want 1.0", pl.FormatVersion)
+	if pl.FormatVersion != plan.FormatVersion {
+		t.Fatalf("format_version = %q, want %q", pl.FormatVersion, plan.FormatVersion)
 	}
 	if len(pl.Drift) != 1 || pl.Drift[0].Address != address || !slices.Contains(pl.Drift[0].Paths, changedPath) {
 		t.Fatalf("drift = %#v, want one %s entry at %s", pl.Drift, changedPath, address)
@@ -759,8 +836,8 @@ func TestCLILifecycle(t *testing.T) {
 	if err := json.Unmarshal([]byte(stdout), &doc); err != nil {
 		t.Fatalf("plan -json stdout is not JSON: %v\n%s", err, stdout)
 	}
-	if doc["format_version"] != "1.0" {
-		t.Errorf("plan -json format_version = %v, want %q", doc["format_version"], "1.0")
+	if doc["format_version"] != plan.FormatVersion {
+		t.Errorf("plan -json format_version = %v, want %q", doc["format_version"], plan.FormatVersion)
 	}
 	if _, exists := doc["drift"]; exists {
 		t.Errorf("drift-free plan -json unexpectedly contains drift: %s", stdout)
@@ -889,7 +966,7 @@ func TestCLILifecycleProtocol5(t *testing.T) {
 	// import the just-destroyed resource back by id -> exit 0. Proves
 	// ImportResourceState composes with the adapter through the full CLI
 	// import command, not just the package-level RPC.
-	stdout, stderr, code = runCLI(t, dir, "import", pd, "tchoritest5_thing.demo", "t-id-demo")
+	stdout, stderr, code = runCLIWithArtifactKey(t, dir, "import", pd, "tchoritest5_thing.demo", "t-id-demo")
 	if code != 0 {
 		t.Fatalf("import: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
@@ -913,12 +990,13 @@ func TestPlanGatewayHTMLDiagnosticsAreAttributedJSONLines(t *testing.T) {
 	dir := t.TempDir()
 	writeNamedConfig(t, dir, addr, "gateway_html", "t-")
 	stateDoc := `{
-  "format_version": "1.0",
+  "format_version": "1.1",
   "serial": 1,
   "resources": {
     "tchoritest_thing.web": {
       "type": "tchoritest_thing",
       "provider": "tchoritest",
+      "provider_source": "tchori-labs/tchoritest",
       "attributes": {"echo":"gateway_html","id":"id-gateway_html","name":"gateway_html","replace_me":null,"rules":null,"tags":null}
     }
   }
@@ -961,7 +1039,7 @@ func TestImportAndPostImportReadDiagnosticsHaveResourceAddress(t *testing.T) {
 	t.Run("ImportResource", func(t *testing.T) {
 		dir := t.TempDir()
 		writeNamedConfig(t, dir, addr, "demo", "t-")
-		_, stderr, code := runCLI(t, dir, "import", "--plugin-dir="+pluginDir, addr, "missing")
+		_, stderr, code := runCLIWithArtifactKey(t, dir, "import", "--plugin-dir="+pluginDir, addr, "missing")
 		if code != 1 {
 			t.Fatalf("import: exit %d, want 1\nstderr: %s", code, stderr)
 		}
@@ -973,7 +1051,7 @@ func TestImportAndPostImportReadDiagnosticsHaveResourceAddress(t *testing.T) {
 	t.Run("post-import ReadResource", func(t *testing.T) {
 		dir := t.TempDir()
 		writeNamedConfig(t, dir, addr, "gateway_html", "t-")
-		_, stderr, code := runCLI(t, dir, "import", "--plugin-dir="+pluginDir, addr, "t-id-gateway_html")
+		_, stderr, code := runCLIWithArtifactKey(t, dir, "import", "--plugin-dir="+pluginDir, addr, "t-id-gateway_html")
 		if code != 1 {
 			t.Fatalf("import refresh: exit %d, want 1\nstderr: %s", code, stderr)
 		}
@@ -1347,7 +1425,7 @@ func TestImportAdoptsResourceIntoState(t *testing.T) {
 	writeConfig(t, dir, "demo")
 	pd := "--plugin-dir=" + pluginDir
 
-	stdout, stderr, code := runCLI(t, dir, "import", pd, "tchoritest_thing.demo", "t-id-demo")
+	stdout, stderr, code := runCLIWithArtifactKey(t, dir, "import", pd, "tchoritest_thing.demo", "t-id-demo")
 	if code != 0 {
 		t.Fatalf("import: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
@@ -1394,6 +1472,413 @@ func TestImportAdoptsResourceIntoState(t *testing.T) {
 	}
 }
 
+func TestImportRefreshReplacesOnlyNamedResource(t *testing.T) {
+	dir := t.TempDir()
+	writeThingResources(t, dir, map[string]string{
+		"tchoritest_thing.one": "one",
+		"tchoritest_thing.two": "two",
+	})
+	pd := "--plugin-dir=" + pluginDir
+
+	for _, tc := range []struct {
+		address string
+		id      string
+	}{
+		{address: "tchoritest_thing.one", id: "t-id-one"},
+		{address: "tchoritest_thing.two", id: "t-id-two"},
+	} {
+		if stdout, stderr, code := runCLIWithArtifactKey(t, dir, "import", pd, tc.address, tc.id); code != 0 {
+			t.Fatalf("import %s: exit %d, want 0\nstdout: %s\nstderr: %s", tc.address, code, stdout, stderr)
+		}
+	}
+	beforeState, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSerial, beforeResources := readStateFile(t, dir)
+	withoutContractEnvelope := func(raw json.RawMessage) []byte {
+		t.Helper()
+		var resource map[string]any
+		if err := json.Unmarshal(raw, &resource); err != nil {
+			t.Fatal(err)
+		}
+		delete(resource, "sensitive_set_recovery")
+		normalized, err := json.Marshal(resource)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return normalized
+	}
+	beforeUnrelated := withoutContractEnvelope(beforeResources["tchoritest_thing.two"])
+
+	stdout, stderr, code := runCLIWithArtifactKey(t, dir, "import", "--refresh", pd, "tchoritest_thing.one", "t-id-one-refreshed")
+	if code != 0 {
+		t.Fatalf("refresh import: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if stdout != "Refreshed tchoritest_thing.one.\n" {
+		t.Fatalf("refresh import stdout = %q, want address-only confirmation", stdout)
+	}
+
+	afterSerial, afterResources := readStateFile(t, dir)
+	afterState, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(afterState, []byte(`"format_version": "1.3"`)) {
+		t.Fatalf("refresh did not persist format 1.3 state: %s", afterState)
+	}
+	if afterSerial != beforeSerial+1 {
+		t.Fatalf("refresh serial = %d, want exactly one increment from %d", afterSerial, beforeSerial)
+	}
+	if bytes.Equal(beforeResources["tchoritest_thing.one"], afterResources["tchoritest_thing.one"]) {
+		t.Fatal("refresh did not replace the named resource")
+	}
+	if afterUnrelated := withoutContractEnvelope(afterResources["tchoritest_thing.two"]); !bytes.Equal(beforeUnrelated, afterUnrelated) {
+		t.Fatal("refresh changed an unrelated resource outside its randomized contract envelope")
+	}
+	backup, err := os.ReadFile(filepath.Join(dir, "state.json.backup")) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(backup, beforeState) {
+		t.Fatal("refresh backup does not contain the complete pre-refresh state")
+	}
+}
+
+func TestImportRefreshPreservesOmittedSensitiveState(t *testing.T) {
+	dir := t.TempDir()
+	writeRefreshSensitiveConfig(t, dir)
+	pd := "--plugin-dir=" + pluginDir
+	const (
+		address   = "tchoritest_refresh_sensitive.demo"
+		initialID = "t-id-seeded"
+		refreshID = "t-id-omit-sensitive"
+	)
+	if stdout, stderr, code := runCLIWithArtifactKey(t, dir, "import", pd, address, initialID); code != 0 {
+		t.Fatalf("initial import: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	initialSerial, _ := readStateFile(t, dir)
+	stdout, stderr, code := runCLIWithArtifactKey(t, dir, "import", "--refresh", pd, address, refreshID)
+	if code != 0 || stdout != "Refreshed "+address+".\n" {
+		t.Fatalf("sensitive refresh: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	for _, secret := range []string{"refresh-sensitive-secret", "refresh-member-one", "refresh-member-two"} {
+		if strings.Contains(stdout+stderr, secret) {
+			t.Fatalf("refresh output exposed %q", secret)
+		}
+	}
+	for _, path := range []string{filepath.Join(dir, "state.json"), filepath.Join(dir, "state.json.backup")} {
+		data, err := os.ReadFile(path) //nolint:gosec // test-controlled state artifact
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{"refresh-sensitive-secret", "refresh-member-one", "refresh-member-two"} {
+			if bytes.Contains(data, []byte(secret)) {
+				t.Fatalf("%s exposed %q", filepath.Base(path), secret)
+			}
+		}
+	}
+	stateData, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Serial    uint64 `json:"serial"`
+		Resources map[string]struct {
+			Attributes           map[string]any `json:"attributes"`
+			SensitiveRecovery    any            `json:"sensitive_set_recovery"`
+			SensitiveRecoveryVer int            `json:"sensitive_recovery_version"`
+		} `json:"resources"`
+	}
+	if err := json.Unmarshal(stateData, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.Serial != initialSerial+1 {
+		t.Fatalf("refresh serial = %d, want exactly one increment from %d", document.Serial, initialSerial)
+	}
+	resource := document.Resources[address]
+	if resource.Attributes["secret"] != nil || resource.Attributes["members"] != nil {
+		t.Fatalf("refreshed sensitive attributes = %#v, want redacted nulls", resource.Attributes)
+	}
+	if resource.Attributes["note"] != "remote-note" {
+		t.Fatalf("ordinary note = %#v, want provider refresh value", resource.Attributes["note"])
+	}
+	if resource.SensitiveRecovery == nil || resource.SensitiveRecoveryVer == 0 {
+		t.Fatal("refreshed state omitted encrypted sensitive recovery")
+	}
+
+	stdout, stderr, code = runCLIWithArtifactKey(t, dir, "state", "show", address)
+	if code != 0 || strings.Contains(stdout+stderr, "refresh-sensitive") {
+		t.Fatalf("state show exposed refresh-sensitive data: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	var shown struct {
+		Attributes map[string]any `json:"attributes"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &shown); err != nil {
+		t.Fatalf("state show output: %v\n%s", err, stdout)
+	}
+	if shown.Attributes["secret"] != nil || shown.Attributes["members"] != nil {
+		t.Fatalf("state show sensitive attributes = %#v, want nulls", shown.Attributes)
+	}
+	if shown.Attributes["note"] != "remote-note" {
+		t.Fatalf("state show note = %#v, want remote value", shown.Attributes["note"])
+	}
+
+	stdout, stderr, code = runCLIWithArtifactKey(t, dir, "plan", pd)
+	if code != 0 || !strings.Contains(stdout, "No changes") {
+		t.Fatalf("plan after omitted-sensitive refresh: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if strings.Contains(stdout+stderr, "refresh-sensitive") {
+		t.Fatal("plan exposed a sensitive refresh value")
+	}
+}
+
+func TestImportSensitiveSetsEncryptsIdentityAndPreservesProjection(t *testing.T) {
+	dir := t.TempDir()
+	writeSensitiveSetConfig(t, dir)
+	pd := "--plugin-dir=" + pluginDir
+	const address = "tchoritest_set_thing.imported"
+	if stdout, stderr, code := runCLIWithArtifactKey(t, dir, "import", pd, address, "remote-set-id"); code != 0 {
+		t.Fatalf("import: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // test-controlled artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{
+		"imported-attribute-token-one", "imported-attribute-token-two",
+		"imported-attribute-detail-one", "imported-attribute-detail-two",
+		"imported-block-token-one", "imported-block-token-two",
+		"imported-block-detail-one", "imported-block-detail-two",
+	} {
+		if bytes.Contains(data, []byte(secret)) {
+			t.Fatalf("imported state exposed %q", secret)
+		}
+	}
+	if !bytes.Contains(data, []byte(`"sensitive_set_recovery"`)) {
+		t.Fatal("imported state omitted encrypted sensitive set recovery")
+	}
+	stdout, stderr, code := runCLIWithArtifactKey(t, dir, "state", "show", address)
+	if code != 0 {
+		t.Fatalf("state show: exit %d\nstderr: %s", code, stderr)
+	}
+	var shown struct {
+		Attributes map[string]any `json:"attributes"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &shown); err != nil {
+		t.Fatalf("state show output: %v\n%s", err, stdout)
+	}
+	for _, field := range []string{"attribute_members", "block_members"} {
+		members, ok := shown.Attributes[field].([]any)
+		if !ok || len(members) != 2 {
+			t.Fatalf("state show %s = %#v, want two projected members", field, shown.Attributes[field])
+		}
+		for _, raw := range members {
+			member := raw.(map[string]any)
+			if member["token"] != nil || member["details"].([]any)[0].(map[string]any)["secret"] != nil {
+				t.Fatalf("state show exposed %s member: %#v", field, member)
+			}
+		}
+	}
+	stdout, stderr, code = runCLIWithArtifactKey(t, dir, "import", "--refresh", pd, address, "remote-set-id")
+	if code != 0 || stdout != "Refreshed "+address+".\n" {
+		t.Fatalf("refresh sensitive import: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	for _, secret := range []string{
+		"imported-attribute-token-one", "imported-attribute-token-two",
+		"imported-attribute-detail-one", "imported-attribute-detail-two",
+		"imported-block-token-one", "imported-block-token-two",
+		"imported-block-detail-one", "imported-block-detail-two",
+	} {
+		if strings.Contains(stdout+stderr, secret) {
+			t.Fatalf("refresh output exposed %q", secret)
+		}
+	}
+	for _, path := range []string{filepath.Join(dir, "state.json"), filepath.Join(dir, "state.json.backup")} {
+		data, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{
+			"imported-attribute-token-one", "imported-attribute-token-two",
+			"imported-attribute-detail-one", "imported-attribute-detail-two",
+			"imported-block-token-one", "imported-block-token-two",
+			"imported-block-detail-one", "imported-block-detail-two",
+		} {
+			if bytes.Contains(data, []byte(secret)) {
+				t.Fatalf("refresh exposed %q in %s", secret, path)
+			}
+		}
+	}
+
+	stdout, stderr, code = runCLIWithArtifactKey(t, dir, "plan", pd)
+	if code != 0 || !strings.Contains(stdout, "No changes") {
+		t.Fatalf("plan after sensitive set import: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+}
+
+func TestImportRefreshScanFailureRollsBackState(t *testing.T) {
+	dir := t.TempDir()
+	config := `{
+  "providers": {
+    "tchoritest": {
+      "source": "tchori-labs/tchoritest",
+      "version": "0.0.1",
+      "config": {"prefix": "t-"}
+    }
+  },
+  "resources": {
+    "tchoritest_thing.one": {
+      "sensitive_attributes": ["name"],
+      "config": {"name": {"env": "TCHORI_ONE_NAME"}}
+    },
+    "tchoritest_thing.other": {
+      "sensitive_attributes": ["name"],
+      "config": {"name": {"env": "TCHORI_OTHER_NAME"}}
+    }
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pd := "--plugin-dir=" + pluginDir
+	if _, stderr, code := runCLIWithArtifactKey(t, dir, "import", pd, "tchoritest_thing.one", "t-id-one"); code != 0 {
+		t.Fatalf("import setup: exit %d\nstderr: %s", code, stderr)
+	}
+
+	statePath := filepath.Join(dir, "state.json")
+	t.Setenv("TCHORI_ARTIFACT_KEY", testArtifactKey)
+	st, err := state.Load(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attributes := json.RawMessage(`{"echo":"other","id":"t-id-other","name":{"unexpected":true}}`)
+	contract, err := sensitive.NewProjectionContract(attributes, []string{"name"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Resources["tchoritest_thing.other"] = &state.ResourceState{
+		Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest",
+		Attributes: attributes, SensitiveSetRecovery: contract,
+		SensitiveRecoveryVersion: sensitive.RecoveryVersion,
+		SensitivePaths:           []string{"name"}, SensitiveScanned: true,
+	}
+	corrupt, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupt = append(corrupt, '\n')
+	if err := os.WriteFile(statePath, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backupPath := statePath + ".backup"
+	beforeState, err := os.ReadFile(statePath) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeBackup := []byte("pre-existing backup")
+	if err := os.WriteFile(backupPath, beforeBackup, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, code := runCLIWithArtifactKey(t, dir, "import", "--refresh", pd, "tchoritest_thing.one", "t-id-one-refreshed")
+	if code != 1 || !strings.Contains(stderr, "sanitize backup attributes") {
+		t.Fatalf("refresh scan failure: exit %d, want scan rejection\nstderr: %s", code, stderr)
+	}
+	afterState, err := os.ReadFile(statePath) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterBackup, err := os.ReadFile(backupPath) //nolint:gosec // test-controlled backup artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(beforeState, afterState) || !bytes.Equal(beforeBackup, afterBackup) {
+		t.Fatal("scan failure changed state or backup")
+	}
+}
+
+func TestImportRefreshRejectsSensitiveValidationWithoutWriting(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, "demo")
+	pd := "--plugin-dir=" + pluginDir
+	if _, stderr, code := runCLIWithArtifactKey(t, dir, "import", pd, "tchoritest_thing.demo", "t-id-demo"); code != 0 {
+		t.Fatalf("import setup: exit %d\nstderr: %s", code, stderr)
+	}
+	statePath := filepath.Join(dir, "state.json")
+	beforeState, err := os.ReadFile(statePath) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := `{
+  "providers": {
+    "tchoritest": {
+      "source": "tchori-labs/tchoritest",
+      "version": "0.0.1",
+      "config": {"prefix": "t-"}
+    }
+  },
+  "resources": {
+    "tchoritest_thing.demo": {
+      "sensitive_attributes": ["not_in_schema"],
+      "config": {"name": "demo"}
+    }
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, code := runCLIWithArtifactKey(t, dir, "import", "--refresh", pd, "tchoritest_thing.demo", "t-id-demo")
+	if code != 1 || !strings.Contains(stderr, "unknown sensitive attribute") {
+		t.Fatalf("refresh sensitive validation: exit %d, want 1 with rejection\nstderr: %s", code, stderr)
+	}
+	afterState, err := os.ReadFile(statePath) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(beforeState, afterState) {
+		t.Fatal("sensitive validation failure changed state.json")
+	}
+	if _, err := os.Stat(statePath + ".backup"); !os.IsNotExist(err) {
+		t.Fatalf("sensitive validation failure created backup: %v", err)
+	}
+}
+
+func TestImportRefreshWriteFailureRollsBackState(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, "demo")
+	pd := "--plugin-dir=" + pluginDir
+	if _, stderr, code := runCLIWithArtifactKey(t, dir, "import", pd, "tchoritest_thing.demo", "t-id-demo"); code != 0 {
+		t.Fatalf("import setup: exit %d\nstderr: %s", code, stderr)
+	}
+	statePath := filepath.Join(dir, "state.json")
+	beforeState, err := os.ReadFile(statePath) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSerial, _ := readStateFile(t, dir)
+	if err := os.Mkdir(statePath+".backup", 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, code := runCLIWithArtifactKey(t, dir, "import", "--refresh", pd, "tchoritest_thing.demo", "t-id-refreshed")
+	if code != 1 || !strings.Contains(stderr, "backup path") {
+		t.Fatalf("refresh write failure: exit %d, want backup write diagnostic\nstderr: %s", code, stderr)
+	}
+	afterState, err := os.ReadFile(statePath) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(beforeState, afterState) {
+		t.Fatal("write failure changed state.json")
+	}
+	afterSerial, _ := readStateFile(t, dir)
+	if afterSerial != beforeSerial {
+		t.Fatalf("write failure changed serial from %d to %d", beforeSerial, afterSerial)
+	}
+}
+
 // TestImportErrorPaths covers import's error contract: undeclared address,
 // already-in-state address, and a nonexistent provider ID all exit 1
 // without mutating state.json (serial unchanged, no partial resource entry).
@@ -1404,7 +1889,7 @@ func TestImportErrorPaths(t *testing.T) {
 
 	t.Run("address not declared in config", func(t *testing.T) {
 		serialBefore, resBefore := readStateFile(t, dir)
-		_, stderr, code := runCLI(t, dir, "import", pd, "tchoritest_thing.nope", "t-id-demo")
+		_, stderr, code := runCLIWithArtifactKey(t, dir, "import", pd, "tchoritest_thing.nope", "t-id-demo")
 		if code != 1 {
 			t.Fatalf("import undeclared address: exit %d, want 1\nstderr: %s", code, stderr)
 		}
@@ -1417,7 +1902,7 @@ func TestImportErrorPaths(t *testing.T) {
 
 	t.Run("nonexistent provider id", func(t *testing.T) {
 		serialBefore, resBefore := readStateFile(t, dir)
-		_, stderr, code := runCLI(t, dir, "import", pd, "tchoritest_thing.demo", "no-marker-here")
+		_, stderr, code := runCLIWithArtifactKey(t, dir, "import", pd, "tchoritest_thing.demo", "no-marker-here")
 		if code != 1 {
 			t.Fatalf("import nonexistent id: exit %d, want 1\nstderr: %s", code, stderr)
 		}
@@ -1430,29 +1915,71 @@ func TestImportErrorPaths(t *testing.T) {
 
 	// Successful import, then a second import of the same address must
 	// refuse to overwrite.
-	if _, stderr, code := runCLI(t, dir, "import", pd, "tchoritest_thing.demo", "t-id-demo"); code != 0 {
+	if _, stderr, code := runCLIWithArtifactKey(t, dir, "import", pd, "tchoritest_thing.demo", "t-id-demo"); code != 0 {
 		t.Fatalf("import (setup): exit %d, want 0\nstderr: %s", code, stderr)
 	}
 
 	t.Run("address already in state", func(t *testing.T) {
 		serialBefore, resBefore := readStateFile(t, dir)
-		_, stderr, code := runCLI(t, dir, "import", pd, "tchoritest_thing.demo", "t-id-demo")
-		if code != 1 {
-			t.Fatalf("import already-in-state: exit %d, want 1\nstderr: %s", code, stderr)
+		before, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // test-controlled state artifact
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = os.ReadFile(filepath.Join(dir, "state.json.backup")) //nolint:gosec // test-controlled state artifact
+		backupExists := err == nil
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if backupExists {
+			t.Fatal("default refusal test unexpectedly started with a backup")
+		}
+
+		_, stderr, code := runCLIWithArtifactKey(t, dir, "import", pd, "tchoritest_thing.demo", "t-id-demo")
+		if code != 1 || !strings.Contains(stderr, "does not overwrite") || !strings.Contains(stderr, "--refresh") {
+			t.Fatalf("import already-in-state: exit %d, want explicit refusal with refresh hint\nstderr: %s", code, stderr)
 		}
 		serialAfter, resAfter := readStateFile(t, dir)
 		if serialAfter != serialBefore || len(resAfter) != len(resBefore) {
 			t.Fatalf("import already-in-state mutated state: serial %d->%d, resources %d->%d",
 				serialBefore, serialAfter, len(resBefore), len(resAfter))
 		}
+		after, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // test-controlled state artifact
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("default refusal changed state.json")
+		}
+	})
+
+	t.Run("refresh provider failure", func(t *testing.T) {
+		before, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // test-controlled state artifact
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, stderr, code := runCLIWithArtifactKey(t, dir, "import", "--refresh", pd, "tchoritest_thing.demo", "no-marker-here")
+		if code != 1 || !strings.Contains(stderr, "resource does not exist") {
+			t.Fatalf("refresh nonexistent id: exit %d, want provider refusal\nstderr: %s", code, stderr)
+		}
+		after, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // test-controlled state artifact
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatal("provider failure changed state.json")
+		}
 	})
 }
 
 func TestStateShowMasksRecordedSensitivityAndNotesOnlyUnscanned(t *testing.T) {
 	dir := t.TempDir()
-	const sentinel = "tchori-e2e-super-secret-value"
+	const (
+		sentinel    = "tchori-e2e-super-secret-value"
+		mapSentinel = "tchori-e2e-private-map-name"
+	)
 	stateDoc := `{"format_version":"1.0","serial":1,"resources":{` +
 		`"secret.masked":{"type":"secret","provider":"test","attributes":{"client_secret":"` + sentinel + `"},"sensitive_paths":["client_secret"]},` +
+		`"secret.map":{"type":"secret","provider":"test","attributes":{"groups":{"` + mapSentinel + `":{"members":[{"token":"` + sentinel + `"}]}}},"sensitive_paths":["groups"],"sensitive_scanned":true},` +
 		`"thing.scanned":{"type":"thing","provider":"test","attributes":{"value":"ok"},"sensitive_scanned":true},` +
 		`"thing.legacy":{"type":"thing","provider":"test","attributes":{"value":"legacy"}}}}`
 	path := filepath.Join(dir, "state.json")
@@ -1461,8 +1988,13 @@ func TestStateShowMasksRecordedSensitivityAndNotesOnlyUnscanned(t *testing.T) {
 	}
 	before, _ := os.ReadFile(path) //nolint:gosec // test-controlled path under t.TempDir()
 	stdout, stderr, code := runCLI(t, dir, "state", "show", "secret.masked")
-	if code != 0 || strings.Contains(stdout+stderr, sentinel) || strings.Contains(stderr, "not checked") {
+	if code != 0 || strings.Contains(stdout+stderr, sentinel) || !strings.Contains(stderr, "not checked") {
 		t.Fatalf("masked show: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI(t, dir, "state", "show", "secret.map")
+	if code != 0 || strings.Contains(stdout+stderr, mapSentinel) || strings.Contains(stdout+stderr, sentinel) ||
+		!strings.Contains(stdout, `"groups": null`) {
+		t.Fatalf("sensitive map show: code=%d stdout=%s stderr=%s", code, stdout, stderr)
 	}
 	stdout, stderr, code = runCLI(t, dir, "state", "show", "thing.scanned")
 	if code != 0 || strings.Contains(stderr, "not checked") {
@@ -1475,5 +2007,354 @@ func TestStateShowMasksRecordedSensitivityAndNotesOnlyUnscanned(t *testing.T) {
 	after, _ := os.ReadFile(path) //nolint:gosec // test-controlled path under t.TempDir()
 	if !bytes.Equal(before, after) {
 		t.Fatal("state show modified state.json")
+	}
+}
+
+func TestStateSanitizeScrubsLegacyStateAndBackup(t *testing.T) {
+	const sentinel = "tchori-e2e-super-secret-value"
+	dir := t.TempDir()
+	cfg := `{
+  "providers": {"tchoritest": {"source":"tchori-labs/tchoritest","version":"0.0.1","config":{}}},
+  "resources": {"tchoritest_lossy.svc": {"config":{"name":"svc"}}}
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDoc := `{"format_version":"1.0","serial":1,"resources":{"tchoritest_lossy.svc":{"type":"tchoritest_lossy","provider":"tchoritest","attributes":{"id":"lossy-svc","name":"svc","flag":null,"tags":null,"secret":"` + sentinel + `","replace_me":null,"credentials":{"user":"agent","token":"` + sentinel + `"},"endpoints":[{"host":"example.test","api_key":"` + sentinel + `"}],"probes":[]}}}}`
+	statePath := filepath.Join(dir, "state.json")
+	backupPath := statePath + ".backup"
+	if err := os.WriteFile(statePath, []byte(stateDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backupPath, []byte(`{"legacy":"`+sentinel+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, code := runCLI(t, dir, "state", "sanitize", "--plugin-dir="+pluginDir)
+	if code != 0 {
+		t.Fatalf("state sanitize: exit %d, want 0\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Sanitized state:") {
+		t.Fatalf("state sanitize stdout = %q, want deterministic summary", stdout)
+	}
+	for _, path := range []string{statePath, backupPath} {
+		got, err := os.ReadFile(path) //nolint:gosec // test-controlled state paths under t.TempDir()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(got, []byte(sentinel)) {
+			t.Fatalf("%s retains sensitive value: %s", path, got)
+		}
+	}
+}
+
+func TestStateSanitizeRejectsProviderSourceDriftBeforeDiscovery(t *testing.T) {
+	dir := t.TempDir()
+	cfg := `{
+  "providers": {"tchoritest": {"source":"new.example/tchoritest","version":"0.0.1","config":{}}},
+  "resources": {"tchoritest_lossy.svc": {"config":{"name":"svc"}}}
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(dir, "state.json")
+	stateDoc := `{"format_version":"1.2","serial":1,"resources":{"tchoritest_lossy.svc":{"type":"tchoritest_lossy","provider":"tchoritest","provider_source":"old.example/tchoritest","attributes":{"id":"lossy-svc","name":"svc","secret":null,"credentials":null,"endpoints":[]}}}}`
+	if err := os.WriteFile(statePath, []byte(stateDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(statePath) //nolint:gosec // test-controlled state path
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyPlugins := filepath.Join(dir, "empty-plugins")
+	if err := os.Mkdir(emptyPlugins, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, code := runCLI(t, dir, "state", "sanitize", "--plugin-dir="+emptyPlugins)
+	if code != 1 || !strings.Contains(stderr, "provider source") {
+		t.Fatalf("state sanitize source drift: code=%d stderr=%s", code, stderr)
+	}
+	if strings.Contains(stderr, "not installed") || strings.Contains(stderr, "launching provider") {
+		t.Fatalf("state sanitize reached provider discovery before refusing source drift: %s", stderr)
+	}
+	after, _ := os.ReadFile(statePath) //nolint:gosec // test-controlled state path
+	if !bytes.Equal(before, after) {
+		t.Fatal("source drift refusal changed state")
+	}
+	if _, err := os.Stat(statePath + ".backup"); !os.IsNotExist(err) {
+		t.Fatalf("source drift refusal created backup: %v", err)
+	}
+}
+
+func TestStateSanitizeMigratesUnboundEncrypted11Private(t *testing.T) {
+	t.Setenv("TCHORI_ARTIFACT_KEY", testArtifactKey)
+	const privateValue = "early-1.1-provider-private"
+	sealed, err := privateblob.Seal([]byte(privateValue), "state\x00tchoritest_lossy.svc\x00tchoritest\x00tchoritest_lossy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	cfg := `{
+  "providers": {"tchoritest": {"source":"tchori-labs/tchoritest","version":"0.0.1","config":{}}},
+  "resources": {"tchoritest_lossy.svc": {"config":{"name":"svc"}}}
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(dir, "state.json")
+	stateDoc := fmt.Sprintf(`{"format_version":"1.1","serial":1,"resources":{"tchoritest_lossy.svc":{"type":"tchoritest_lossy","provider":"tchoritest","attributes":{"id":"lossy-svc","name":"svc","flag":null,"tags":null,"secret":null,"replace_me":null,"credentials":null,"endpoints":[],"probes":[]},"private":%s}}}`, sealed)
+	if err := os.WriteFile(statePath, []byte(stateDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, code := runCLI(t, dir, "state", "sanitize", "--plugin-dir="+pluginDir)
+	if code != 0 {
+		t.Fatalf("state sanitize early 1.1: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	for _, artifact := range []string{statePath, statePath + ".backup"} {
+		loaded, err := state.Load(artifact)
+		if err != nil {
+			t.Fatalf("Load(%s): %v", artifact, err)
+		}
+		rs := loaded.Resources["tchoritest_lossy.svc"]
+		if rs.ProviderSource != "tchori-labs/tchoritest" {
+			t.Fatalf("%s provider source = %q", artifact, rs.ProviderSource)
+		}
+		if !bytes.Equal(rs.Private, []byte(privateValue)) {
+			t.Fatalf("%s lost early 1.1 private bytes", artifact)
+		}
+	}
+}
+
+func TestStateSanitizeRefusesUnresolvedLegacyEntry(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, "demo")
+	statePath := filepath.Join(dir, "state.json")
+	backupPath := statePath + ".backup"
+	stateDoc := `{"format_version":"1.0","serial":1,"resources":{"orphan.legacy":{"type":"orphan","provider":"missing","attributes":{"unknown":"value"}}}}`
+	if err := os.WriteFile(statePath, []byte(stateDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backupPath, []byte("existing backup"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeState, _ := os.ReadFile(statePath)   //nolint:gosec // test-controlled state path under t.TempDir()
+	beforeBackup, _ := os.ReadFile(backupPath) //nolint:gosec // test-controlled backup path under t.TempDir()
+
+	_, stderr, code := runCLI(t, dir, "state", "sanitize", "--plugin-dir="+pluginDir)
+	if code != 1 || !strings.Contains(stderr, "orphan.legacy") {
+		t.Fatalf("state sanitize unresolved: code=%d stderr=%s", code, stderr)
+	}
+	afterState, _ := os.ReadFile(statePath)   //nolint:gosec // test-controlled state path under t.TempDir()
+	afterBackup, _ := os.ReadFile(backupPath) //nolint:gosec // test-controlled backup path under t.TempDir()
+	if !bytes.Equal(beforeState, afterState) || !bytes.Equal(beforeBackup, afterBackup) {
+		t.Fatal("unresolved state sanitize modified state or backup")
+	}
+}
+
+func TestStateSanitizeReportsHintedOrphanAsUnresolved(t *testing.T) {
+	const (
+		knownValue   = "known-sensitive-value"
+		unknownValue = "unknown-potentially-sensitive-value"
+	)
+	dir := t.TempDir()
+	writeConfig(t, dir, "demo")
+	statePath := filepath.Join(dir, "state.json")
+	backupPath := statePath + ".backup"
+	stateDoc := `{"format_version":"1.0","serial":1,"resources":{"orphan.legacy":{"type":"orphan","provider":"missing","attributes":{"known":"` + knownValue + `","unknown":"` + unknownValue + `"},"sensitive_paths":["known"]}}}`
+	if err := os.WriteFile(statePath, []byte(stateDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, code := runCLI(t, dir, "state", "sanitize", "--plugin-dir="+pluginDir)
+	if code != 1 || !strings.Contains(stderr, "orphan.legacy") {
+		t.Fatalf("state sanitize hinted orphan: code=%d stderr=%s", code, stderr)
+	}
+	for _, path := range []string{statePath, backupPath} {
+		got, err := os.ReadFile(path) //nolint:gosec // test-controlled state paths under t.TempDir()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(got, []byte(knownValue)) {
+			t.Fatalf("%s retains known sensitive value: %s", path, got)
+		}
+		if !bytes.Contains(got, []byte(unknownValue)) {
+			t.Fatalf("%s unexpectedly rewrote unclassified value: %s", path, got)
+		}
+		var doc struct {
+			Resources map[string]struct {
+				SensitiveScanned bool `json:"sensitive_scanned"`
+			} `json:"resources"`
+		}
+		if err := json.Unmarshal(got, &doc); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		if doc.Resources["orphan.legacy"].SensitiveScanned {
+			t.Fatalf("%s falsely certifies hinted orphan as sensitivity-scanned", path)
+		}
+	}
+}
+
+func TestStateShowDiscoverSensitiveMasksWithoutWrites(t *testing.T) {
+	const (
+		sentinel = "tchori-e2e-super-secret-value"
+		private  = "b3BhcXVlLXByb3ZpZGVyLXByaXZhdGU="
+	)
+	dir := t.TempDir()
+	cfg := `{
+  "providers": {"tchoritest": {"source":"tchori-labs/tchoritest","version":"0.0.1","config":{}}},
+  "resources": {"tchoritest_lossy.svc": {"config":{"name":"svc"}}}
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(dir, "state.json")
+	backupPath := statePath + ".backup"
+	stateDoc := `{"format_version":"1.0","serial":1,"resources":{"tchoritest_lossy.svc":{"type":"tchoritest_lossy","provider":"tchoritest","private":"` + private + `","attributes":{"id":"lossy-svc","name":"svc","secret":"` + sentinel + `","credentials":{"user":"agent","token":"` + sentinel + `"},"endpoints":[{"host":"example.test","api_key":"` + sentinel + `"}]}}}}`
+	if err := os.WriteFile(statePath, []byte(stateDoc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backupPath, []byte("backup must remain byte-identical"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeState, _ := os.ReadFile(statePath)   //nolint:gosec // test-controlled state path under t.TempDir()
+	beforeBackup, _ := os.ReadFile(backupPath) //nolint:gosec // test-controlled backup path under t.TempDir()
+
+	stdout, stderr, code := runCLI(t, dir, "state", "show", "--discover-sensitive", "--plugin-dir="+pluginDir, "tchoritest_lossy.svc")
+	if code != 0 || strings.Contains(stdout+stderr, sentinel) || strings.Contains(stdout+stderr, private) {
+		t.Fatalf("discover-sensitive show: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+	afterState, _ := os.ReadFile(statePath)   //nolint:gosec // test-controlled state path under t.TempDir()
+	afterBackup, _ := os.ReadFile(backupPath) //nolint:gosec // test-controlled backup path under t.TempDir()
+	if !bytes.Equal(beforeState, afterState) || !bytes.Equal(beforeBackup, afterBackup) {
+		t.Fatal("discover-sensitive state show modified state or backup")
+	}
+}
+
+func TestStateShowDiscoverSensitiveReportsResolutionProvenance(t *testing.T) {
+	t.Run("live non-sensitive schema is scanned without warning", func(t *testing.T) {
+		dir := t.TempDir()
+		writeConfig(t, dir, "demo")
+		statePath := filepath.Join(dir, "state.json")
+		stateDoc := `{"format_version":"1.0","serial":1,"resources":{"tchoritest_thing.demo":{"type":"tchoritest_thing","provider":"tchoritest","attributes":{"name":"demo"}}}}`
+		if err := os.WriteFile(statePath, []byte(stateDoc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := os.ReadFile(statePath) //nolint:gosec // test-controlled state path under t.TempDir()
+
+		stdout, stderr, code := runCLI(t, dir, "state", "show", "--discover-sensitive", "--plugin-dir="+pluginDir, "tchoritest_thing.demo")
+		if code != 0 || strings.Contains(stderr, "not checked") {
+			t.Fatalf("discovered non-sensitive state: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+		}
+		var shown struct {
+			SensitiveScanned bool `json:"sensitive_scanned"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &shown); err != nil {
+			t.Fatalf("decode state show: %v", err)
+		}
+		if !shown.SensitiveScanned {
+			t.Fatalf("discovered non-sensitive state was not marked scanned in output: %s", stdout)
+		}
+		after, _ := os.ReadFile(statePath) //nolint:gosec // test-controlled state path under t.TempDir()
+		if !bytes.Equal(before, after) {
+			t.Fatal("discover-sensitive state show modified state.json")
+		}
+	})
+
+	t.Run("hinted orphan stays unscanned and warns", func(t *testing.T) {
+		const (
+			knownValue   = "known-sensitive-value"
+			unknownValue = "unknown-potentially-sensitive-value"
+		)
+		dir := t.TempDir()
+		writeConfig(t, dir, "demo")
+		statePath := filepath.Join(dir, "state.json")
+		stateDoc := `{"format_version":"1.0","serial":1,"resources":{"orphan.legacy":{"type":"orphan","provider":"missing","attributes":{"known":"` + knownValue + `","unknown":"` + unknownValue + `"},"sensitive_paths":["known"]}}}`
+		if err := os.WriteFile(statePath, []byte(stateDoc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := os.ReadFile(statePath) //nolint:gosec // test-controlled state path under t.TempDir()
+
+		stdout, stderr, code := runCLI(t, dir, "state", "show", "--discover-sensitive", "--plugin-dir="+pluginDir, "orphan.legacy")
+		if code != 0 || strings.Contains(stdout+stderr, knownValue) || !strings.Contains(stdout, unknownValue) {
+			t.Fatalf("hinted orphan show: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+		}
+		if !strings.Contains(stderr, "not checked") {
+			t.Fatalf("hinted orphan show suppressed unresolved warning: %s", stderr)
+		}
+		var shown struct {
+			SensitiveScanned bool `json:"sensitive_scanned"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &shown); err != nil {
+			t.Fatalf("decode state show: %v", err)
+		}
+		if shown.SensitiveScanned {
+			t.Fatalf("hinted orphan was falsely marked scanned in output: %s", stdout)
+		}
+		after, _ := os.ReadFile(statePath) //nolint:gosec // test-controlled state path under t.TempDir()
+		if !bytes.Equal(before, after) {
+			t.Fatal("discover-sensitive state show modified hinted orphan state")
+		}
+	})
+}
+
+func TestImportRequiresArtifactKeyBeforeProviderMutation(t *testing.T) {
+	for name, key := range map[string]string{
+		"missing": "",
+		"invalid": "not-a-valid-aes-256-key",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfig(t, dir, "demo")
+			providerPIDPath := filepath.Join(dir, "provider.pid")
+			_, stderr, code := runCLIEnv(t, dir, map[string]string{
+				"TCHORI_ARTIFACT_KEY": key,
+				"TCHORITEST_PID_FILE": providerPIDPath,
+			}, "import", "--plugin-dir="+pluginDir, "tchoritest_thing.demo", "t-id-demo")
+			if code != 1 || !strings.Contains(stderr, "TCHORI_ARTIFACT_KEY") {
+				t.Fatalf("import with %s artifact key: code=%d stderr=%s", name, code, stderr)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "state.json")); !os.IsNotExist(err) {
+				t.Fatalf("import with %s artifact key created state: %v", name, err)
+			}
+			if _, err := os.Stat(providerPIDPath); !os.IsNotExist(err) {
+				t.Fatalf("import with %s artifact key launched provider: %v", name, err)
+			}
+		})
+	}
+}
+
+func TestStateSensitivityRejectsMismatchedSchema(t *testing.T) {
+	for _, tc := range []struct{ name, provider, attributes string }{
+		{"changed provider", "former", `{"name":"demo"}`},
+		{"unknown attribute", "tchoritest", `{"name":"demo","removed_secret":"legacy-secret"}`},
+	} {
+		for _, command := range []string{"sanitize", "show"} {
+			t.Run(tc.name+"/"+command, func(t *testing.T) {
+				dir := t.TempDir()
+				writeConfig(t, dir, "demo")
+				document := `{"format_version":"1.0","serial":1,"resources":{"tchoritest_thing.demo":{"type":"tchoritest_thing","provider":"` + tc.provider + `","attributes":` + tc.attributes + `}}}`
+				path := filepath.Join(dir, "state.json")
+				if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				args := []string{"state", command, "--plugin-dir=" + pluginDir}
+				if command == "show" {
+					args = append(args, "--discover-sensitive", "tchoritest_thing.demo")
+				}
+				stdout, stderr, code := runCLI(t, dir, args...)
+				if code != 1 || strings.Contains(stdout+stderr, "legacy-secret") {
+					t.Fatalf("mismatched schema must fail without disclosure: code=%d", code)
+				}
+				after, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+				if err != nil || !bytes.Equal(after, []byte(document)) {
+					t.Fatal("schema refusal changed state")
+				}
+				if _, err := os.Stat(path + ".backup"); !os.IsNotExist(err) {
+					t.Fatalf("schema refusal created backup: %v", err)
+				}
+			})
+		}
 	}
 }

@@ -225,7 +225,20 @@ func redactConsistencyValue(block *provider.SchemaBlock, path cty.Path) bool {
 			return true
 		}
 		if attr, ok := cur.Attributes[step.Name]; ok {
-			return attr == nil || attr.Sensitive
+			if attr == nil || attr.Sensitive {
+				return true
+			}
+			if len(attr.NestedType) == 0 {
+				return false
+			}
+			nested := &provider.SchemaBlock{Attributes: attr.NestedType}
+			if attr.Type.IsListType() || attr.Type.IsSetType() || attr.Type.IsMapType() {
+				i++ // skip collection index or key
+			}
+			if i >= len(path)-1 {
+				return blockHasSensitiveDescendant(nested)
+			}
+			return redactConsistencyValue(nested, path[i+1:])
 		}
 		nb, ok := cur.Blocks[step.Name]
 		if !ok || nb == nil || nb.Block == nil {
@@ -251,6 +264,9 @@ func blockHasSensitiveDescendant(block *provider.SchemaBlock) bool {
 	}
 	for _, attr := range block.Attributes {
 		if attr == nil || attr.Sensitive {
+			return true
+		}
+		if len(attr.NestedType) != 0 && blockHasSensitiveDescendant(&provider.SchemaBlock{Attributes: attr.NestedType}) {
 			return true
 		}
 	}

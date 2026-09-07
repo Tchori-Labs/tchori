@@ -10,29 +10,28 @@ existence alone is not acceptance evidence.
 
 ## Prerequisites
 
-> **Blocked on promotion.** `import` is on `develop`, but is not released.
-> `go install github.com/tchori-labs/tchori/cmd/tchori@latest` and builds from
-> `main` do not contain it. Re-check with `git ls-remote --tags origin` in a
-> tchori checkout: this remote query currently prints nothing. A local `git
-> tag` is not evidence because an unfetched clone is also empty. Until a
-> `develop` → `main` promotion and board-approved release occur, a clean build
-> of the pinned `develop` SHA below is the only supported path. This is the
-> same consumer-facing release gap tracked by issue #57 / TC-058.
+> **Pinned build required.** Public release `v0.1.0` includes `import`, but it
+> predates the `1.1` encrypted-artifact and provider-source identity protections
+> required by this acceptance procedure. `v0.1.1` is not released. Until the
+> reviewed integration is promoted to `main` and receives a board-approved
+> release, build the pinned public `develop` commit below rather than using
+> `go install ...@latest`.
+>
+> **Security rationale for the pin.** This public integration commit includes
+> `import`, authenticated private artifacts, provider-source binding, and the
+> gRPC and `x/text` dependency upgrades that avoid GO-2026-6061 and
+> GO-2026-5970. Before any future repin, prove that the new SHA (a) is an
+> ancestor of `origin/develop`, (b) contains `newImportCmd`, (c) carries
+> `google.golang.org/grpc` >= v1.82.1 and `golang.org/x/text` >= v0.39.0, and
+> (d) retains the artifact protections; then rerun `govulncheck ./...`.
 
-> **Security rationale for the pin.** This SHA includes TC-060's gRPC and
-> `x/text` dependency upgrades, so the operator does not build a binary exposed
-> to GO-2026-6061 or GO-2026-5970. Before any future repin, prove that the new
-> SHA (a) is an ancestor of `origin/develop`, (b) contains `newImportCmd`, and
-> (c) carries `google.golang.org/grpc` >= v1.82.1 and
-> `golang.org/x/text` >= v0.39.0; then rerun `govulncheck ./...`.
-
-- [ ] Build commit `f7c28232ee472aeb346de75bd123bc47467e6f53` from a clean
+- [ ] Build commit `ea73e83f3b4adeec14e40a98e2e80efdd32fc61f` from a clean
       tchori checkout into a dedicated directory:
 
 ```bash
 # Build from the pinned develop commit in a clean checkout
 TCHORI_SRC=/path/to/tchori
-PINNED_SHA=f7c28232ee472aeb346de75bd123bc47467e6f53
+PINNED_SHA=ea73e83f3b4adeec14e40a98e2e80efdd32fc61f
 git -C "$TCHORI_SRC" fetch origin develop
 git -C "$TCHORI_SRC" checkout "$PINNED_SHA"
 
@@ -57,16 +56,16 @@ export TCHORI_BIN="$HOME/.local/tchori-bin/tchori"
   different from `PINNED_SHA` is a hard stop: clean or re-checkout, then rebuild.
 - [ ] Prove resolution before touching infra. Under Discipline A,
       `command -v tchori` must print `$HOME/.local/tchori-bin/tchori`; a path
-      such as `~/go/bin/tchori` or `/usr/local/bin/tchori` is a stale,
-      importless binary, so stop and fix `PATH`. Under Discipline B, verify
-      `ls -l "$TCHORI_BIN"` and use that expansion everywhere. Run `tchori
-      import --help`: it must exit 0 and print `tchori import ADDRESS ID`.
-- [ ] Capture `tchori version` as metadata only (expected `0.1.0-dev`). It is
-      **not provenance**: `version.Version` is a hardcoded, build-invariant
-      constant with no SHA ldflags stamping, and the CLI test asserts that
-      literal. Identity comes from the clean checkout, matching HEAD, build
-      from that checkout, resolution check, and `import --help` capability
-      probe.
+      such as `~/go/bin/tchori` or `/usr/local/bin/tchori` may resolve to a
+      release binary without the required artifact protections, so stop and fix
+      `PATH`. Under Discipline B, verify `ls -l "$TCHORI_BIN"` and use that
+      expansion everywhere. Run `tchori import --help`: it must exit 0 and
+      print `tchori import ADDRESS ID`.
+- [ ] Capture `tchori version` as metadata only. Source builds normally report
+      `0.1.0-dev`; release builds stamp their version through linker flags.
+      Neither value alone proves source provenance. Identity comes from the
+      clean checkout, matching HEAD, build from that checkout, resolution
+      check, and `import --help` capability probe.
 - [ ] Check out Tchori-Labs/infra. Its `infra/cloudflare` directory must have
       the existing `state.json` and at least one `*.tchori.json`. Start with a
       clean `git status` so every resulting change is attributable to this run.
@@ -78,6 +77,13 @@ export TCHORI_BIN="$HOME/.local/tchori-bin/tchori"
       zone as `CLOUDFLARE_API_TOKEN`, and the zone ID as
       `CLOUDFLARE_ZONE_ID`. Source the token from a secret manager or use
       `read -rs`; never type it inline or retain it in shell history.
+- [ ] Inject the persistent workspace `TCHORI_ARTIFACT_KEY` from the approved
+      secret manager: standard base64 encoding of 32 random bytes. Import
+      refuses to mutate without a valid key. Reuse the same key for encrypted
+      state, plans, and backup recovery; never print it, commit it, or generate
+      a different key on each invocation. See
+      [artifact key management](configuration.md#artifact-encryption-key) and
+      [infra adoption #150](https://github.com/Tchori-Labs/infra/issues/150).
 - [ ] Install `jq` and curl 7.x or newer; verify with `curl --version`. Keep
       shell xtrace (`set -x`) off.
 
@@ -215,16 +221,23 @@ EOF
   Adapt rather than copy. TTL must equal the live numeric value (automatic is
   `1`). Proxied is not meaningful for TXT; include it only when schema and live
   object both carry it. Match comment/tags when set and omit only when absent.
-  Priority applies to MX/SRV, not TXT. Environment wrappers are permitted only
-  in provider config and rejected in resource config. Record each managed
-  argument and whether its source was a live field or deliberate omission.
+  Priority applies to MX/SRV, not TXT. Environment wrappers are permitted in
+  both provider and resource config when the schema expects a string. Record
+  each managed argument and whether its source was a live field or deliberate
+  omission.
 
 - [ ] **6. Validate.** `tchori validate` must exit 0, proving the merged block
       parses and its provider resolves before state is touched.
 - [ ] **7. Import.** Run `tchori import cloudflare_dns_record.<name>
       <record-id>` using the exact recorded values. Both operands are required.
       It must exit 0 and print `Imported cloudflare_dns_record.<name>
-      (id=<record-id>).`; missing operands exit 1.
+      (id=<record-id>).`; missing operands exit 1. This default path refuses an
+      address already present in state. To replace an existing entry after an
+      out-of-band live update, use the explicit
+      `tchori import --refresh cloudflare_dns_record.<name> <record-id>` path.
+      It reads only that named resource through the provider, performs no
+      Create/Update/Delete operation, and writes one atomic state replacement;
+      the default command remains refusal-only for existing addresses.
 - [ ] **8. Inspect.** `tchori state show cloudflare_dns_record.<name>` must show
       the intended object. Compare every attribute with the full API object.
 - [ ] **9. Prove a no-op plan.** `tchori plan` must exit 0 and print `No
@@ -241,18 +254,27 @@ EOF
 
 Never place the token in config, argv, this run record, or a PR comment. It is
 referenced only as `${CLOUDFLARE_API_TOKEN}` in curl's stdin config and as
-`{"env": "CLOUDFLARE_API_TOKEN"}` in provider config. Provider responses are
-stored verbatim in state and plan files; inspect diffs for token-derived data
-before committing.
+`{"env": "CLOUDFLARE_API_TOKEN"}` in provider config. Sensitive attributes are
+withheld according to schema/config metadata and opaque private recovery data
+is encrypted. Unmarked attributes can still carry token-derived data; inspect
+diffs before committing. Neither sanitization nor encryption revokes an
+already exposed credential or removes historical copies.
 
-Import never overwrites an existing state entry, so repeating it after a
-mistake exits 1. For the expected uncommitted failure (wrong object, or plan
-still changing after config adjustment), do not hand-edit state. From
+Import without `--refresh` never overwrites an existing state entry, so
+repeating it after a mistake exits 1. `--refresh` is the explicit replacement
+path: it holds the state lock, calls only provider import/read for the named
+address, and commits one format-1.2 serial increment with the existing backup
+mechanism. For the expected uncommitted failure (wrong object, or plan still
+changing after config adjustment), do not hand-edit state. From
 `infra/cloudflare`, restore the generated change with `git restore --
 state.json` (or `git checkout -- state.json`), fix config or the record ID, and
 restart at validation. If a wrong import was already merged, open a reverting
 PR in the infra repo. Rollback is always restore from version control or revert
 of a reviewed commit.
+Retain the artifact key for restored encrypted versions. If a rollback brings
+back legacy plaintext, sanitize the restored state and backup before
+recommitting; follow the security incident's rotation/history-remediation
+procedure rather than treating a clean working-tree diff as proof of cleanup.
 
 ## Run record
 

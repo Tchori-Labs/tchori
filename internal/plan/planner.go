@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/zclconf/go-cty/cty"
-	ctyjson "github.com/zclconf/go-cty/cty/json"
 	"github.com/zclconf/go-cty/cty/msgpack"
 
 	"github.com/tchori-labs/tchori/internal/config"
@@ -86,6 +85,20 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 
 	for _, addr := range order {
 		res := p.Config.Resources[addr]
+		rs, hasPrior := p.State.Resources[addr]
+		providerConfig := p.Config.Providers[res.Provider]
+		if providerConfig == nil || providerConfig.Source == "" {
+			ds = append(ds, diag.Errorf(addr, "provider source unavailable",
+				fmt.Sprintf("provider %q has no canonical source in configuration", res.Provider)))
+			return nil, ds
+		}
+		if hasPrior {
+			ids := validateStateIdentity(addr, rs, res.Type, res.Provider, providerConfig.Source)
+			ds = append(ds, ids...)
+			if ids.HasErrors() {
+				return nil, ds
+			}
+		}
 		client, schema, lds := p.lookup(addr, res.Provider, res.Type)
 		ds = append(ds, lds...)
 		if lds.HasErrors() {
@@ -93,68 +106,55 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		}
 		ty := schema.Block.ImpliedType()
 
-		// declared is the effective sensitive-path input to spec below: the
-		// union of config's sensitive_attributes and whatever this resource's
-		// state already recorded as sensitive. State sensitivity memory must
-		// be monotonic — a path once recorded as sensitive (a legacy
-		// plaintext write predating the declaration, or a declaration config
-		// has since narrowed or dropped) stays redacted in Change.Before,
-		// Drift, plan -json/-out, and the re-persisted state, not just while
-		// config keeps declaring it. A state-recorded path that no longer
-		// exists in the current schema cannot hold a value there anymore
-		// (the provider dropped or renamed the attribute), so it is filtered
-		// out here rather than handed to sensitive.Resolve, which would
-		// reject an unknown path and hard-fail the whole plan.
-		rs, hasPrior := p.State.Resources[addr]
-		declared := res.SensitiveAttributes
+		var persistedPaths []string
 		if hasPrior {
-			var recalled []string
-			for _, path := range rs.SensitivePaths {
-				if schemaHasPath(schema.Block, path) {
-					recalled = append(recalled, path)
-				}
-			}
-			declared = unionPaths(declared, recalled)
+			persistedPaths = rs.SensitivePaths
 		}
-		spec, specDs := sensitive.Resolve(schema.Block, declared, res.Config)
+		spec, specDs := sensitive.ResolveWithPersisted(
+			schema.Block, res.SensitiveAttributes, persistedPaths, res.Config,
+		)
 		ds = append(ds, specDs...)
 		if specDs.HasErrors() {
 			return nil, ds
 		}
 
-		// Prior value from state, decoded against the schema's implied type.
+		// Prior value from state. Sensitive-set recovery is applied before cty
+		// decoding so provider operations receive the original set membership.
 		prior := cty.NullVal(ty)
 		var priorPrivate []byte
-		var redactedPrior cty.Value
+		var recordedAttrs json.RawMessage
 		if hasPrior {
-			pv, err := provider.DecodeJSON(rs.Attributes, ty)
+			pv, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, ty, rs.SensitivePaths, rs.SensitiveRecoveryVersion)
 			if err != nil {
 				ds = append(ds, diag.Errorf(addr, "invalid state attributes", err.Error()))
 				return nil, ds
 			}
 			prior = pv
 			priorPrivate = rs.Private
-			var legacyPaths []string
-			redactedPrior, legacyPaths, err = spec.Redact(prior)
+			var projectedRedacted []string
+			recordedAttrs, projectedRedacted, _, err = spec.Project(prior)
+			if err != nil {
+				return nil, append(ds, diag.Errorf(addr, "cannot project recorded state", err.Error()))
+			}
+			publicDifference, err := newDrift(addr, rs.Attributes, recordedAttrs)
 			if err != nil {
 				return nil, append(ds, diag.Errorf(addr, "cannot inspect sensitive state", err.Error()))
 			}
-			if len(legacyPaths) != 0 {
-				ds = append(ds, diag.Warnf(addr, "plaintext sensitive value already exists in state", fmt.Sprintf("rotate credentials at paths %s and purge state.json, state.json.backup, and git history; plan writes no state and a no-op apply saves nothing, so manual purge may be required", strings.Join(legacyPaths, ", "))))
+			if publicDifference != nil {
+				_, legacyPaths, redactErr := sensitive.RedactJSON(rs.Attributes, projectedRedacted)
+				if redactErr != nil {
+					return nil, append(ds, diag.Errorf(addr, "cannot inspect sensitive state", redactErr.Error()))
+				}
+				if len(legacyPaths) != 0 {
+					ds = append(ds, diag.Warnf(addr, "plaintext sensitive value already exists in state", fmt.Sprintf("rotate credentials at paths %s and purge state.json, state.json.backup, and git history; plan writes no state and a no-op apply saves nothing, so manual purge may be required", strings.Join(legacyPaths, ", "))))
+				}
 			}
 		}
 
 		// Refresh: re-read the real object, use the result as prior, and keep
 		// the in-memory state copy in sync.
 		if p.Refresh && hasPrior {
-			// recordedAttrs is the redacted reporting copy of rs.Attributes
-			// used for Drift.Before below, built here (not above) since it is
-			// only ever consumed on this refresh path.
-			recordedAttrs, err := ctyjson.Marshal(redactedPrior, ty)
-			if err != nil {
-				ds = append(ds, diag.Errorf(addr, "cannot encode recorded state", err.Error()))
-				return nil, ds
-			}
+			// recordedAttrs was projected without rebuilding sensitive sets.
 			rv, rpriv, rds := client.ReadResource(ctx, res.Type, prior, priorPrivate)
 			rds = provider.Context(addr, rds)
 			ds = append(ds, rds...)
@@ -172,16 +172,15 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 				prior = cty.NullVal(ty)
 				priorPrivate = nil
 			} else {
-				redactedRefresh, redactedPaths, err := spec.Redact(rv)
+				refreshed, carryErr := spec.CarryForwardBestEffort(prior, rv, rs.SensitivePaths)
+				if carryErr != nil {
+					return nil, append(ds, diag.Errorf(addr, "cannot preserve sensitive state", carryErr.Error()))
+				}
+				attrs, redactedPaths, recovery, err := spec.Project(refreshed)
 				if err != nil {
 					return nil, append(ds, diag.Errorf(addr, "cannot redact refreshed state", err.Error()))
 				}
-				attrs, err := ctyjson.Marshal(redactedRefresh, ty)
-				if err != nil {
-					ds = append(ds, diag.Errorf(addr, "cannot encode refreshed state", err.Error()))
-					return nil, ds
-				}
-				drift, err := newDrift(addr, recordedAttrs, attrs)
+				drift, err := newTypedDrift(addr, recordedAttrs, attrs, prior, refreshed, spec)
 				if err != nil {
 					ds = append(ds, diag.Errorf(addr, "cannot compare refreshed state", err.Error()))
 					return nil, ds
@@ -191,6 +190,8 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 				}
 				rs.Attributes = attrs
 				rs.Private = rpriv
+				rs.SensitiveSetRecovery = recovery
+				rs.SensitiveRecoveryVersion = sensitive.RecoveryVersion
 				rs.Redacted = redactedPaths
 				// spec was built from the union above, so spec.Paths() is
 				// itself the monotonic union of what rs.SensitivePaths held
@@ -199,7 +200,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 				// drop a still-schema-valid recorded one.
 				rs.SensitivePaths = spec.Paths()
 				rs.SensitiveScanned = true
-				prior = rv
+				prior = refreshed
 				priorPrivate = rpriv
 			}
 		}
@@ -236,7 +237,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 		planned := pc.State
 		plannedValues[addr] = planned
 
-		ch, err := newChange(addr, prior, planned, ty, pc, spec)
+		ch, err := newChange(addr, res.Provider, providerConfig.Source, res.Type, prior, planned, ty, pc, spec)
 		if err != nil {
 			ds = append(ds, diag.Errorf(addr, "cannot encode change", err.Error()))
 			return nil, ds
@@ -290,21 +291,33 @@ func (p *Planner) lookup(addr, providerName, typeName string) (*provider.Client,
 // No provider plan RPC is needed to plan a deletion in the MVP.
 func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 	rs := p.State.Resources[addr]
+	providerConfig := p.Config.Providers[rs.Provider]
+	if providerConfig == nil || providerConfig.Source == "" {
+		return nil, diag.Diagnostics{diag.Errorf(addr, "provider source unavailable",
+			fmt.Sprintf("provider %q has no canonical source in configuration", rs.Provider))}
+	}
+	ids := validateStateIdentity(addr, rs, rs.Type, rs.Provider, providerConfig.Source)
+	if ids.HasErrors() {
+		return nil, ids
+	}
 	_, schema, lds := p.lookup(addr, rs.Provider, rs.Type)
 	if lds.HasErrors() {
 		return nil, lds
 	}
 	ty := schema.Block.ImpliedType()
-	spec, sds := sensitive.Resolve(schema.Block, rs.SensitivePaths, nil)
+	spec, sds := sensitive.ResolveWithPersisted(schema.Block, nil, rs.SensitivePaths, nil)
 	lds = append(lds, sds...)
 	if sds.HasErrors() {
 		return nil, lds
 	}
-	paths := spec.Paths()
-	p.State.NoteSensitive(addr, paths)
+	p.State.NoteSensitive(addr, spec.Paths())
+	prior, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, ty, rs.SensitivePaths, rs.SensitiveRecoveryVersion)
+	if err != nil {
+		return nil, diag.Diagnostics{diag.Errorf(addr, "cannot restore delete state", err.Error())}
+	}
 	// A state-only delete has no raw config and therefore no stable literal
-	// instance exemptions; its reporting copy is scrubbed path-level.
-	before, _, err := sensitive.RedactJSON(rs.Attributes, paths, nil)
+	// instance exemptions; spec is already resolved without any exemptions.
+	before, _, _, err := spec.Project(prior)
 	if err != nil {
 		return nil, diag.Diagnostics{diag.Errorf(addr, "cannot sanitize delete state", err.Error())}
 	}
@@ -313,24 +326,38 @@ func (p *Planner) stateDeleteChange(addr string) (*Change, diag.Diagnostics) {
 		return nil, diag.Diagnostics{diag.Errorf(addr, "cannot encode planned value", err.Error())}
 	}
 	return &Change{
-		Address:    addr,
-		Action:     "delete",
-		Before:     before,
-		After:      json.RawMessage("null"),
-		PlannedRaw: raw,
-		Private:    rs.Private,
+		Address:        addr,
+		Type:           rs.Type,
+		Provider:       rs.Provider,
+		ProviderSource: rs.ProviderSource,
+		Action:         "delete",
+		Before:         before,
+		After:          json.RawMessage("null"),
+		PlannedRaw:     raw,
+		Private:        rs.Private,
 	}, lds
 }
 
+func validateStateIdentity(addr string, rs *state.ResourceState, resourceType, providerName, providerSource string) diag.Diagnostics {
+	if rs == nil {
+		return nil
+	}
+	if rs.ProviderSource == "" {
+		return diag.Diagnostics{diag.Errorf(addr, "state has unbound provider source",
+			"the stored resource predates canonical provider-source binding; run tchori state sanitize before planning")}
+	}
+	if rs.Type != resourceType || rs.Provider != providerName || rs.ProviderSource != providerSource {
+		return diag.Diagnostics{diag.Errorf(addr, "state does not match resource identity",
+			"the stored resource type, provider alias, or canonical provider source differs from configuration")}
+	}
+	return nil
+}
+
 // newChange classifies and serializes one provider-planned resource change.
-func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.PlannedChange, spec *sensitive.Spec) (*Change, error) {
+func newChange(addr, providerName, providerSource, typeName string, prior, planned cty.Value, ty cty.Type, pc *provider.PlannedChange, spec *sensitive.Spec) (*Change, error) {
 	before := json.RawMessage("null") // JSON null for create
 	if !prior.IsNull() {
-		maskedPrior, _, err := spec.Redact(prior)
-		if err != nil {
-			return nil, fmt.Errorf("before redaction: %w", err)
-		}
-		b, err := ctyjson.Marshal(maskedPrior, ty)
+		b, _, _, err := spec.Marshal(prior)
 		if err != nil {
 			return nil, fmt.Errorf("before: %w", err)
 		}
@@ -346,15 +373,11 @@ func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.
 		if err != nil {
 			return nil, fmt.Errorf("sensitive unknowns: %w", err)
 		}
-		sanitized, paths, err := nullOutUnknowns(plannedForArtifact)
+		b, _, paths, err := spec.Marshal(plannedForArtifact)
 		if err != nil {
 			return nil, fmt.Errorf("after: %w", err)
 		}
 		unknownAfter = paths
-		b, err := ctyjson.Marshal(sanitized, ty)
-		if err != nil {
-			return nil, fmt.Errorf("after: %w", err)
-		}
 		after = b
 	}
 
@@ -367,7 +390,10 @@ func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.
 
 	return &Change{
 		Address:         addr,
-		Action:          classify(prior, planned, pc.RequiresReplace, spec),
+		Type:            typeName,
+		Provider:        providerName,
+		ProviderSource:  providerSource,
+		Action:          Classify(prior, planned, pc.RequiresReplace, spec),
 		Before:          before,
 		After:           after,
 		UnknownAfter:    unknownAfter,
@@ -377,11 +403,12 @@ func newChange(addr string, prior, planned cty.Value, ty cty.Type, pc *provider.
 	}, nil
 }
 
-// classify implements the contract's action classification: no prior =>
-// create; prior and null planned => delete; RequiresReplace non-empty AND
-// planned differs on those paths => replace; planned == prior => no-op;
-// else update.
-func classify(prior, planned cty.Value, requiresReplace []string, spec *sensitive.Spec) string {
+// Classify implements the plan/apply action contract: no prior => create;
+// prior and null planned => delete; RequiresReplace non-empty and changed on
+// one of those paths => replace; planned equal to prior => no-op; else update.
+// Apply reuses this after concretizing an unknown-bearing set re-plan so a
+// reviewed replacement cannot destroy an object after its action changes.
+func Classify(prior, planned cty.Value, requiresReplace []string, spec *sensitive.Spec) string {
 	if prior.IsNull() {
 		return "create"
 	}
@@ -425,93 +452,6 @@ func replaceRequired(prior, planned cty.Value, paths []string) bool {
 // attrPath retains the package-private call site while sharing one renderer/parser.
 func attrPath(dotted string) cty.Path { return sensitive.AttrPath(dotted) }
 
-// unionPaths returns the union of a and b, preserving a's order and
-// appending unseen entries from b. sensitive.Resolve sorts and dedupes the
-// effective path set again internally, so the exact order produced here is
-// not load-bearing.
-func unionPaths(a, b []string) []string {
-	if len(b) == 0 {
-		return a
-	}
-	seen := make(map[string]bool, len(a))
-	for _, p := range a {
-		seen[p] = true
-	}
-	out := append([]string(nil), a...)
-	for _, p := range b {
-		if !seen[p] {
-			seen[p] = true
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// schemaHasPath reports whether dotted names an attribute or nested block
-// reachable from block, mirroring internal/sensitive's own schema walk
-// (unexported there). It exists so a state-recorded sensitive path from an
-// older provider schema — an attribute the provider has since dropped or
-// renamed — can be pruned from the union above instead of being handed to
-// sensitive.Resolve, which rejects unknown paths and would hard-fail the
-// whole plan over a path that can no longer hold a value anyway.
-func schemaHasPath(block *provider.SchemaBlock, dotted string) bool {
-	return schemaBlockHasPath(block, strings.Split(dotted, "."))
-}
-
-func schemaBlockHasPath(block *provider.SchemaBlock, parts []string) bool {
-	if block == nil || len(parts) == 0 {
-		return false
-	}
-	if nested, ok := block.Blocks[parts[0]]; ok && nested != nil {
-		if len(parts) == 1 {
-			return true
-		}
-		return schemaBlockHasPath(nested.Block, parts[1:])
-	}
-	attr, ok := block.Attributes[parts[0]]
-	if !ok || attr == nil {
-		return false
-	}
-	if len(parts) == 1 {
-		return true
-	}
-	return schemaTypeHasPath(attr.Type, parts[1:])
-}
-
-func schemaTypeHasPath(ty cty.Type, parts []string) bool {
-	for ty.IsListType() || ty.IsSetType() || ty.IsMapType() {
-		ty = ty.ElementType()
-	}
-	if !ty.IsObjectType() || len(parts) == 0 || !ty.HasAttribute(parts[0]) {
-		return false
-	}
-	if len(parts) == 1 {
-		return true
-	}
-	return schemaTypeHasPath(ty.AttributeType(parts[0]), parts[1:])
-}
-
-// nullOutUnknowns is the research-digest workaround for ctyjson.Marshal
-// rejecting unknown values: replace every unknown with a typed null and
-// record its dotted path for the plan's unknown_after list. Paths are
-// stringified inside the callback, so no cty.Path.Copy is needed (the
-// backing array is only reused after the callback returns).
-func nullOutUnknowns(v cty.Value) (cty.Value, []string, error) {
-	var paths []string
-	out, err := cty.Transform(v, func(p cty.Path, val cty.Value) (cty.Value, error) {
-		if !val.IsKnown() {
-			paths = append(paths, PathString(p))
-			return cty.NullVal(val.Type()), nil
-		}
-		return val, nil
-	})
-	if err != nil {
-		return cty.NilVal, nil, err
-	}
-	sort.Strings(paths)
-	return out, paths, nil
-}
-
 // PathString is retained for callers outside plan; implementation lives in the leaf package.
 func PathString(path cty.Path) string { return sensitive.PathString(path) }
 
@@ -543,6 +483,32 @@ func newDrift(address string, before, after json.RawMessage) (*Drift, error) {
 		Before:  append(json.RawMessage(nil), before...),
 		After:   append(json.RawMessage(nil), after...),
 		Paths:   paths,
+	}, nil
+}
+
+func newTypedDrift(address string, before, after json.RawMessage, prior, refreshed cty.Value, spec *sensitive.Spec) (*Drift, error) {
+	maskedPrior, err := spec.Mask(prior)
+	if err != nil {
+		return nil, fmt.Errorf("mask recorded value: %w", err)
+	}
+	maskedRefreshed, err := spec.Mask(refreshed)
+	if err != nil {
+		return nil, fmt.Errorf("mask refreshed value: %w", err)
+	}
+	if maskedPrior.RawEquals(maskedRefreshed) {
+		return nil, nil
+	}
+	drift, err := newDrift(address, before, after)
+	if err != nil || drift != nil {
+		return drift, err
+	}
+	// Sensitive set membership can change while both review projections remain
+	// identical. Preserve the truthful drift event without exposing the hidden
+	// member difference.
+	return &Drift{
+		Address: address,
+		Before:  append(json.RawMessage(nil), before...),
+		After:   append(json.RawMessage(nil), after...),
 	}, nil
 }
 

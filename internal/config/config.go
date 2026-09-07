@@ -116,7 +116,9 @@ func Load(dir string) (*Config, diag.Diagnostics) {
 		}
 
 		var doc fileDoc
-		if err := json.Unmarshal(rawBytes, &doc); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(rawBytes))
+		decoder.UseNumber()
+		if err := decoder.Decode(&doc); err != nil {
 			ds = append(ds, diag.Errorf("", "cannot decode config file", fmt.Sprintf("%s: %s", base, err)))
 			continue
 		}

@@ -2,6 +2,7 @@ package state
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,10 +13,20 @@ import (
 	"testing"
 
 	"github.com/gofrs/flock"
+	"github.com/tchori-labs/tchori/internal/privateblob"
+	"github.com/tchori-labs/tchori/internal/provider"
+	"github.com/tchori-labs/tchori/internal/sensitive"
+	"github.com/zclconf/go-cty/cty"
 )
 
-// TestLoadMissing verifies Load returns an empty, well-formed state when
-// no state file exists yet: FormatVersion "1.0", Serial 0, empty Resources.
+func TestMain(m *testing.M) {
+	if err := os.Setenv("TCHORI_ARTIFACT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{99}, 32))); err != nil {
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
+
+// TestLoadMissing verifies Load returns an empty, well-formed format 1.3 state.
 func TestLoadMissing(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
@@ -24,8 +35,8 @@ func TestLoadMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(%q) = %v, want nil error", path, err)
 	}
-	if s.FormatVersion != "1.0" {
-		t.Fatalf("FormatVersion = %q, want %q", s.FormatVersion, "1.0")
+	if s.FormatVersion != "1.3" {
+		t.Fatalf("FormatVersion = %q, want %q", s.FormatVersion, "1.3")
 	}
 	if s.Serial != 0 {
 		t.Fatalf("Serial = %d, want 0", s.Serial)
@@ -35,6 +46,21 @@ func TestLoadMissing(t *testing.T) {
 	}
 	if len(s.Resources) != 0 {
 		t.Fatalf("len(Resources) = %d, want 0", len(s.Resources))
+	}
+}
+
+func TestLoadRejectsNullResource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	data := []byte(`{"format_version":"1.0","serial":1,"resources":{"thing.demo":null}}`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("null resource entry must be rejected before CLI or MCP dereferences it")
+	}
+	after, err := os.ReadFile(path) //nolint:gosec // G304: test-owned state artifact in t.TempDir
+	if err != nil || !bytes.Equal(data, after) {
+		t.Fatal("loading invalid state must not change it")
 	}
 }
 
@@ -69,14 +95,17 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load after first Save = %v", err)
 	}
-	if reloaded.FormatVersion != "1.0" {
-		t.Fatalf("Load after first Save: FormatVersion = %q, want %q", reloaded.FormatVersion, "1.0")
+	if reloaded.FormatVersion != "1.3" {
+		t.Fatalf("Load after first Save: FormatVersion = %q, want %q", reloaded.FormatVersion, "1.3")
 	}
 	if reloaded.Serial != 1 {
 		t.Fatalf("Load after first Save: Serial = %d, want 1", reloaded.Serial)
 	}
 	if len(reloaded.Resources) != 1 {
 		t.Fatalf("Load after first Save: len(Resources) = %d, want 1", len(reloaded.Resources))
+	}
+	if got := reloaded.Resources["null_resource.demo"].SensitiveRecoveryVersion; got != sensitive.RecoveryVersion {
+		t.Fatalf("current resource generation = %d, want %d", got, sensitive.RecoveryVersion)
 	}
 
 	if err := reloaded.Save(path); err != nil {
@@ -143,7 +172,6 @@ func TestSaveDeterministicAcrossInsertionOrder(t *testing.T) {
 			Type:       "bbb_thing",
 			Provider:   "bbb",
 			Attributes: json.RawMessage(`{"name":"beta"}`),
-			Private:    []byte("secret"),
 		},
 		"ccc_thing.gamma": {
 			Type:       "ccc_thing",
@@ -239,6 +267,7 @@ func TestSaveWritesBackupOnSecondSave(t *testing.T) {
 // TestSaveRetightensPermissiveBackup verifies Save overwrites stale backup
 // content and forces a pre-existing permissive backup back to mode 0600.
 func TestSaveRetightensPermissiveBackup(t *testing.T) {
+	setStateArtifactKey(t, 20)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
 	backupPath := path + ".backup"
@@ -248,10 +277,11 @@ func TestSaveRetightensPermissiveBackup(t *testing.T) {
 		t.Fatalf("Load(missing) = %v", err)
 	}
 	s.Resources["thing.example"] = &ResourceState{
-		Type:       "thing",
-		Provider:   "test",
-		Attributes: json.RawMessage(`{"value":"before"}`),
-		Private:    []byte("sensitive state"),
+		Type:           "thing",
+		Provider:       "test",
+		ProviderSource: "example.test/test",
+		Attributes:     json.RawMessage(`{"value":"before"}`),
+		Private:        []byte("sensitive state"),
 	}
 	if err := s.Save(path); err != nil {
 		t.Fatalf("Save #1 = %v", err)
@@ -373,7 +403,12 @@ func TestSaveTempSyncFailure(t *testing.T) {
 
 	s.Resources["thing.new"] = &ResourceState{Type: "thing", Provider: "test", Attributes: json.RawMessage(`{}`)}
 	syncFailure := errors.New("injected temp fsync failure")
-	fsyncFile = func(*os.File) error { return syncFailure }
+	fsyncFile = func(f *os.File) error {
+		if !strings.HasPrefix(filepath.Base(f.Name()), ".state-backup-") {
+			return syncFailure
+		}
+		return originalFsyncFile(f)
+	}
 	err = s.Save(path)
 	if !errors.Is(err, syncFailure) || !strings.Contains(err.Error(), "sync temp state file") {
 		t.Fatalf("Save error = %v, want actionable temp sync failure", err)
@@ -383,6 +418,60 @@ func TestSaveTempSyncFailure(t *testing.T) {
 	}
 	assertStateFileUnchanged(t, path, before)
 	assertNoTempStateFiles(t, filepath.Dir(path))
+}
+
+// TestSaveBackupTempSyncFailure verifies a failed pre-rename data barrier for
+// the recovery artifact preserves both committed files and removes staging.
+func TestSaveBackupTempSyncFailure(t *testing.T) {
+	originalFsyncFile := fsyncFile
+	defer func() { fsyncFile = originalFsyncFile }()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Resources["thing.example"] = &ResourceState{
+		Type:       "thing",
+		Provider:   "test",
+		Attributes: json.RawMessage(`{"value":"first"}`),
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatalf("first Save = %v", err)
+	}
+	s.Resources["thing.example"].Attributes = json.RawMessage(`{"value":"second"}`)
+	if err := s.Save(path); err != nil {
+		t.Fatalf("second Save = %v", err)
+	}
+	beforeState, err := os.ReadFile(path) //nolint:gosec // test-controlled path under t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeBackup, err := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled path under t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSerial := s.Serial
+
+	s.Resources["thing.example"].Attributes = json.RawMessage(`{"value":"third"}`)
+	syncFailure := errors.New("injected backup temp fsync failure")
+	fsyncFile = func(f *os.File) error {
+		if strings.HasPrefix(filepath.Base(f.Name()), ".state-backup-") {
+			return syncFailure
+		}
+		return originalFsyncFile(f)
+	}
+	err = s.Save(path)
+	if !errors.Is(err, syncFailure) || !strings.Contains(err.Error(), "sync temporary backup") {
+		t.Fatalf("Save error = %v, want actionable backup sync failure", err)
+	}
+	if s.Serial != beforeSerial {
+		t.Fatalf("Serial after backup pre-rename failure = %d, want unchanged serial %d", s.Serial, beforeSerial)
+	}
+	assertStateFileUnchanged(t, path, beforeState)
+	assertStateFileUnchanged(t, path+".backup", beforeBackup)
+	assertNoTempStateFiles(t, dir)
 }
 
 // TestSaveCloseFailure verifies a failed close after fsync is surfaced and the
@@ -764,9 +853,8 @@ func TestLoadRejectsUnsupportedFormatVersion(t *testing.T) {
 }
 
 // TestLoadRejectsMissingFormatVersion verifies an existing state.json with
-// no format_version field at all is also rejected — this is a state file
-// tchori did not write (Save always stamps "1.0"), so Load should not treat
-// it as compatible just because a fresh (nonexistent) state file is fine.
+// no format_version field at all is also rejected because Save always stamps
+// the current format version.
 func TestLoadRejectsMissingFormatVersion(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "state.json")
@@ -1149,6 +1237,46 @@ func TestSaveSanitizesSensitiveStateAndBackup(t *testing.T) {
 	}
 }
 
+func TestSavePreservesLiveMapElementsWhileRedactingSensitiveLeaves(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"secret.map": {
+			Type:       "secret",
+			Provider:   "test",
+			Attributes: json.RawMessage(`{"credentials":{"token":{"token":"synthetic-private-value","user":"alice"}}}`),
+		},
+	}}
+	elementType := cty.Object(map[string]cty.Type{"token": cty.String, "user": cty.String})
+	resourceType := cty.Object(map[string]cty.Type{"credentials": cty.Map(elementType)})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"credentials": {
+			Type: cty.Map(elementType),
+			NestedType: map[string]*provider.Attr{
+				"token": {Type: cty.String, Sensitive: true},
+				"user":  {Type: cty.String},
+			},
+		},
+	}}
+	spec, ds := sensitive.Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	s.SetSensitiveResolver(func(string, *ResourceState) (Resolution, bool) {
+		return Resolution{Paths: spec.Paths(), SanitizeAttributes: spec.Sanitizer(resourceType)}, true
+	})
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	var attributes map[string]map[string]map[string]any
+	if err := json.Unmarshal(s.Resources["secret.map"].Attributes, &attributes); err != nil {
+		t.Fatal(err)
+	}
+	element, ok := attributes["credentials"]["token"]
+	if !ok || element["user"] != "alice" || element["token"] != nil {
+		t.Fatalf("map element structure was not preserved: %#v", attributes)
+	}
+}
+
 func TestSaveSanitizesBackupFromEffectiveHintWhenValueNowNull(t *testing.T) {
 	const sentinel = "tchori-e2e-super-secret-value"
 	path := filepath.Join(t.TempDir(), "state.json")
@@ -1171,7 +1299,8 @@ func TestSaveSanitizesBackupFromEffectiveHintWhenValueNowNull(t *testing.T) {
 	}
 }
 
-func TestSavePreservesLiteralAndCurrentResolutionClearsRemovedPath(t *testing.T) {
+func TestSavePreservesLiteralAndRecordedSensitivity(t *testing.T) {
+	setStateArtifactKey(t, 35)
 	path := filepath.Join(t.TempDir(), "state.json")
 	initial := `{"format_version":"1.0","serial":0,"resources":{` +
 		`"secret.literal":{"type":"secret","provider":"test","attributes":{"token":"literal-token-ok"},"sensitive_paths":["token"]},` +
@@ -1184,28 +1313,61 @@ func TestSavePreservesLiteralAndCurrentResolutionClearsRemovedPath(t *testing.T)
 		t.Fatal(err)
 	}
 	s.Resources["secret.removed"].Attributes = json.RawMessage(`{"note":"visible-again"}`)
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"token": {Type: cty.String, Sensitive: true},
+	}}
+	tokenType := cty.Object(map[string]cty.Type{"token": cty.String})
+	spec, ds := sensitive.Resolve(block, nil, map[string]any{"token": "literal-token-ok"}) //nolint:gosec // synthetic sensitivity fixture
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	backupSpec, ds := sensitive.Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	noteType := cty.Object(map[string]cty.Type{"note": cty.String})
+	noteBlock := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"note": {Type: cty.String, Sensitive: true},
+	}}
+	noteSpec, ds := sensitive.Resolve(noteBlock, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
 	s.SetSensitiveResolver(func(addr string, _ *ResourceState) (Resolution, bool) {
 		if addr == "secret.literal" {
-			return Resolution{Paths: []string{"token"}, ExemptInstances: []string{"token"}}, true
+			return Resolution{
+				Paths:              spec.Paths(),
+				ProviderSource:     "example.test/test",
+				SanitizeAttributes: spec.Sanitizer(tokenType),
+				SanitizeBackup:     backupSpec.Sanitizer(tokenType),
+			}, true
 		}
-		return Resolution{}, true
+		return Resolution{
+			ProviderSource:     "example.test/test",
+			Paths:              noteSpec.Paths(),
+			SanitizeAttributes: noteSpec.Sanitizer(noteType),
+			SanitizeBackup:     noteSpec.Sanitizer(noteType),
+		}, true
 	})
 	if err := s.Save(path); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(path) //nolint:gosec // test-controlled state path under t.TempDir()
-	if !bytes.Contains(b, []byte("literal-token-ok")) || !bytes.Contains(b, []byte("visible-again")) {
-		t.Fatalf("live state clobbered: %s", b)
+	if !bytes.Contains(b, []byte("literal-token-ok")) || bytes.Contains(b, []byte("visible-again")) {
+		t.Fatalf("save must preserve literal exemptions without forgetting recorded sensitivity")
 	}
 	rs := s.Resources["secret.removed"]
-	if len(rs.SensitivePaths) != 0 || len(rs.Redacted) != 0 || !rs.SensitiveScanned {
-		t.Fatalf("stale metadata = %#v", rs)
+	if len(rs.SensitivePaths) != 1 || rs.SensitivePaths[0] != "note" || !rs.SensitiveScanned {
+		t.Fatal("save forgot the previously sensitive path")
 	}
 }
 
 func TestSaveResolverOutcomes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	s := &State{Resources: map[string]*ResourceState{"known": {Attributes: json.RawMessage(`{}`)}, "orphan": {Attributes: json.RawMessage(`{}`)}}}
+	s := &State{Resources: map[string]*ResourceState{
+		"known":  {Type: "thing", Provider: "test", Attributes: json.RawMessage(`{}`)},
+		"orphan": {Type: "thing", Provider: "test", Attributes: json.RawMessage(`{}`)},
+	}}
 	s.SetSensitiveResolver(func(addr string, _ *ResourceState) (Resolution, bool) {
 		if addr == "known" {
 			return Resolution{}, true
@@ -1223,5 +1385,837 @@ func TestSaveResolverOutcomes(t *testing.T) {
 	}
 	if s.Resources["orphan"].SensitiveScanned {
 		t.Fatal("unresolved entry marked scanned")
+	}
+}
+
+func TestSaveRejectsProviderSourceDriftBeforeMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"test_thing.example": {
+			Type:           "test_thing",
+			Provider:       "test",
+			ProviderSource: "old.example/test",
+			Attributes:     json.RawMessage(`{"id":"example"}`),
+		},
+	}}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	beforeState, err := os.ReadFile(path) //nolint:gosec // test-controlled state path
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeBackup, err := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled backup path
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetSensitiveResolver(func(string, *ResourceState) (Resolution, bool) {
+		return Resolution{ProviderSource: "new.example/test"}, true
+	})
+	err = s.Save(path)
+	if err == nil || !strings.Contains(err.Error(), "provider source") {
+		t.Fatalf("Save error = %v, want provider source mismatch", err)
+	}
+	afterState, _ := os.ReadFile(path)              //nolint:gosec // test-controlled state path
+	afterBackup, _ := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled backup path
+	if !bytes.Equal(beforeState, afterState) || !bytes.Equal(beforeBackup, afterBackup) {
+		t.Fatal("provider source drift changed state or backup")
+	}
+	if got := s.Resources["test_thing.example"].ProviderSource; got != "old.example/test" {
+		t.Fatalf("in-memory provider source = %q, want old binding", got)
+	}
+}
+
+func setStateArtifactKey(t *testing.T, seed byte) {
+	t.Helper()
+	t.Setenv("TCHORI_ARTIFACT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{seed}, 32)))
+}
+
+func TestSaveEncryptsPrivateAndLoadRestoresExactBytes(t *testing.T) {
+	setStateArtifactKey(t, 21)
+	const sentinel = "opaque-provider-private-sentinel"
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"test_thing.example": {
+			Type:           "test_thing",
+			Provider:       "test",
+			ProviderSource: "example.test/test",
+			Attributes:     json.RawMessage(`{"id":"example"}`),
+			Private:        []byte(sentinel),
+		},
+	}}
+	if err := s.Save(path); err != nil {
+		t.Fatalf("Save = %v", err)
+	}
+	data, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(sentinel)) ||
+		bytes.Contains(data, []byte(base64.StdEncoding.EncodeToString([]byte(sentinel)))) {
+		t.Fatal("state.json exposed provider private bytes")
+	}
+	if !bytes.Contains(data, []byte(`"format_version": "1.3"`)) ||
+		!bytes.Contains(data, []byte(`"private": {`)) {
+		t.Fatalf("state.json does not contain a 1.3 encrypted private envelope: %s", data)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load = %v", err)
+	}
+	if !bytes.Equal(loaded.Resources["test_thing.example"].Private, []byte(sentinel)) {
+		t.Fatal("Load did not restore exact provider private bytes")
+	}
+}
+
+func TestResourceStateJSONNeverExposesPrivate(t *testing.T) {
+	const sentinel = "standalone-private-sentinel"
+	data, err := json.Marshal(&ResourceState{
+		Type:       "test_thing",
+		Provider:   "test",
+		Attributes: json.RawMessage(`{}`),
+		Private:    []byte(sentinel),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(sentinel)) ||
+		bytes.Contains(data, []byte(base64.StdEncoding.EncodeToString([]byte(sentinel)))) ||
+		bytes.Contains(data, []byte(`"private"`)) {
+		t.Fatalf("standalone ResourceState JSON exposed private data: %s", data)
+	}
+}
+
+func TestLoadEncryptedPrivateFailsClosed(t *testing.T) {
+	setStateArtifactKey(t, 22)
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"test_thing.alpha": {Type: "test_thing", Provider: "test", ProviderSource: "example.test/test", Attributes: json.RawMessage(`{}`), Private: []byte("alpha-private")},
+		"test_thing.beta":  {Type: "test_thing", Provider: "test", ProviderSource: "example.test/test", Attributes: json.RawMessage(`{}`), Private: []byte("beta-private")},
+	}}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("wrong key", func(t *testing.T) {
+		t.Setenv("TCHORI_ARTIFACT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{23}, 32)))
+		if _, err := Load(path); err == nil {
+			t.Fatal("Load accepted encrypted private data under the wrong key")
+		} else if strings.Contains(err.Error(), "alpha-private") || strings.Contains(err.Error(), "beta-private") {
+			t.Fatal("wrong-key error exposed private content")
+		}
+	})
+
+	t.Run("cross-resource replay", func(t *testing.T) {
+		setStateArtifactKey(t, 22)
+		data, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(data, &doc); err != nil {
+			t.Fatal(err)
+		}
+		resources := doc["resources"].(map[string]any)
+		alpha := resources["test_thing.alpha"].(map[string]any)
+		beta := resources["test_thing.beta"].(map[string]any)
+		beta["private"] = alpha["private"]
+		replayed, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		replayPath := filepath.Join(t.TempDir(), "state.json")
+		if err := os.WriteFile(replayPath, replayed, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(replayPath); err == nil {
+			t.Fatal("Load accepted a private envelope replayed at another address")
+		}
+	})
+
+	t.Run("provider source tamper", func(t *testing.T) {
+		setStateArtifactKey(t, 22)
+		data, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(data, &doc); err != nil {
+			t.Fatal(err)
+		}
+		resources := doc["resources"].(map[string]any)
+		resources["test_thing.alpha"].(map[string]any)["provider_source"] = "attacker.example/test"
+		tampered, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tamperedPath := filepath.Join(t.TempDir(), "state.json")
+		if err := os.WriteFile(tamperedPath, tampered, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(tamperedPath); err == nil {
+			t.Fatal("Load accepted private state under a different canonical provider source")
+		}
+	})
+
+	t.Run("1.1 plaintext", func(t *testing.T) {
+		plaintext := `{"format_version":"1.1","serial":1,"resources":{"test_thing.alpha":{"type":"test_thing","provider":"test","attributes":{},"private":"YWxwaGEtcHJpdmF0ZQ=="}}}`
+		plainPath := filepath.Join(t.TempDir(), "state.json")
+		if err := os.WriteFile(plainPath, []byte(plaintext), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(plainPath); err == nil {
+			t.Fatal("Load accepted plaintext/base64 private data in format 1.1")
+		}
+	})
+}
+
+func TestLoadUnbound11PrivateForExplicitMigration(t *testing.T) {
+	setStateArtifactKey(t, 26)
+	const sentinel = "pre-source-binding-state-private"
+	sealed, err := privateblob.Seal([]byte(sentinel), "state\x00test_thing.example\x00test\x00test_thing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := fmt.Sprintf(
+		`{"format_version":"1.1","serial":2,"resources":{"test_thing.example":{"type":"test_thing","provider":"test","attributes":{},"private":%s}}}`,
+		sealed,
+	)
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load pre-source-binding 1.1 state: %v", err)
+	}
+	if got.Resources["test_thing.example"].ProviderSource != "" ||
+		!bytes.Equal(got.Resources["test_thing.example"].Private, []byte(sentinel)) {
+		t.Fatal("pre-source-binding 1.1 state did not remain readable for explicit migration")
+	}
+}
+
+func TestSaveMigratesLegacyPrivateInStateAndBackup(t *testing.T) {
+	setStateArtifactKey(t, 24)
+	const sentinel = "legacy-private-sentinel"
+	path := filepath.Join(t.TempDir(), "state.json")
+	legacy := fmt.Sprintf(
+		`{"format_version":"1.0","serial":4,"resources":{"test_thing.example":{"type":"test_thing","provider":"test","attributes":{},"private":%q}}}`,
+		base64.StdEncoding.EncodeToString([]byte(sentinel)),
+	)
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load legacy state = %v", err)
+	}
+	if !bytes.Equal(s.Resources["test_thing.example"].Private, []byte(sentinel)) {
+		t.Fatal("legacy load lost private bytes")
+	}
+	s.Resources["test_thing.example"].ProviderSource = "example.test/test"
+	s.SetSensitiveResolver(func(string, *ResourceState) (Resolution, bool) {
+		return Resolution{ProviderSource: "example.test/test"}, true
+	})
+	if err := s.Save(path); err != nil {
+		t.Fatalf("Save migration after explicit source binding = %v", err)
+	}
+	for _, artifact := range []string{path, path + ".backup"} {
+		data, err := os.ReadFile(artifact) //nolint:gosec // test-controlled path
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte(sentinel)) ||
+			bytes.Contains(data, []byte(base64.StdEncoding.EncodeToString([]byte(sentinel)))) ||
+			!bytes.Contains(data, []byte(`"format_version": "1.3"`)) {
+			t.Fatalf("migration left an unsafe artifact at %s: %s", artifact, data)
+		}
+		loaded, err := Load(artifact)
+		if err != nil {
+			t.Fatalf("Load(%s) = %v", artifact, err)
+		}
+		if !bytes.Equal(loaded.Resources["test_thing.example"].Private, []byte(sentinel)) {
+			t.Fatalf("migration lost private bytes in %s", artifact)
+		}
+	}
+}
+
+func TestCurrentProjectionContractRequiresArtifactKey(t *testing.T) {
+	t.Setenv("TCHORI_ARTIFACT_KEY", "")
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"test_thing.example": {
+			Type: "test_thing", Provider: "test", ProviderSource: "example.test/test",
+			Attributes: json.RawMessage(`{"id":"public"}`),
+		},
+	}}
+	err := s.Save(path)
+	if err == nil || !strings.Contains(err.Error(), "TCHORI_ARTIFACT_KEY") {
+		t.Fatalf("Save error = %v, want mandatory current projection contract key error", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("key failure wrote current state: %v", statErr)
+	}
+}
+
+func TestSaveKeyFailureLeavesStateAndBackupUnchanged(t *testing.T) {
+	setStateArtifactKey(t, 25)
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"test_thing.example": {Type: "test_thing", Provider: "test", ProviderSource: "example.test/test", Attributes: json.RawMessage(`{}`), Private: []byte("private")},
+	}}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	beforeState, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeBackup, err := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSerial := s.Serial
+	if err := os.Unsetenv("TCHORI_ARTIFACT_KEY"); err != nil {
+		t.Fatal(err)
+	}
+	s.Resources["test_thing.example"].Private = []byte("changed-private")
+	if err := s.Save(path); err == nil {
+		t.Fatal("Save accepted private bytes without an artifact key")
+	}
+	afterState, _ := os.ReadFile(path)              //nolint:gosec // test-controlled path
+	afterBackup, _ := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled path
+	if !bytes.Equal(beforeState, afterState) || !bytes.Equal(beforeBackup, afterBackup) {
+		t.Fatal("key failure changed the state or backup artifact")
+	}
+	if s.Serial != beforeSerial {
+		t.Fatalf("key failure advanced serial from %d to %d", beforeSerial, s.Serial)
+	}
+}
+
+func TestSaveMarshalFailureLeavesStateAndBackupUnchanged(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"test_thing.example": {Type: "test_thing", Provider: "test", Attributes: json.RawMessage(`{}`)},
+	}}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	beforeState, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeBackup, err := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled path
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeSerial := s.Serial
+	s.Resources["test_thing.example"].Attributes = json.RawMessage(`{`)
+	if err := s.Save(path); err == nil {
+		t.Fatal("Save accepted malformed resource JSON")
+	}
+	afterState, _ := os.ReadFile(path)              //nolint:gosec // test-controlled path
+	afterBackup, _ := os.ReadFile(path + ".backup") //nolint:gosec // test-controlled path
+	if !bytes.Equal(beforeState, afterState) || !bytes.Equal(beforeBackup, afterBackup) {
+		t.Fatal("marshal failure changed the state or backup artifact")
+	}
+	if s.Serial != beforeSerial {
+		t.Fatalf("marshal failure advanced serial from %d to %d", beforeSerial, s.Serial)
+	}
+}
+
+func TestSaveHonorsLegacyRedactedHint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	document := `{"format_version":"1.0","serial":1,"resources":{"thing.old":{"type":"thing","provider":"test","attributes":{"secret":"legacy-secret","id":"public"},"redacted":["secret"]}}}`
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	for _, artifact := range []string{path, path + ".backup"} {
+		data, err := os.ReadFile(artifact) //nolint:gosec // test-controlled artifact
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte("legacy-secret")) || !bytes.Contains(data, []byte("public")) {
+			t.Fatal("Save did not preserve public data while masking a legacy redacted hint")
+		}
+	}
+}
+
+func TestSavePreservesLegacyFormatWhenProjectionCannotBeRestored(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	document := `{"format_version":"1.0","serial":1,"resources":{"thing.old":{"type":"thing","provider":"test","attributes":{"secret":"legacy-secret"},"redacted":["secret"]}}}`
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if s.FormatVersion != recoveryFormatVersion {
+		t.Fatalf("FormatVersion = %q, want truthful legacy format %q", s.FormatVersion, recoveryFormatVersion)
+	}
+	data, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte(`"format_version": "1.2"`)) ||
+		!bytes.Contains(data, []byte(`"sensitive_recovery_version": 0`)) {
+		t.Fatalf("unrestored legacy projection was mislabeled as current: %s", data)
+	}
+}
+
+func TestSaveKeepsUnresolvedPathFreeLegacyProjectionAtGenerationZero(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	document := `{"format_version":"1.0","serial":1,"resources":{"thing.old":{"type":"thing","provider":"test","attributes":{"id":"public"}}}}`
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if s.FormatVersion != recoveryFormatVersion ||
+		s.Resources["thing.old"].SensitiveRecoveryVersion != 0 {
+		t.Fatalf("unresolved path-free legacy state was mislabeled as current: format=%q generation=%d",
+			s.FormatVersion, s.Resources["thing.old"].SensitiveRecoveryVersion)
+	}
+}
+
+func TestSaveRefusesIncompleteLegacyProjectionBeforeWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	document := []byte(`{"format_version":"1.0","serial":1,"resources":{"thing.old":{"type":"thing","provider":"test","attributes":{"secret":"legacy-secret"},"redacted":["secret"]}}}`)
+	if err := os.WriteFile(path, document, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Incomplete = &IncompleteApply{Remaining: []string{"thing.old"}}
+	if err := s.Save(path); err == nil {
+		t.Fatal("Save accepted an incomplete marker on an unrestored legacy projection")
+	}
+	after, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, document) {
+		t.Fatalf("refused apply preflight changed state: %s", after)
+	}
+	if _, err := os.Stat(path + ".backup"); !os.IsNotExist(err) {
+		t.Fatalf("refused apply preflight created backup: %v", err)
+	}
+}
+
+func TestSensitiveSetRecoveryIsEncryptedBoundAndBackedUp(t *testing.T) {
+	setStateArtifactKey(t, 31)
+	elementType := cty.Object(map[string]cty.Type{"label": cty.String, "token": cty.String})
+	resourceType := cty.Object(map[string]cty.Type{"members": cty.Set(elementType)})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"members": {
+			Type: cty.Set(elementType),
+			NestedType: map[string]*provider.Attr{
+				"label": {Type: cty.String},
+				"token": {Type: cty.String, Sensitive: true},
+			},
+		},
+	}}
+	spec, ds := sensitive.Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	element := func(token string) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{"label": cty.StringVal("same"), "token": cty.StringVal(token)})
+	}
+	original := cty.ObjectVal(map[string]cty.Value{
+		"members": cty.SetVal([]cty.Value{element("set-secret-one"), element("set-secret-two")}),
+	})
+	public, redacted, recovery, err := spec.Project(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"secret.set": {
+			Type: "secret", Provider: "test", ProviderSource: "example.test/test",
+			Attributes: public, Private: []byte("provider-private"), SensitiveSetRecovery: recovery,
+			Redacted: redacted, SensitivePaths: spec.Paths(), SensitiveScanned: true,
+		},
+	}}
+	s.SetSensitiveResolver(func(string, *ResourceState) (Resolution, bool) {
+		return Resolution{Paths: spec.Paths(), ProviderSource: "example.test/test", SanitizeAttributes: spec.Sanitizer(resourceType)}, true
+	})
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, artifact := range []string{path, path + ".backup"} {
+		data, err := os.ReadFile(artifact) //nolint:gosec // test-controlled artifact
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{"set-secret-one", "set-secret-two"} {
+			if bytes.Contains(data, []byte(secret)) || bytes.Contains(data, []byte(base64.StdEncoding.EncodeToString([]byte(secret)))) {
+				t.Fatalf("%s exposed sensitive set member %q", artifact, secret)
+			}
+		}
+		if !bytes.Contains(data, []byte(`"sensitive_set_recovery"`)) ||
+			!bytes.Contains(data, []byte(`"sensitive_recovery_version"`)) {
+			t.Fatalf("%s omitted sensitive recovery envelope or generation marker", artifact)
+		}
+		loaded, err := Load(artifact)
+		if err != nil {
+			t.Fatalf("Load(%s): %v", artifact, err)
+		}
+		rs := loaded.Resources["secret.set"]
+		if rs.SensitiveRecoveryVersion != sensitive.RecoveryVersion {
+			t.Fatalf("Load(%s) recovery version = %d", artifact, rs.SensitiveRecoveryVersion)
+		}
+		restored, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, resourceType, rs.SensitivePaths, rs.SensitiveRecoveryVersion)
+		if err != nil {
+			t.Fatalf("Restore(%s): %v", artifact, err)
+		}
+		if !restored.RawEquals(original) {
+			t.Fatalf("%s lost sensitive set identity", artifact)
+		}
+	}
+
+	data, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name   string
+		key    string
+		mutate func(map[string]any)
+	}{
+		{"address", "", func(doc map[string]any) {
+			resources := doc["resources"].(map[string]any)
+			resources["secret.renamed"] = resources["secret.set"]
+			delete(resources, "secret.set")
+		}},
+		{"type", "", func(doc map[string]any) {
+			doc["resources"].(map[string]any)["secret.set"].(map[string]any)["type"] = "other"
+		}},
+		{"source", "", func(doc map[string]any) {
+			doc["resources"].(map[string]any)["secret.set"].(map[string]any)["provider_source"] = "example.test/other"
+		}},
+		{"purpose", "", func(doc map[string]any) {
+			resource := doc["resources"].(map[string]any)["secret.set"].(map[string]any)
+			resource["private"], resource["sensitive_set_recovery"] = resource["sensitive_set_recovery"], resource["private"]
+		}},
+		{"generation", "", func(doc map[string]any) {
+			doc["resources"].(map[string]any)["secret.set"].(map[string]any)["sensitive_recovery_version"] = 0
+		}},
+		{"missing key", "missing", func(map[string]any) {}},
+		{"changed key", "changed", func(map[string]any) {}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setStateArtifactKey(t, 31)
+			var doc map[string]any
+			if err := json.Unmarshal(data, &doc); err != nil {
+				t.Fatal(err)
+			}
+			tc.mutate(doc)
+			tampered, err := json.Marshal(doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tamperedPath := filepath.Join(t.TempDir(), "state.json")
+			if err := os.WriteFile(tamperedPath, tampered, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			switch tc.key {
+			case "missing":
+				t.Setenv("TCHORI_ARTIFACT_KEY", "")
+			case "changed":
+				setStateArtifactKey(t, 32)
+			}
+			if _, err := Load(tamperedPath); err == nil {
+				t.Fatal("Load accepted recovery with invalid key or authenticated identity")
+			}
+		})
+	}
+
+	var stripped map[string]any
+	if err := json.Unmarshal(data, &stripped); err != nil {
+		t.Fatal(err)
+	}
+	delete(stripped["resources"].(map[string]any)["secret.set"].(map[string]any), "sensitive_set_recovery")
+	strippedData, err := json.Marshal(stripped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	strippedPath := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(strippedPath, strippedData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(strippedPath); err == nil {
+		t.Fatal("Load accepted a current resource without its authenticated projection contract")
+	}
+}
+
+func TestCurrentProjectionContractRestoresAuthenticatedMetadata(t *testing.T) {
+	setStateArtifactKey(t, 35)
+	resourceType := cty.Object(map[string]cty.Type{"secret": cty.String, "public": cty.String})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"secret": {Type: cty.String, Sensitive: true},
+		"public": {Type: cty.String},
+	}}
+	spec, ds := sensitive.Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	public, redacted, contract, err := spec.Project(cty.ObjectVal(map[string]cty.Value{
+		"secret": cty.StringVal("contract-private"),
+		"public": cty.StringVal("visible"),
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"secret.scalar": {
+			Type: "secret", Provider: "test", ProviderSource: "example.test/test",
+			Attributes: public, SensitiveSetRecovery: contract,
+			SensitiveRecoveryVersion: sensitive.RecoveryVersion,
+			Redacted:                 redacted, SensitivePaths: spec.Paths(), SensitiveScanned: true,
+		},
+	}}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	resource := document["resources"].(map[string]any)["secret.scalar"].(map[string]any)
+	delete(resource, "sensitive_paths")
+	delete(resource, "redacted")
+	tampered, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := loaded.Resources["secret.scalar"]
+	if !equalStrings(rs.SensitivePaths, spec.Paths()) ||
+		!equalStrings(rs.Redacted, redacted) {
+		t.Fatalf("authenticated metadata was not restored: paths=%v redacted=%v", rs.SensitivePaths, rs.Redacted)
+	}
+	if _, err := spec.RestoreProjected(
+		rs.Attributes, rs.SensitiveSetRecovery, resourceType,
+		rs.SensitivePaths, rs.SensitiveRecoveryVersion,
+	); err != nil {
+		t.Fatalf("restored authenticated contract is unusable: %v", err)
+	}
+}
+
+func TestCurrentMapRecoveryGenerationCannotBeStripped(t *testing.T) {
+	setStateArtifactKey(t, 34)
+	mapType := cty.Map(cty.Set(cty.String))
+	resourceType := cty.Object(map[string]cty.Type{"groups": mapType})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"groups": {Type: mapType},
+	}}
+	spec, ds := sensitive.Resolve(block, []string{"groups"}, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	original := cty.ObjectVal(map[string]cty.Value{
+		"groups": cty.MapVal(map[string]cty.Value{
+			"private-key": cty.SetVal([]cty.Value{cty.StringVal("member")}),
+		}),
+	})
+	public, redacted, recovery, err := spec.Project(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"secret.map": {
+			Type: "secret", Provider: "test", ProviderSource: "example.test/test",
+			Attributes: public, SensitiveSetRecovery: recovery,
+			SensitiveRecoveryVersion: sensitive.RecoveryVersion,
+			Redacted:                 redacted, SensitivePaths: spec.Paths(), SensitiveScanned: true,
+		},
+	}}
+	s.SetSensitiveResolver(func(string, *ResourceState) (Resolution, bool) {
+		return Resolution{Paths: spec.Paths(), ProviderSource: "example.test/test", SanitizeAttributes: spec.Sanitizer(resourceType)}, true
+	})
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name          string
+		mutate        func(map[string]any)
+		wantLoadError bool
+	}{
+		{"marker removed", func(resource map[string]any) {
+			delete(resource, "sensitive_recovery_version")
+		}, true},
+		{"marker tampered", func(resource map[string]any) {
+			resource["sensitive_recovery_version"] = 0
+		}, true},
+		{"envelope removed", func(resource map[string]any) {
+			delete(resource, "sensitive_set_recovery")
+		}, true},
+		{"envelope removed and marker reset", func(resource map[string]any) {
+			delete(resource, "sensitive_set_recovery")
+			resource["sensitive_recovery_version"] = 0
+		}, true},
+		{"marker and envelope removed", func(resource map[string]any) {
+			delete(resource, "sensitive_recovery_version")
+			delete(resource, "sensitive_set_recovery")
+		}, true},
+		{"contract envelope and plaintext contract removed", func(resource map[string]any) {
+			delete(resource, "sensitive_set_recovery")
+			delete(resource, "sensitive_paths")
+			delete(resource, "redacted")
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var document map[string]any
+			if err := json.Unmarshal(data, &document); err != nil {
+				t.Fatal(err)
+			}
+			resource := document["resources"].(map[string]any)["secret.map"].(map[string]any)
+			tc.mutate(resource)
+			tampered, err := json.Marshal(document)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tamperedPath := filepath.Join(t.TempDir(), "state.json")
+			if err := os.WriteFile(tamperedPath, tampered, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := Load(tamperedPath)
+			if tc.wantLoadError {
+				if err == nil {
+					t.Fatal("Load accepted stripped or tampered current recovery metadata")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			rs := loaded.Resources["secret.map"]
+			if _, err := spec.RestoreProjected(
+				rs.Attributes, rs.SensitiveSetRecovery, resourceType,
+				rs.SensitivePaths, rs.SensitiveRecoveryVersion,
+			); err == nil {
+				t.Fatal("RestoreProjected accepted stripped current recovery")
+			}
+		})
+	}
+}
+
+func TestBackupReprojectsSensitiveSetRecoveryAfterRemovingLiteralExemptions(t *testing.T) {
+	setStateArtifactKey(t, 33)
+	elementType := cty.Object(map[string]cty.Type{"label": cty.String, "token": cty.String})
+	resourceType := cty.Object(map[string]cty.Type{
+		"members": cty.Set(elementType),
+		"note":    cty.String,
+	})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"members": {
+			Type: cty.Set(elementType),
+			NestedType: map[string]*provider.Attr{
+				"label": {Type: cty.String},
+				"token": {Type: cty.String, Sensitive: true},
+			},
+		},
+		"note": {Type: cty.String, Sensitive: true},
+	}}
+	spec, ds := sensitive.Resolve(block, nil, map[string]any{"note": "authored-public"})
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	noExempt := spec.Effective(nil)
+	member := func(token string) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{"label": cty.StringVal("same"), "token": cty.StringVal(token)})
+	}
+	original := cty.ObjectVal(map[string]cty.Value{
+		"members": cty.SetVal([]cty.Value{member("set-secret-one"), member("set-secret-two")}),
+		"note":    cty.StringVal("authored-public"),
+	})
+	public, redacted, recovery, err := spec.Project(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"secret.set": {
+			Type: "secret", Provider: "test", ProviderSource: "example.test/test",
+			Attributes: public, SensitiveSetRecovery: recovery,
+			Redacted: redacted, SensitivePaths: spec.Paths(), SensitiveScanned: true,
+		},
+	}}
+	s.SetSensitiveResolver(func(string, *ResourceState) (Resolution, bool) {
+		return Resolution{
+			Paths: spec.Paths(), ProviderSource: "example.test/test",
+			SanitizeAttributes: spec.Sanitizer(resourceType),
+			SanitizeBackup:     noExempt.Sanitizer(resourceType),
+		}, true
+	})
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := Load(path + ".backup")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := backup.Resources["secret.set"]
+	restored, err := noExempt.Restore(rs.Attributes, rs.SensitiveSetRecovery, resourceType)
+	if err != nil {
+		t.Fatalf("backup stored a mismatched projection/recovery pair: %v", err)
+	}
+	if !restored.GetAttr("members").RawEquals(original.GetAttr("members")) {
+		t.Fatal("backup lost authoritative set membership")
+	}
+	if !restored.GetAttr("note").IsNull() {
+		t.Fatal("backup retained a sensitive literal exemption")
 	}
 }

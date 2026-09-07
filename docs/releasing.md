@@ -5,11 +5,36 @@ artifacts. Preparing this workflow does not authorize a release.
 
 ## Release policy and publish gate
 
-Per [`AGENTS.md`](../AGENTS.md), no release may be tagged or published until a
+Per [`CLAUDE.md`](../CLAUDE.md), no release may be tagged or published until a
 human board decision explicitly approves it and that decision is recorded in
 the `Tchori-Labs/main` repository. Agents may prepare a release change, but they
 must not create or push the tag, dispatch the release workflow, approve its
 deployment, or publish the release.
+
+Pushing a `v*` tag automatically starts only the release workflow's
+**dry-run** job in the public `Tchori-Labs/tchori` repository. A tag push never
+starts `publish`, never creates or modifies a GitHub Release, and never exposes
+release assets. Its dry-run checks out the existing tag, validates that the tag
+is in reviewed `origin/main` history, signs the reviewable artifacts, generates
+GitHub build provenance, and uploads them for review. The jobs are disabled in
+forks and in `tchori-internal`; internally prepared changes must first be
+transferred through review to the public repository. Accepted tags are
+`v`-prefixed semantic versions whose commits belong to reviewed `origin/main`
+history.
+
+`workflow_dispatch` is the only path to `publish`. An authorized initiator
+must run it from `main`, enter the existing approved `v*` tag, select
+`mode: publish`, and do so only after the dry-run artifact and its required
+Environment review have been examined and approved. Neither dispatch mode
+creates or moves a tag. The protected `release` Environment remains a required
+gate for both dry-run and publish jobs.
+
+The ancestry check prevents an accidental release from an unreviewed commit; it
+does not authenticate the tagger or make historical workflow revisions safe.
+Anyone allowed to create or move a matching `v*` tag can trigger a dry-run, but
+that permission alone cannot publish. A human repository administrator must
+still restrict and audit the live tag-permission boundary. It is not encoded by
+this repository.
 
 The live enforcement mechanism is the GitHub Environment named `release`.
 The reviewable source of truth is
@@ -87,19 +112,58 @@ does not create or protect the Environment.
 
 ### Current application status
 
-**Applied as of 2026-09-02.** Repository admin `@VictorCano` applied the
-`release` Environment to the live repository and created its two custom
-deployment-branch policies. `scripts/verify-release-environment.sh` returned
-all PASS: the required reviewer is `@VictorCano`, `prevent_self_review` is
-`true`, and the declared policies are exactly branch `main` and tag pattern
-`v*`. The administrator handoff that led to this application is recorded in
-[issue #77](https://github.com/Tchori-Labs/tchori-internal/issues/77#issuecomment-5165580020).
-[TC-059](https://github.com/Tchori-Labs/tchori-internal/issues/66) is
-unblocked on this Environment control, but a release still also requires the
-separate TC-068 board-decision gate before any tag is created.
+**Public repository audited on 2026-09-05: PASS.** The live `release`
+Environment requires `@VictorCano`, prevents self-review, and restricts custom
+deployment policies to exactly branch `main` and tag `v*`.
+`scripts/verify-release-environment.sh` passed against `Tchori-Labs/tchori`.
+This is structural evidence, not board sign-off or deployment approval; rerun
+the verifier before publishing. It does not certify the private archive's
+Environment. Historical administrative work remains recorded in
+[internal issue #77](https://github.com/Tchori-Labs/tchori-internal/issues/77);
+the first-release decision is tracked in
+[internal issue #66](https://github.com/Tchori-Labs/tchori-internal/issues/66).
 
-Both release jobs reference this Environment, so GitHub pauses the selected
-job for required human review. The `dry-run` job
+Board approval for `v0.1.0` is recorded in
+[ADR-0012](https://github.com/Tchori-Labs/main/blob/main/decisions/0012-tchori-v0.1.0-release.md).
+It covers a reviewed promotion on public `main`, not unreviewed local changes.
+Because `@VictorCano` is the sole reviewer and self-review is forbidden, the
+decision delegates the first tag push to Tchorizo and deployment approval to
+Victor. A workflow triggered by Victor cannot also be approved by Victor;
+future releases need a distinct authorized initiator or a reviewed change to
+the reviewer policy.
+
+**Existing first-release attempt:** `v0.1.0` already resolves to public commit
+`74af4ff52ddaf0c07771865bafa60630bc5b7c6e`.
+[Run 33652904208](https://github.com/Tchori-Labs/tchori/actions/runs/33652904208)
+was observed waiting for approval; approving it would publish that old
+commit, not subsequent security fixes. Do not move or recreate the tag to
+hide this difference.
+[The existing board decision issue](https://github.com/Tchori-Labs/main/issues/163)
+records `v0.1.1` as the next release version. That choice does not authorize
+tag creation, release dispatch, deployment approval, or publication.
+
+Release-readiness also requires non-secret evidence of credential revocation
+and history remediation for
+[internal #72](https://github.com/Tchori-Labs/tchori-internal/issues/72) /
+[infra #138](https://github.com/Tchori-Labs/infra/issues/138).
+The current product writes plan documents in format `1.2` and fully reprojected
+state in format `1.3`; it reads state `1.0`, `1.1`, `1.2`, and `1.3` as
+documented in [formats.md](formats.md). Consumers such as
+[infra #150](https://github.com/Tchori-Labs/infra/issues/150) must plan the
+state migration to current generation `4`; older state formats and recovery
+generations remain migration inputs, not current write formats.
+When existing state or its backup has no canonical `provider_source`, run
+`tchori state sanitize` with the matching configuration, provider schemas, and
+artifact key before planning or applying. When an existing plan lacks complete
+resource identity, or provider routing/configuration changed, recompute the
+plan before apply; state sanitization does not rewrite a plan. Previously
+leaked values still require credential rotation and history cleanup. Local
+tests and a clean working-tree secret scan do not certify revocation,
+historical cleanup, consumer key provisioning, migration, or deployment
+approval.
+
+Both release jobs reference this Environment, so once it is correctly applied
+GitHub pauses the selected job for required human review. The `dry-run` job
 cannot create or modify a GitHub Release; the `publish` job alone receives
 job-scoped `contents: write`. No other workflow or job receives publish
 permissions.
@@ -108,28 +172,38 @@ permissions.
 
 After the board decision and normal CODEOWNERS review have landed:
 
-1. A human maintainer creates and pushes the approved `v*` tag. This triggers
-   publish mode. Do not tag from an unreviewed commit.
-2. Before publishing, or when validating a workflow change, a human maintainer
-   may use **Actions → Release → Run workflow** from `main`, enter an existing
-   approved `v*` tag, and leave `mode` at its safe `dry-run` default. The
-   workflow checks out the tag and runs GoReleaser with `--skip=publish`, while
-   retaining real keyless signing and GitHub provenance generation. It does
-   not create a tag, GitHub Release, or public release asset. Instead, it
-   uploads a 30-day Actions artifact named
+1. The board-authorized tag actor creates and pushes the approved `v*` tag.
+   This triggers **dry-run only**. For `v0.1.0`, follow ADR-0012's scoped
+   delegation above. Do not tag from an unreviewed commit.
+2. The tag-triggered dry-run checks out that existing tag and runs GoReleaser
+   with `--skip=publish`, while retaining real keyless signing and GitHub
+   provenance generation. It does not create a tag, GitHub Release, or public
+   release asset. Instead, it uploads a 30-day Actions artifact named
    `release-dry-run-<run-id>-<run-attempt>` containing the archives, SBOMs,
    checksum manifest, detached signature and certificate, and the local
    `provenance.intoto.jsonl` bundle for board review.
-3. A board-approved manual publish or retry uses the same dispatch with
-   `mode: publish`. Both manual modes require an existing tag; neither creates
-   or moves one.
-4. For every mode, `@VictorCano` reviews the pending `release` Environment
+3. When a dry-run must be repeated without another tag push, an authorized
+   initiator distinct from the required reviewer may use
+   **Actions → Release → Run workflow** from `main`, enter the same existing
+   approved `v*` tag, and leave `mode` at its safe `dry-run` default. This
+   dispatch follows the same validation and artifact path, but its workflow
+   identity is the reviewed `main` ref.
+4. Only after the dry-run artifact has been reviewed and its required
+   Environment deployment has been approved may an authorized initiator use
+   **Run workflow** from `main` with `mode: publish`. Publish checks out the
+   same existing tag; it never creates or moves one.
+5. For every mode, `@VictorCano` reviews the pending `release` Environment
    deployment against the recorded board decision and approves or rejects it.
-5. In publish mode, GoReleaser uploads the signed artifacts to a **draft**
-   GitHub Release. The workflow checks the archive, SBOM, checksum, signature,
-   and certificate outputs, then records GitHub build-provenance attestations
-   for every archive and `checksums.txt`. Only after attestation succeeds does
-   the final step make the draft public. If output validation or attestation
+   In publish mode, GoReleaser uploads the signed artifacts to a **draft**
+   GitHub Release. `scripts/verify-release-artifacts.sh` requires all six
+   platform archives, their six SPDX SBOMs, a complete checksum manifest whose
+   digests match those files. `scripts/verify-release-signature.sh` then runs
+   Cosign verification against the current workflow/ref certificate identity
+   and GitHub Actions OIDC issuer; missing, malformed, or invalid signatures
+   stop both dry-run and publish acceptance.
+   The workflow then records GitHub build-provenance attestations for every
+   archive and `checksums.txt`. Only after attestation succeeds does the
+   final step make the draft public. If output validation or attestation
    fails, the release remains a non-public draft for maintainer inspection;
    the workflow never exposes archives before their required provenance exists.
 6. A board-approved retry for the same tag safely replaces that incomplete
@@ -144,6 +218,24 @@ certificate for this exact workflow invocation; there is no private signing
 key, PAT, or other long-lived signing credential to store or rotate.
 `secrets.GITHUB_TOKEN` is GitHub's short-lived per-run token and is used only to
 create the GitHub Release.
+
+### Local preparation without publication
+
+With the pinned Go toolchain, GoReleaser v2, and Syft installed:
+
+```sh
+scripts/check.sh
+go test -count=1 -tags e2e ./e2e
+govulncheck ./...
+goreleaser check
+goreleaser release --snapshot --clean --skip=sign,before
+```
+
+The snapshot builds all six platforms and generates SBOMs and checksums
+without publishing. `before` skips `go mod tidy` so validation does not alter
+the dependency manifest. Local unsigned snapshots cannot prove Cosign OIDC
+signing, GitHub provenance issuance, or consumer verification of a published
+release; those require the approved live workflow.
 
 ## Published artifact names
 
@@ -185,27 +277,24 @@ gh release download "$TAG" --repo tchori-labs/tchori \
 
 ### 1. Verify the keyless signature
 
-Verify the certificate's GitHub Actions issuer and restrict its identity to the
-repository's tag-triggered release workflow:
+Verify the certificate's GitHub Actions issuer and restrict its identity to
+the workflow/ref that produced the artifact. A published release can only come
+from the explicit manual `publish` dispatch, so its identity must end in
+`@refs/heads/main`:
 
 ```sh
 cosign verify-blob \
   --certificate checksums.txt.pem \
   --signature checksums.txt.sig \
-  --certificate-identity-regexp '^https://github\.com/tchori-labs/tchori/\.github/workflows/release\.yml@refs/tags/v.*$' \
+  --certificate-identity-regexp '^https://github\.com/Tchori-Labs/tchori/\.github/workflows/release\.yml@refs/heads/main$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   checksums.txt
 ```
 
-A manual retry checks out the same release tag but its certificate identity can
-end in `@refs/heads/main`. For a board-approved manual retry only, replace the
-identity regexp above with this deliberately narrow alternative:
-
-```sh
---certificate-identity-regexp '^https://github\.com/tchori-labs/tchori/\.github/workflows/release\.yml@refs/heads/main$'
-```
-
-Do not use a repository-wide or issuer-only identity expression.
+A tag-triggered dry-run artifact instead has the exact tag identity
+`@refs/tags/v...`; a manual dry-run has the exact `@refs/heads/main` identity.
+Those artifacts are review evidence, not published releases. Do not use a
+repository-wide or issuer-only identity expression.
 
 ### 2. Verify archive and SBOM checksums
 

@@ -250,28 +250,121 @@ func TestStateListReportsIncompleteApply(t *testing.T) {
 }
 
 func TestStateShowMasksRecordedSensitivityWithoutWriting(t *testing.T) {
+	for _, tc := range []struct {
+		name, metadata string
+		warn           bool
+	}{
+		{"unscanned paths", `"sensitive_paths":["client_secret"]`, true},
+		{"legacy redacted hint", `"redacted":["client_secret"]`, true},
+		{"scanned paths", `"sensitive_paths":["client_secret"],"sensitive_scanned":true`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workdir := t.TempDir()
+			const sentinel = "tchori-e2e-super-secret-value"
+			stateJSON := `{"format_version":"1.0","serial":1,"resources":{"secret.demo":{"type":"secret","provider":"test","attributes":{"id":"public","client_secret":"` + sentinel + `"},` + tc.metadata + `}}}`
+			path := filepath.Join(workdir, "state.json")
+			if err := os.WriteFile(path, []byte(stateJSON), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			h := &handlers{workdir: workdir}
+			result, _, err := h.stateShow(context.Background(), nil, stateShowInput{Address: "secret.demo"})
+			if err != nil || result.IsError {
+				t.Fatalf("state_show failed: %v", err)
+			}
+			text, ok := result.Content[0].(*mcp.TextContent)
+			if !ok {
+				t.Fatalf("content=%T", result.Content[0])
+			}
+			var shown struct {
+				Attributes map[string]any `json:"attributes"`
+				Note       string         `json:"note"`
+			}
+			if err := json.Unmarshal([]byte(text.Text), &shown); err != nil {
+				t.Fatal(err)
+			}
+			if value, exists := shown.Attributes["client_secret"]; !exists || value != nil || strings.Contains(text.Text, sentinel) {
+				t.Fatal("MCP state_show failed to withhold the known secret")
+			}
+			if shown.Attributes["id"] != "public" || (shown.Note != "") != tc.warn {
+				t.Fatalf("public data or sensitivity provenance changed: %+v", shown)
+			}
+			after, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+			if err != nil || !bytes.Equal([]byte(stateJSON), after) {
+				t.Fatal("MCP state_show modified state")
+			}
+		})
+	}
+}
+
+func TestStateShowPreservesSensitiveSetCardinality(t *testing.T) {
 	workdir := t.TempDir()
-	const sentinel = "tchori-e2e-super-secret-value"
-	stateJSON := `{"format_version":"1.0","serial":1,"resources":{"secret.demo":{"type":"secret","provider":"test","attributes":{"client_secret":"` + sentinel + `"},"sensitive_paths":["client_secret"]}}}`
+	const sentinel = "mcp-sensitive-set-sentinel"
+	stateJSON := `{"format_version":"1.0","serial":1,"resources":{"secret.demo":{"type":"secret","provider":"test","attributes":{"members":[{"label":"same","token":"` + sentinel + `-one"},{"label":"same","token":"` + sentinel + `-two"}]},"sensitive_paths":["members.token"],"sensitive_scanned":true}}}`
 	path := filepath.Join(workdir, "state.json")
 	if err := os.WriteFile(path, []byte(stateJSON), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	before, _ := os.ReadFile(path) //nolint:gosec // test-controlled state path under t.TempDir()
 	h := &handlers{workdir: workdir}
 	result, _, err := h.stateShow(context.Background(), nil, stateShowInput{Address: "secret.demo"})
-	if err != nil {
+	if err != nil || result.IsError {
+		t.Fatalf("state_show failed: %v", err)
+	}
+	text := result.Content[0].(*mcp.TextContent)
+	var shown struct {
+		Attributes struct {
+			Members []map[string]any `json:"members"`
+		} `json:"attributes"`
+	}
+	if err := json.Unmarshal([]byte(text.Text), &shown); err != nil {
 		t.Fatal(err)
 	}
-	text, ok := result.Content[0].(*mcp.TextContent)
-	if !ok {
-		t.Fatalf("content=%T", result.Content[0])
+	if len(shown.Attributes.Members) != 2 {
+		t.Fatalf("MCP set cardinality = %d, want 2", len(shown.Attributes.Members))
 	}
-	if strings.Contains(text.Text, sentinel) || !strings.Contains(text.Text, `"sensitive_paths":["client_secret"]`) {
-		t.Fatalf("result leaked or omitted metadata: %s", text.Text)
+	for _, member := range shown.Attributes.Members {
+		if member["label"] != "same" || member["token"] != nil {
+			t.Fatalf("MCP public member = %#v", member)
+		}
 	}
-	after, _ := os.ReadFile(path) //nolint:gosec // test-controlled state path under t.TempDir()
-	if !bytes.Equal(before, after) {
-		t.Fatal("MCP state_show modified state")
+	if strings.Contains(text.Text, sentinel) {
+		t.Fatal("MCP state_show exposed sensitive set values")
+	}
+	after, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+	if err != nil || !bytes.Equal([]byte(stateJSON), after) {
+		t.Fatal("MCP state_show rewrote the artifact")
+	}
+}
+
+func TestStateShowWithholdsSensitiveMapKeysAboveSet(t *testing.T) {
+	workdir := t.TempDir()
+	const (
+		valueSentinel = "mcp-sensitive-map-value"
+		mapSentinel   = "mcp-sensitive-map-name"
+	)
+	stateJSON := `{"format_version":"1.0","serial":1,"resources":{"secret.demo":{"type":"secret","provider":"test","attributes":{"groups":{"` + mapSentinel + `":{"members":[{"token":"` + valueSentinel + `"}]}}},"sensitive_paths":["groups"],"sensitive_scanned":true}}}`
+	path := filepath.Join(workdir, "state.json")
+	if err := os.WriteFile(path, []byte(stateJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, _, err := (&handlers{workdir: workdir}).stateShow(context.Background(), nil, stateShowInput{Address: "secret.demo"})
+	if err != nil || result.IsError {
+		t.Fatalf("state_show failed: %v", err)
+	}
+	text := result.Content[0].(*mcp.TextContent).Text
+	if strings.Contains(text, mapSentinel) || strings.Contains(text, valueSentinel) {
+		t.Fatalf("MCP state_show exposed a sensitive map key or value: %s", text)
+	}
+	var shown struct {
+		Attributes map[string]any `json:"attributes"`
+	}
+	if err := json.Unmarshal([]byte(text), &shown); err != nil {
+		t.Fatal(err)
+	}
+	if value, exists := shown.Attributes["groups"]; !exists || value != nil {
+		t.Fatalf("MCP groups = %#v, want null", value)
+	}
+	after, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+	if err != nil || !bytes.Equal([]byte(stateJSON), after) {
+		t.Fatal("MCP state_show rewrote the artifact")
 	}
 }

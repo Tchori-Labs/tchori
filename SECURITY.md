@@ -9,26 +9,20 @@ guarantees.
 
 ## Reporting a vulnerability
 
-<!-- security-channel: pending -->
+<!-- security-channel: github-pvr -->
 
-Report suspected vulnerabilities privately through GitHub private vulnerability
-reporting: open the repository's **Security** tab, choose **Report a
-vulnerability**, and submit a private GitHub Security Advisory.
+GitHub private vulnerability reporting is enabled on the public
+`Tchori-Labs/tchori` repository. Report suspected vulnerabilities privately:
+open its [Security tab](https://github.com/Tchori-Labs/tchori/security), choose
+**Report a vulnerability**, and submit a private GitHub Security Advisory.
 
 Do **not** disclose a suspected vulnerability in a public GitHub issue, pull
 request, discussion, or other public channel. If a board-approved private
 security contact is documented in the future, it may be used as a fallback when
 GitHub private vulnerability reporting is unavailable.
 
-> [!IMPORTANT]
-> **Maintainer action required:** GitHub private vulnerability reporting is not
-> currently enabled, and no board-approved private security contact is
-> documented. Maintainers must enable private vulnerability reporting and/or
-> designate and document a private fallback contact before this policy is fully
-> operative. Follow the [security disclosure channel runbook](docs/security-disclosure-channel.md)
-> for the exact repository-admin and board procedure and its read-only audit.
-> Until then, do not publish vulnerability details through a public repository
-> channel.
+Maintainers can verify the live channel with the read-only audit in the
+[security disclosure channel runbook](docs/security-disclosure-channel.md).
 
 ## What to include
 

@@ -152,7 +152,7 @@ func TestResolvePlannedUnknowns(t *testing.T) {
 			}),
 		},
 		{
-			name: "set with unknown element substituted wholesale by wholly-known cfg set",
+			name: "set with unknown element remains provider planned",
 			planned: cty.SetVal([]cty.Value{
 				cty.UnknownVal(cty.String),
 				cty.StringVal("known"),
@@ -162,8 +162,8 @@ func TestResolvePlannedUnknowns(t *testing.T) {
 				cty.StringVal("cfg2"),
 			}),
 			want: cty.SetVal([]cty.Value{
-				cty.StringVal("cfg1"),
-				cty.StringVal("cfg2"),
+				cty.UnknownVal(cty.String),
+				cty.StringVal("known"),
 			}),
 		},
 		{
@@ -202,5 +202,31 @@ func TestResolvePlannedUnknowns(t *testing.T) {
 				t.Errorf("resolvePlannedUnknowns(%#v, %#v) = %#v, want %#v", c.planned, c.cfgVal, got, c.want)
 			}
 		})
+	}
+}
+
+func TestPerfectBipartiteMatchUsesAugmentingPath(t *testing.T) {
+	// A greedy first-fit matcher takes right 0 for left 0 and strands left 1.
+	// A valid perfect matching exists only after reassigning left 0 to right 1.
+	edges := [][]int{{0, 1}, {0}}
+	if !perfectBipartiteMatch(edges, 2) {
+		t.Fatal("augmenting-path graph rejected despite a perfect matching")
+	}
+}
+
+func TestPerfectBipartiteMatchRejectsDenseImpossibleGraph(t *testing.T) {
+	const size = 64
+	edges := make([][]int, size)
+	for left := range size - 1 {
+		edges[left] = make([]int, size)
+		for right := range edges[left] {
+			edges[left][right] = right
+		}
+	}
+	// The final reviewed member has a known public value absent from every
+	// current member. All preceding members are wildcard-compatible with all
+	// current members, yielding the dense adversarial rejection graph.
+	if perfectBipartiteMatch(edges, size) {
+		t.Fatal("dense graph with one unmatched reviewed member reported a perfect matching")
 	}
 }

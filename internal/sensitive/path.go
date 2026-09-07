@@ -50,25 +50,12 @@ func PathString(path cty.Path) string {
 	return buf.String()
 }
 
-func stripIndices(path string) string {
-	var b strings.Builder
-	for i := 0; i < len(path); {
-		if path[i] != '[' {
-			b.WriteByte(path[i])
-			i++
-			continue
-		}
-		depth := 1
-		i++
-		for i < len(path) && depth > 0 {
-			switch path[i] {
-			case '[':
-				depth++
-			case ']':
-				depth--
-			}
-			i++
+func logicalPath(path cty.Path) string {
+	var parts []string
+	for _, step := range path {
+		if attr, ok := step.(cty.GetAttrStep); ok {
+			parts = append(parts, attr.Name)
 		}
 	}
-	return b.String()
+	return strings.Join(parts, ".")
 }

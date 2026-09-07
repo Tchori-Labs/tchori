@@ -153,21 +153,23 @@ func (h *handlers) stateShow(_ context.Context, _ *mcp.CallToolRequest, in state
 	attrs := append(json.RawMessage(nil), rs.Attributes...)
 	redacted := append([]string(nil), rs.Redacted...)
 	note := ""
-	if len(rs.SensitivePaths) != 0 {
+	paths := mergeStringSets(rs.SensitivePaths, rs.Redacted)
+	if len(paths) != 0 {
 		var changed []string
 		// No provider/config is launched here, so rendering intentionally uses
 		// conservative path-level masking and never writes the result back.
-		attrs, changed, err = sensitive.RedactJSON(attrs, rs.SensitivePaths, nil)
+		attrs, changed, err = sensitive.RedactJSON(attrs, paths)
 		if err != nil {
 			return errResult(diag.Diagnostics{diag.Errorf(in.Address, "failed to mask sensitive state", err.Error())})
 		}
 		redacted = mergeStringSets(redacted, changed)
-	} else if !rs.SensitiveScanned {
-		note = "this state entry was not checked for sensitive values and may contain unredacted values; it will be checked on the next save-producing apply"
+	}
+	if !rs.SensitiveScanned {
+		note = "this state entry was not fully checked for sensitive values; use state sanitize with matching configuration and provider schemas"
 	}
 	return jsonResult(stateShowResult{
 		Address: in.Address, Type: rs.Type, Provider: rs.Provider, Attributes: attrs,
-		Redacted: redacted, SensitivePaths: rs.SensitivePaths, SensitiveScanned: rs.SensitiveScanned, Note: note,
+		Redacted: redacted, SensitivePaths: paths, SensitiveScanned: rs.SensitiveScanned, Note: note,
 	})
 }
 

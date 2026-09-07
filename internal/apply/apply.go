@@ -23,17 +23,18 @@
 package apply
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sort"
 	"strings"
 
 	"github.com/zclconf/go-cty/cty"
-	ctyjson "github.com/zclconf/go-cty/cty/json"
 
 	"github.com/tchori-labs/tchori/internal/config"
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/plan"
+	"github.com/tchori-labs/tchori/internal/privateblob"
 	"github.com/tchori-labs/tchori/internal/provider"
 	"github.com/tchori-labs/tchori/internal/sensitive"
 	"github.com/tchori-labs/tchori/internal/state"
@@ -56,8 +57,8 @@ import (
 // ordering, and configuration-drift refusals happen before any save.
 //
 // Ordering note: pl.Changes is sorted alphabetically by address (see
-// plan.finalize) purely so plan.json is byte-for-byte deterministic — that
-// order carries no dependency information and must never drive execution.
+// plan.finalize) for stable document ordering; it carries no dependency
+// information and must never drive execution.
 // A dependent whose address sorts before its dependency (e.g.
 // tchoritest_thing.a_first referencing ${tchoritest_thing.z_second.id})
 // would otherwise be applied before the resource it depends on exists.
@@ -89,6 +90,9 @@ type NotExecutedChange struct {
 // Apply returns truthful execution accounting alongside all diagnostics.
 func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map[string]*provider.Client, schemas map[string]*provider.ProviderSchemas, st *state.State, statePath string) (Result, diag.Diagnostics) {
 	var result Result
+	if err := privateblob.ValidateKey(); err != nil {
+		return result, diag.Diagnostics{diag.Errorf("", "invalid artifact key", err.Error())}
+	}
 	hadMarker := st.Incomplete != nil
 	if pl.StateSerial != st.Serial {
 		return result, diag.Diagnostics{diag.Errorf("", "stale plan", fmt.Sprintf(
@@ -98,23 +102,37 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 
 	ex := &executor{cfg: cfg, providers: providers, schemas: schemas, st: st, statePath: statePath, applied: map[string]cty.Value{}}
 	st.SetSensitiveResolver(func(addr string, rs *state.ResourceState) (state.Resolution, bool) {
-		if cfg == nil || cfg.Resources[addr] == nil {
-			return state.Resolution{}, false
+		providerName, typeName := rs.Provider, rs.Type
+		providerSource := rs.ProviderSource
+		var declared []string
+		var rawCfg map[string]any
+		if cfg != nil {
+			if res := cfg.Resources[addr]; res != nil {
+				providerName, typeName = res.Provider, res.Type
+				declared, rawCfg = res.SensitiveAttributes, res.Config
+			}
+			if pc := cfg.Providers[providerName]; pc != nil {
+				providerSource = pc.Source
+			}
 		}
-		res := cfg.Resources[addr]
-		ps := schemas[res.Provider]
+		ps := schemas[providerName]
 		if ps == nil {
 			return state.Resolution{}, false
 		}
-		sch, _, known := ps.LookupResourceType(res.Type)
+		sch, _, known := ps.LookupResourceType(typeName)
 		if !known || sch == nil {
 			return state.Resolution{}, false
 		}
-		spec, rds := sensitive.Resolve(sch.Block, res.SensitiveAttributes, res.Config)
+		spec, rds := sensitive.ResolveWithPersisted(sch.Block, declared, rs.SensitivePaths, rawCfg)
 		if rds.HasErrors() {
 			return state.Resolution{}, false
 		}
-		return state.Resolution{Paths: spec.Paths(), ExemptInstances: spec.ExemptInstances()}, true
+		return state.Resolution{
+			Paths:              spec.Paths(),
+			ProviderSource:     providerSource,
+			SanitizeAttributes: spec.Sanitizer(sch.Block.ImpliedType()),
+			SanitizeBackup:     spec.Effective(nil).Sanitizer(sch.Block.ImpliedType()),
+		}, true
 	})
 
 	byAddr := make(map[string]*plan.Change, len(pl.Changes))
@@ -199,24 +217,56 @@ func Apply(ctx context.Context, pl *plan.Plan, cfg *config.Config, providers map
 	// resource after the plan was saved) never appears in `order` and would
 	// otherwise silently vanish from `ordered`, applying nothing with zero
 	// diagnostics. Refuse the whole apply instead, before any provider call
-	// or state save, mirroring the stale-plan check's all-or-nothing
-	// posture: a plan that no longer matches configuration is not
-	// partially actionable.
 	var driftDiags diag.Diagnostics
 	for _, ch := range pl.Changes {
-		if ch.Action == "delete" {
+		if ch.Action == "no-op" {
 			continue
 		}
-		if cfg == nil || cfg.Resources[ch.Address] == nil {
+		if ch.Action != "delete" && (cfg == nil || cfg.Resources[ch.Address] == nil) {
 			driftDiags = append(driftDiags, diag.Errorf(ch.Address, "plan does not match configuration",
 				fmt.Sprintf(
 					"plan has a %q change for %q, but the address is no longer present in the loaded configuration; the configuration changed since the plan was created — run plan again",
 					ch.Action, ch.Address)))
+			continue
+		}
+		if ch.Type == "" || ch.Provider == "" || ch.ProviderSource == "" {
+			driftDiags = append(driftDiags, diag.Errorf(ch.Address, "plan has unbound resource identity",
+				"every executable change must record its resource type, provider alias, and canonical provider source; run plan again"))
+			continue
+		}
+		typeName, providerName, providerSource, known := resourceIdentity(cfg, st, ch.Address)
+		if !known || ch.Type != typeName || ch.Provider != providerName || ch.ProviderSource != providerSource {
+			driftDiags = append(driftDiags, diag.Errorf(ch.Address, "plan does not match resource identity",
+				"the resource type, provider alias, or canonical provider source changed since the plan was created; run plan again"))
+			continue
+		}
+		if ch.Action != "create" {
+			if rs := st.Resources[ch.Address]; rs != nil {
+				if rs.ProviderSource == "" {
+					driftDiags = append(driftDiags, diag.Errorf(ch.Address, "state has unbound provider source",
+						"the stored resource predates canonical provider-source binding; run tchori state sanitize before applying"))
+					continue
+				}
+				if rs.Type != typeName || rs.Provider != providerName || rs.ProviderSource != providerSource {
+					driftDiags = append(driftDiags, diag.Errorf(ch.Address, "state does not match resource identity",
+						"the stored resource type, provider alias, or canonical provider source differs from the provider selected by configuration"))
+					continue
+				}
+			}
+		}
+		if ch.Action == "delete" {
+			continue
 		}
 	}
 	if driftDiags.HasErrors() {
 		return result, driftDiags
 	}
+
+	unlock, err := st.Lock(ctx, statePath)
+	if err != nil {
+		return result, diag.Diagnostics{diag.Errorf("", "locking state", err.Error())}
+	}
+	defer unlock()
 
 	marked := len(ordered) > 0
 	if marked {
@@ -402,24 +452,38 @@ func (ex *executor) save() error {
 	return nil
 }
 
+// resourceIdentity is shared by preflight and execution so authenticated plan
+// metadata is checked against the exact provider that will receive the call.
+func resourceIdentity(cfg *config.Config, st *state.State, address string) (resourceType, providerName, providerSource string, known bool) {
+	if cfg != nil && cfg.Resources[address] != nil {
+		resource := cfg.Resources[address]
+		providerConfig := cfg.Providers[resource.Provider]
+		if providerConfig == nil || providerConfig.Source == "" {
+			return resource.Type, resource.Provider, "", false
+		}
+		return resource.Type, resource.Provider, providerConfig.Source, true
+	}
+	if resource := st.Resources[address]; resource != nil {
+		source := resource.ProviderSource
+		if cfg != nil && cfg.Providers[resource.Provider] != nil {
+			source = cfg.Providers[resource.Provider].Source
+		}
+		if source == "" {
+			return resource.Type, resource.Provider, "", false
+		}
+		return resource.Type, resource.Provider, source, true
+	}
+	return "", "", "", false
+}
+
 // applyChange executes one plan change and persists its result. For TC-048,
 // every non-delete config is composed before action dispatch so replace cannot
 // destroy the prior object before an unresolved-reference failure is known.
 func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagnostics {
 	addr := ch.Address
 
-	// Type and provider come from config when the resource is present; a
-	// delete of a resource that was removed from config falls back to the
-	// state entry (which records both).
-	var typeName, providerName string
-	switch {
-	case ex.cfg != nil && ex.cfg.Resources[addr] != nil:
-		typeName = ex.cfg.Resources[addr].Type
-		providerName = ex.cfg.Resources[addr].Provider
-	case ex.st.Resources[addr] != nil:
-		typeName = ex.st.Resources[addr].Type
-		providerName = ex.st.Resources[addr].Provider
-	default:
+	typeName, providerName, providerSource, known := resourceIdentity(ex.cfg, ex.st, addr)
+	if !known {
 		return diag.Diagnostics{diag.Errorf(addr, "unknown resource",
 			"address appears in the plan but in neither configuration nor state")}
 	}
@@ -446,20 +510,20 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	ty := schema.Block.ImpliedType()
 	// Register full effective paths before any destroy removes the entry; the
 	// same save's backup must still scrub the departing resource.
-	var declared []string
+	var declared, persisted []string
 	var rawCfg map[string]any
 	if ex.cfg != nil && ex.cfg.Resources[addr] != nil {
 		declared = ex.cfg.Resources[addr].SensitiveAttributes
 		rawCfg = ex.cfg.Resources[addr].Config
 	}
-	spec, sds := sensitive.Resolve(schema.Block, declared, rawCfg)
+	if rs := ex.st.Resources[addr]; rs != nil {
+		persisted = rs.SensitivePaths
+	}
+	spec, sds := sensitive.ResolveWithPersisted(schema.Block, declared, persisted, rawCfg)
 	if sds.HasErrors() {
 		return sds
 	}
 	ex.st.NoteSensitive(addr, spec.Paths())
-	if rs := ex.st.Resources[addr]; rs != nil {
-		ex.st.NoteSensitive(addr, rs.SensitivePaths)
-	}
 
 	// Prior value and private bytes come from state (null/nil if absent) —
 	// except for "create", where the plan document is trusted over state
@@ -479,7 +543,7 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	var priorPrivate []byte
 	if ch.Action != "create" {
 		if rs := ex.st.Resources[addr]; rs != nil {
-			v, err := provider.DecodeJSON(rs.Attributes, ty)
+			v, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, ty, rs.SensitivePaths, rs.SensitiveRecoveryVersion)
 			if err != nil {
 				return diag.Diagnostics{diag.Errorf(addr, "corrupt state attributes", err.Error())}
 			}
@@ -489,7 +553,7 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	}
 
 	if ch.Action == "delete" {
-		return ex.destroy(ctx, client, typeName, addr, ch.Action, ty, prior, priorPrivate)
+		return ex.destroy(ctx, client, typeName, providerName, providerSource, addr, ch.Action, schema.Block, ty, prior, priorPrivate)
 	}
 
 	// Compose before selecting create/update/replace so an unresolved value
@@ -500,30 +564,128 @@ func (ex *executor) applyChange(ctx context.Context, ch *plan.Change) diag.Diagn
 	if ds.HasErrors() {
 		return ds
 	}
+	// Decode the reviewed plan. Sensitive-set plans deliberately carry
+	// unknown secret leaves, so apply re-plans them with the now-concrete
+	// composed configuration rather than replacing the entire provider plan
+	// with raw config. The re-plan is non-mutating and must satisfy the
+	// reviewed known-value contract as a multiset before any replace destroy.
+	reviewed, err := provider.DecodeMsgpack(ch.PlannedRaw, ty)
+	if err != nil {
+		return append(ds, diag.Errorf(addr, "corrupt planned value", err.Error()))
+	}
+	planned := reviewed
+	plannedPrivate := ch.Private
+	if reviewedSetNeedsReplan(reviewed) {
+		proposed := provider.ProposedNew(schema.Block, prior, cfgVal)
+		replanned, pds := client.PlanResource(ctx, typeName, prior, proposed, cfgVal, priorPrivate)
+		pds = provider.Context(addr, pds)
+		ds = append(ds, pds...)
+		if pds.HasErrors() {
+			return ds
+		}
+		replannedAction := plan.Classify(prior, replanned.State, replanned.RequiresReplace, spec)
+		if !plannedContractMatches(reviewed, replanned.State) ||
+			!sameStrings(ch.RequiresReplace, replanned.RequiresReplace) ||
+			replannedAction != ch.Action {
+			return append(ds, diag.Errorf(addr, "set preflight diverged from reviewed plan",
+				fmt.Sprintf("provider re-plan changed a reviewed non-sensitive value, collection membership, replacement requirement, or action (%s to %s); no resource mutation was attempted", ch.Action, replannedAction)))
+		}
+		planned = replanned.State
+		plannedPrivate = replanned.Private
+	} else {
+		planned = resolvePlannedUnknowns(reviewed, cfgVal)
+	}
+	if planned.IsNull() || !planned.IsKnown() {
+		return append(ds, diag.Errorf(addr, "invalid planned value", "create, update, and replace require a known, non-null resource object"))
+	}
+	for _, finding := range provider.FindUnresolvedReferences(planned) {
+		ds = append(ds, provider.UnresolvedReferenceDiagnostic(addr, finding))
+	}
+	if ds.HasErrors() {
+		return ds
+	}
 
 	switch ch.Action {
 	case "replace":
 		// Destroy-then-create: two explicit ApplyResource calls. The state
 		// entry is removed (and saved) after the destroy leg, then written
 		// back (and saved) after the create leg.
-		destroyDs := ex.destroy(ctx, client, typeName, addr, ch.Action, ty, prior, priorPrivate)
+		destroyDs := ex.destroy(ctx, client, typeName, providerName, providerSource, addr, ch.Action, schema.Block, ty, prior, priorPrivate)
 		ds = append(ds, destroyDs...)
 		if destroyDs.HasErrors() {
 			return ds
 		}
-		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, cty.NullVal(ty), cfgVal, ch)...)
+		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, providerSource, addr, schema.Block, ty, cty.NullVal(ty), cfgVal, planned, plannedPrivate, ch, spec)...)
 	default: // "create", "update"
-		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, addr, schema.Block, ty, prior, cfgVal, ch)...)
+		return append(ds, ex.createOrUpdate(ctx, client, typeName, providerName, providerSource, addr, schema.Block, ty, prior, cfgVal, planned, plannedPrivate, ch, spec)...)
 	}
 }
 
 // destroy applies a null planned value — the plugin-protocol convention for
 // "destroy this object" — then removes the resource from state and saves.
-func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeName, addr, action string, ty cty.Type, prior cty.Value, priorPrivate []byte) diag.Diagnostics {
-	newState, _, ds := client.ApplyResource(ctx, typeName, prior, cty.NullVal(ty), cty.NullVal(ty), priorPrivate)
+func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeName, providerName, providerSource, addr, action string, block *provider.SchemaBlock, ty cty.Type, prior cty.Value, priorPrivate []byte) diag.Diagnostics {
+	newState, newPrivate, ds := client.ApplyResource(ctx, typeName, prior, cty.NullVal(ty), cty.NullVal(ty), priorPrivate)
 	ds = provider.Context(addr, ds)
-	if ds.HasErrors() {
-		return ds
+	failed := ds.HasErrors()
+	if failed {
+		if newState == cty.NilVal || !newState.IsKnown() {
+			return ds
+		}
+		old := ex.st.Resources[addr]
+		if newState.IsNull() {
+			delete(ex.st.Resources, addr)
+			if err := ex.save(); err != nil {
+				if old != nil {
+					ex.st.Resources[addr] = old
+				}
+				return append(ds, diag.Errorf(addr, "saving state", err.Error()))
+			}
+			return append(ds, unresolvedWarnings(ex.st)...)
+		}
+		if old != nil && newState.RawEquals(prior) && (newPrivate == nil || bytes.Equal(newPrivate, old.Private)) {
+			return ds
+		}
+
+		var declared, persisted []string
+		var rawCfg map[string]any
+		if ex.cfg != nil && ex.cfg.Resources[addr] != nil {
+			declared = append(declared, ex.cfg.Resources[addr].SensitiveAttributes...)
+			rawCfg = ex.cfg.Resources[addr].Config
+		}
+		if old != nil {
+			persisted = old.SensitivePaths
+		}
+		spec, specDs := sensitive.ResolveWithPersisted(block, declared, persisted, rawCfg)
+		ds = append(ds, specDs...)
+		if specDs.HasErrors() {
+			return ds
+		}
+		attrs, redactedPaths, recovery, err := spec.Project(newState)
+		if err != nil {
+			return append(ds, diag.Errorf(addr, "redacting partial destroy state", err.Error()))
+		}
+		ex.st.NoteSensitive(addr, spec.Paths())
+		ex.st.Resources[addr] = &state.ResourceState{
+			Type:                     typeName,
+			Provider:                 providerName,
+			ProviderSource:           providerSource,
+			Attributes:               attrs,
+			Private:                  newPrivate,
+			SensitiveSetRecovery:     recovery,
+			SensitiveRecoveryVersion: sensitive.RecoveryVersion,
+			Redacted:                 redactedPaths,
+			SensitivePaths:           spec.Paths(),
+			SensitiveScanned:         true,
+		}
+		if err := ex.save(); err != nil {
+			if old != nil {
+				ex.st.Resources[addr] = old
+			} else {
+				delete(ex.st.Resources, addr)
+			}
+			return append(ds, diag.Errorf(addr, "saving state", err.Error()))
+		}
+		return append(ds, unresolvedWarnings(ex.st)...)
 	}
 	if !newState.IsNull() {
 		return append(ds, diag.Errorf(addr, "provider did not destroy resource",
@@ -537,83 +699,59 @@ func (ex *executor) destroy(ctx context.Context, client *provider.Client, typeNa
 	return append(ds, unresolvedWarnings(ex.st)...)
 }
 
-// createOrUpdate decodes the planned value captured at plan time (msgpack,
-// may contain unknowns), overlays the already-composed config, rejects any
-// unresolved reference that survived in an older plan document, applies, then
-// records the provider's returned state and saves. cfgVal was composed by
-// applyChange before any replace destroy leg.
-func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, addr string, block *provider.SchemaBlock, ty cty.Type, prior, cfgVal cty.Value, ch *plan.Change) diag.Diagnostics {
-	planned, err := provider.DecodeMsgpack(ch.PlannedRaw, ty)
-	if err != nil {
-		return diag.Diagnostics{diag.Errorf(addr, "corrupt planned value", err.Error())}
-	}
-
-	// ch.PlannedRaw was captured at plan time: an attribute whose raw config
-	// is a ${..} reference to a resource that had not yet applied within
-	// that same plan (e.g. two new resources created together, one
-	// referencing the other's computed id) is still unknown there — the
-	// referenced resource's real value did not exist yet. By now,
-	// dependency-ordered execution (see Apply) guarantees any resource
-	// addr's config references has already applied, so cfgVal — recomposed
-	// above against current state — holds the concrete value. Overlay it
-	// onto planned's unknown leaves before applying; leaves the provider's
-	// own computed attributes (absent from raw config, hence null in
-	// cfgVal, e.g. "id") unknown for the provider itself to resolve, same
-	// as before.
-	planned = resolvePlannedUnknowns(planned, cfgVal)
+// createOrUpdate applies the value prepared before any replace destroy leg,
+// then records the provider's returned state and saves.
+func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client, typeName, providerName, providerSource, addr string, block *provider.SchemaBlock, ty cty.Type, prior, cfgVal, planned cty.Value, plannedPrivate []byte, ch *plan.Change, spec *sensitive.Spec) diag.Diagnostics {
 	var ds diag.Diagnostics
-	for _, finding := range provider.FindUnresolvedReferences(planned) {
-		ds = append(ds, provider.UnresolvedReferenceDiagnostic(addr, finding))
-	}
-	if ds.HasErrors() {
-		return ds
-	}
 
-	newState, newPrivate, applyDs := client.ApplyResource(ctx, typeName, prior, planned, cfgVal, ch.Private)
+	newState, newPrivate, applyDs := client.ApplyResource(ctx, typeName, prior, planned, cfgVal, plannedPrivate)
 	applyDs = provider.Context(addr, applyDs)
 	ds = append(ds, applyDs...)
-	if applyDs.HasErrors() {
-		return append(ds, attemptedChangeSummary(addr, ch.Action, block, prior, planned)...)
-	}
-	if ds.HasErrors() {
-		return ds
+	failed := applyDs.HasErrors()
+	if failed {
+		ds = append(ds, attemptedChangeSummary(addr, ch.Action, block, prior, planned)...)
+		if newState == cty.NilVal || newState.IsNull() || !newState.IsKnown() {
+			return ds
+		}
+		// Unchanged prior state needs no extra checkpoint. A changed partial
+		// result must survive so the next run can recover the remote object.
+		if old := ex.st.Resources[addr]; old != nil && newState.RawEquals(prior) && bytes.Equal(newPrivate, old.Private) {
+			return ds
+		}
 	}
 
 	// Compute consistency diagnostics before encoding. Degenerate null or
 	// shallow-unknown resource roots return their named errors immediately;
 	// a partially unknown object is still walked for actionable leaf errors,
 	// then the encoding guard below prevents it from being persisted.
-	consistencyDs := checkResultConsistency(addr, block, planned, cfgVal, newState)
-	if newState.IsNull() || !newState.IsKnown() {
-		return append(ds, consistencyDs...)
+	var consistencyDs diag.Diagnostics
+	if !failed {
+		consistencyDs = checkResultConsistency(addr, block, planned, cfgVal, newState)
 	}
-	res := ex.cfg.Resources[addr] // composeConfig above verified this resource exists.
-	spec, specDs := sensitive.Resolve(block, res.SensitiveAttributes, res.Config)
-	ds = append(ds, specDs...)
-	if specDs.HasErrors() {
+	if newState.IsNull() || !newState.IsKnown() {
 		return append(ds, consistencyDs...)
 	}
 	// Keep the full result only in memory so same-run references resolve even
 	// though the durable state withholds the source value.
-	ex.applied[addr] = newState
-	redactedState, redactedPaths, err := spec.Redact(newState)
+	if !failed {
+		ex.applied[addr] = newState
+	}
+	attrs, redactedPaths, recovery, err := spec.Project(newState)
 	if err != nil {
 		return append(ds, diag.Errorf(addr, "redacting new state", err.Error()))
 	}
-	attrs, err := ctyjson.Marshal(redactedState, ty)
-	if err != nil {
-		ds = append(ds, consistencyDs...)
-		return append(ds, diag.Errorf(addr, "encoding new state", err.Error()))
-	}
 	ex.st.NoteSensitive(addr, spec.Paths())
 	ex.st.Resources[addr] = &state.ResourceState{
-		Type:             typeName,
-		Provider:         providerName,
-		Attributes:       attrs,
-		Private:          newPrivate,
-		Redacted:         redactedPaths,
-		SensitivePaths:   spec.Paths(),
-		SensitiveScanned: true,
+		Type:                     typeName,
+		Provider:                 providerName,
+		ProviderSource:           providerSource,
+		Attributes:               attrs,
+		Private:                  newPrivate,
+		SensitiveSetRecovery:     recovery,
+		SensitiveRecoveryVersion: sensitive.RecoveryVersion,
+		Redacted:                 redactedPaths,
+		SensitivePaths:           spec.Paths(),
+		SensitiveScanned:         true,
 	}
 	if len(redactedPaths) != 0 {
 		ds = append(ds, diag.Warnf(addr, "sensitive attributes withheld from state", fmt.Sprintf("withheld paths: %s; capture provider-issued credentials in a secret store", strings.Join(redactedPaths, ", "))))
@@ -621,7 +759,9 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	if err := ex.save(); err != nil {
 		return append(ds, diag.Errorf(addr, "saving state", err.Error()))
 	}
-	ex.mutations = append(ex.mutations, stateMutation{addr: addr, action: ch.Action})
+	if !failed {
+		ex.mutations = append(ex.mutations, stateMutation{addr: addr, action: ch.Action})
+	}
 	ds = append(ds, unresolvedWarnings(ex.st)...)
 	return append(ds, consistencyDs...)
 }
@@ -639,36 +779,12 @@ func unresolvedWarnings(st *state.State) diag.Diagnostics {
 // corresponding value from cfgVal, provided cfgVal actually has a concrete
 // (known, non-null) value there. Composite values recurse per-element:
 // objects and maps per-attribute/per-key (as before), and — fixing
-// Tchori-Labs/tchori-internal#11 (TC-033) — lists and tuples per-index, plus a
-// wholesale substitution rule for sets. Before this fix, a ${...} reference
-// nested inside a list (e.g. cloudflare's policies[].include[].
-// service_token.token_id) stayed unknown at apply and was sent to the
-// provider as null, requiring a second apply once the referenced resource
-// was in state; a plain create+create or create+update within a single
-// apply now resolves such nested references in one pass.
-//
-// Soundness argument for lists/tuples: planned and cfgVal decode the SAME
-// raw config at the SAME schema type, so when their lengths agree, index i
-// of planned and index i of cfgVal both derive from the same configured
-// element — the same correspondence guarantee that already justifies the
-// map branch's per-key merge, just keyed by position instead of by map key.
-// A wholly-unknown list/tuple is already replaced wholesale by the
-// top-of-function !planned.IsKnown() branch, so this per-index recursion
-// only ever runs on a list/tuple whose *elements* are individually
-// known/unknown. When lengths disagree (a provider-side length change, or
-// cfgVal not actually known/non-null), no sound positional correspondence
-// exists, so planned is returned unchanged rather than risk misaligning
-// elements.
-//
-// Sets have no stable per-element index at all (cty sets are unordered and
-// de-duplicated), so there is no sound per-element merge rule. Instead, if
-// planned is not wholly known and cfgVal is a known, non-null, wholly-known
-// set, the whole set is substituted with cfgVal; otherwise planned passes
-// through unchanged. This trades away preserving any provider-planned
-// modification to an individual set element in favor of resolving the
-// reference — acceptable here because this branch only ever fires when the
-// set actually contains unresolved unknowns (a wholly-known planned set is
-// returned unchanged, same as any other known leaf).
+// Tchori-Labs/tchori-internal#11 (TC-033) — lists and tuples per-index.
+// Planned and cfgVal decode the same raw config at the same schema type, so
+// positional collections can resolve unknown references only when lengths
+// agree. Sets intentionally have no merge rule: their elements have no stable
+// identity. Sensitive sets are concretized by a provider re-plan plus the
+// reviewed-contract check in applyChange.
 func resolvePlannedUnknowns(planned, cfgVal cty.Value) cty.Value {
 	if !planned.IsKnown() {
 		if cfgVal.IsKnown() && !cfgVal.IsNull() {
@@ -770,18 +886,194 @@ func resolvePlannedUnknowns(planned, cfgVal cty.Value) cty.Value {
 		return cty.TupleVal(elems)
 
 	case ty.IsSetType():
-		// Sets have no stable per-element index, so there is no sound
-		// per-element merge; substitute the whole set only when planned
-		// actually contains unresolved unknowns and cfgVal is a concrete,
-		// wholly-known replacement. Otherwise leave planned untouched.
-		if !planned.IsWhollyKnown() && cfgVal.IsKnown() && !cfgVal.IsNull() && cfgVal.IsWhollyKnown() {
-			return cfgVal
-		}
 		return planned
 
 	default:
 		return planned
 	}
+}
+
+// reviewedSetNeedsReplan reports whether a reviewed unknown is at or below a
+// set boundary. Sets have no positional merge rule, so every such value must
+// be concretized by asking the provider to plan again.
+func reviewedSetNeedsReplan(value cty.Value) bool {
+	return unknownAtOrBelowSet(value, false)
+}
+
+func unknownAtOrBelowSet(value cty.Value, insideSet bool) bool {
+	ty := value.Type()
+	if !value.IsKnown() {
+		return insideSet || typeContainsSet(ty)
+	}
+	if value.IsNull() {
+		return false
+	}
+	if ty.IsSetType() {
+		if !value.IsWhollyKnown() {
+			return true
+		}
+		for it := value.ElementIterator(); it.Next(); {
+			_, element := it.Element()
+			if unknownAtOrBelowSet(element, true) {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case ty.IsObjectType():
+		for name := range ty.AttributeTypes() {
+			if unknownAtOrBelowSet(value.GetAttr(name), insideSet) {
+				return true
+			}
+		}
+	case ty.IsMapType(), ty.IsListType(), ty.IsTupleType():
+		for it := value.ElementIterator(); it.Next(); {
+			_, element := it.Element()
+			if unknownAtOrBelowSet(element, insideSet) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func typeContainsSet(ty cty.Type) bool {
+	switch {
+	case ty.IsSetType():
+		return true
+	case ty.IsListType(), ty.IsMapType():
+		return typeContainsSet(ty.ElementType())
+	case ty.IsTupleType():
+		for _, elementType := range ty.TupleElementTypes() {
+			if typeContainsSet(elementType) {
+				return true
+			}
+		}
+	case ty.IsObjectType():
+		for _, attributeType := range ty.AttributeTypes() {
+			if typeContainsSet(attributeType) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// plannedContractMatches checks that an apply-time provider re-plan preserves
+// every reviewed known value and collection membership. Unknown reviewed
+// leaves are wildcards. Sets use a full bipartite match rather than index
+// association, so duplicate public projections cannot coalesce.
+func plannedContractMatches(reviewed, current cty.Value) bool {
+	if reviewed == cty.NilVal || current == cty.NilVal || !reviewed.Type().Equals(current.Type()) {
+		return false
+	}
+	if !reviewed.IsKnown() {
+		return true
+	}
+	if !current.IsKnown() || reviewed.IsNull() != current.IsNull() {
+		return false
+	}
+	if reviewed.IsNull() {
+		return true
+	}
+
+	ty := reviewed.Type()
+	switch {
+	case ty.IsObjectType():
+		for name := range ty.AttributeTypes() {
+			if !plannedContractMatches(reviewed.GetAttr(name), current.GetAttr(name)) {
+				return false
+			}
+		}
+		return true
+	case ty.IsMapType():
+		reviewedValues, currentValues := reviewed.AsValueMap(), current.AsValueMap()
+		if len(reviewedValues) != len(currentValues) {
+			return false
+		}
+		for key, value := range reviewedValues {
+			other, ok := currentValues[key]
+			if !ok || !plannedContractMatches(value, other) {
+				return false
+			}
+		}
+		return true
+	case ty.IsListType(), ty.IsTupleType():
+		reviewedValues, currentValues := reviewed.AsValueSlice(), current.AsValueSlice()
+		if len(reviewedValues) != len(currentValues) {
+			return false
+		}
+		for i := range reviewedValues {
+			if !plannedContractMatches(reviewedValues[i], currentValues[i]) {
+				return false
+			}
+		}
+		return true
+	case ty.IsSetType():
+		reviewedValues, currentValues := reviewed.AsValueSlice(), current.AsValueSlice()
+		if len(reviewedValues) != len(currentValues) {
+			return false
+		}
+		edges := make([][]int, len(reviewedValues))
+		for i := range reviewedValues {
+			for j := range currentValues {
+				if plannedContractMatches(reviewedValues[i], currentValues[j]) {
+					edges[i] = append(edges[i], j)
+				}
+			}
+		}
+		return perfectBipartiteMatch(edges, len(currentValues))
+	default:
+		return reviewed.RawEquals(current)
+	}
+}
+
+// perfectBipartiteMatch uses augmenting paths to find a complete assignment in
+// O(VE). It never enumerates permutations of wildcard-compatible set members.
+func perfectBipartiteMatch(edges [][]int, rightCount int) bool {
+	if len(edges) != rightCount {
+		return false
+	}
+	rightOwner := make([]int, rightCount)
+	for i := range rightOwner {
+		rightOwner[i] = -1
+	}
+	var augment func(int, []bool) bool
+	augment = func(left int, seen []bool) bool {
+		for _, right := range edges[left] {
+			if right < 0 || right >= rightCount || seen[right] {
+				continue
+			}
+			seen[right] = true
+			if rightOwner[right] == -1 || augment(rightOwner[right], seen) {
+				rightOwner[right] = left
+				return true
+			}
+		}
+		return false
+	}
+	for left := range edges {
+		if !augment(left, make([]bool, rightCount)) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	a, b = append([]string(nil), a...), append([]string(nil), b...)
+	sort.Strings(a)
+	sort.Strings(b)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveRef resolves a ${type.name.attr} reference against the current

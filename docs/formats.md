@@ -3,9 +3,10 @@
 tchori has exactly two machine-readable, on-disk artifacts: the plan
 document (`plan.json`, or whatever path `-out` names) and the state file
 (`state.json`, fixed name in the working directory). Both are schema-
-versioned, deterministic JSON, designed to be committed, diffed, and read by
-agents as easily as by humans. This page documents their fields, semantics,
-and guarantees as implemented — it is not a design proposal.
+versioned JSON designed to be reviewed by humans and agents. Attribute and
+field ordering is stable; encrypted private payloads use fresh random nonces,
+so ciphertext is intentionally not byte-deterministic. This page documents
+implemented fields, semantics, and guarantees, not a design proposal.
 
 Source of truth: `internal/plan/plan.go`, `internal/plan/planner.go`,
 `internal/state/state.go`, and their tests.
@@ -15,7 +16,7 @@ Source of truth: `internal/plan/plan.go`, `internal/plan/planner.go`,
 | File | Written by | Read by | Purpose |
 | --- | --- | --- | --- |
 | `plan.json` | `tchori plan -out FILE`, `tchori destroy -out FILE` | `tchori apply FILE` | The reviewable, PR-able artifact: the exact changes an apply will execute plus optional informational refresh drift. There is no plan-less apply. |
-| `state.json` | `tchori apply`, `tchori destroy` (via `Save`) | `tchori plan`, `tchori apply`, `tchori state list/show`, `tchori mcp` | The record of what tchori believes is really deployed: one entry per managed resource, keyed by address. |
+| `state.json` | `tchori apply`, `tchori import`, `tchori state sanitize` | `tchori plan`, `tchori apply`, `tchori state list/show/status`, `tchori mcp` | The record of what tchori believes is deployed, keyed by resource address. |
 
 ## Unresolved-reference safety
 
@@ -26,6 +27,10 @@ RPC, tchori refuses the call with an `unresolved reference` error. This guard
 applies to validate, plan, apply (including replace before its destroy leg),
 and provider configuration. As a result, tchori never persists a matching
 value that it composed and sent itself.
+
+Replacement planned values are decoded and validated before the destroy leg.
+Corrupt MessagePack, null resource roots, and unresolved references refuse the
+replacement without deleting the existing object.
 
 Composition happens without a resource address in scope, so validate and plan
 diagnostics identify the offending attribute path and matched `${...}`
@@ -49,7 +54,7 @@ The guarantee has three deliberate boundaries:
 
 | Field | JSON type | Meaning |
 | --- | --- | --- |
-| `format_version` | string | Plan document schema version. Currently always `"1.0"` (`plan.FormatVersion`). |
+| `format_version` | string | Plan document schema version. New writes use `"1.2"` (`plan.FormatVersion`). |
 | `engine_version` | string | The tchori binary version that produced the plan (e.g. `"0.1.0-dev"`), from `internal/version.Version`. |
 | `state_serial` | integer | The state file's `serial` at the moment this plan was computed (`p.State.Serial`). `apply` compares this against the live state's serial to detect staleness — see below. |
 | `changes` | array of `Change` | Always sorted by `address` (`plan.finalize`). Document order is for byte-stability only; it carries no dependency information (`apply.Apply`'s ordering notes call this out explicitly — execution order comes from the config's topological sort, not from this array). |
@@ -61,17 +66,27 @@ The guarantee has three deliberate boundaries:
 | Field | JSON type | Meaning |
 | --- | --- | --- |
 | `address` | string | Resource address, `type.name` (e.g. `tchoritest_thing.a`). |
+| `type` | string, omitted when absent in legacy input | Provider resource type; required for every executable change and checked against the execution target. |
+| `provider` | string, omitted when absent in legacy input | Provider local name; required for every executable change and checked against the execution target. |
+| `provider_source` | string, omitted when absent in legacy input | Canonical registry source of the provider selected at plan time; required for every executable change and authenticated with private data. |
 | `action` | string | One of `create`, `update`, `delete`, `replace`, `no-op` — see Action semantics below. |
-| `before` | object or `null` | Prior value, ctyjson-encoded. `null` for `create` (no prior object existed). |
-| `after` | object or `null` | Planned value, ctyjson-encoded, with every attribute unknown at plan time rendered as JSON `null`. `null` for `delete`. |
+| `before` | object or `null` | Prior public projection. `null` for `create`; sensitive-set arrays retain one entry per authoritative element. |
+| `after` | object or `null` | Planned public projection, with every attribute unknown at plan time rendered as JSON `null`. `null` for `delete`; projected set duplicates are retained. |
 | `unknown_after` | array of strings, omitted if empty | Dotted attribute paths inside `after` whose real value won't be known until apply (see Unknowns below). |
 | `requires_replace` | array of strings, omitted if empty | Attribute paths the provider says force replacement *if their value differs from prior*. Presence here does not by itself mean `action` is `replace` — see Action semantics. |
-| `planned_raw` | base64 string, omitted if empty | The exact planned value (including real unknowns), msgpack-encoded via `cty/msgpack`. Opaque; consumed by `apply` to reconstruct the planned state precisely — not meant for humans to read. |
-| `private` | base64 string, omitted if empty | Opaque per-resource provider private data, round-tripped from the provider's plan RPC into its apply RPC. |
+| `planned_raw` | base64 string, omitted if empty | The exact provider-planned shape, msgpack-encoded via `cty/msgpack`. Provider unknowns remain unknown. Sensitive non-exempt leaves are also encoded as unknown, including inside sets, so config/env secrets are not frozen into the executable artifact. |
+| `private` | object, omitted if empty | Authenticated encrypted envelope for opaque provider recovery data; decrypted bytes are passed unchanged to provider RPCs. Legacy `1.0` used a plaintext base64 string. |
 
-`before`/`after`/`planned_raw`/`private` are typed `json.RawMessage` or
-`[]byte` in Go; `encoding/json`'s default handling renders `[]byte` as
-standard base64 in the JSON document.
+`before` and `after` are deterministic JSON projections. A set is sorted by
+its projected element bytes but duplicate projections remain duplicate array
+entries, preserving cardinality when elements differ only in sensitive leaves.
+`planned_raw` is base64-encoded MessagePack. Current `private` is an envelope
+with integer `version: 1`, base64 `nonce` (12 bytes), and base64 `ciphertext`
+(including the 16-byte authentication tag). It uses AES-256-GCM and
+authenticates the resource address, resource type, provider alias, canonical
+provider source, and artifact kind as additional data. It is not
+interchangeable with `planned_raw`, nor may a plaintext private string appear
+in a `1.1` or `1.2` document.
 
 ### Drift fields
 
@@ -101,9 +116,9 @@ field completely, preserving the bytes written before this field existed.
 | --- | --- |
 | `create` | No prior state for this address. |
 | `delete` | Prior state exists and the planned value is null (resource removed from config, or `destroy` mode). |
-| `replace` | `requires_replace` is non-empty **and** the planned value actually differs from prior on at least one of those paths (an unknown planned value on such a path counts as differing — the provider cannot promise it stays the same). |
-| `update` | Planned value differs from prior, but not on a path that forces replacement. |
-| `no-op` | Planned value equals prior exactly (`cty.Value.RawEquals`). |
+| `replace` | `requires_replace` is non-empty **and** the comparison value differs from prior on at least one of those paths (an unknown planned value on such a path counts as differing — the provider cannot promise it stays the same). |
+| `update` | The comparison value differs from prior, but not on a path that forces replacement. |
+| `no-op` | Prior and planned values are equal after masking ordinary sensitive leaves. Sensitive leaves inside sets remain part of the in-memory comparison because they determine membership. |
 
 `no-op` changes are listed in `changes` (so the document always accounts for
 every config resource) but never counted in `summary`, and `tchori plan`'s
@@ -142,17 +157,23 @@ value and:
 Paths use the same dotted/bracket notation for nested attributes and map
 keys, e.g. `echo`, `id`, or `tags["parent"]` for a map key. `planned_raw`
 preserves provider unknowns for apply, but sensitive non-exempt leaves are
-also encoded there as unknown rather than concrete values. `after` is the
+also encoded there as unknown rather than concrete values. A sensitive set
+keeps every unknown-bearing element, so add/remove/member-change transitions
+remain distinguishable without persisting the secret. `after` is the
 reviewable JSON projection; `planned_raw` is the executable one.
 
 At apply time, an unknown left over from planning that turns out to be a
 `${...}` reference to another resource created earlier in the same run is
-resolved against that resource's real, just-applied value before the
-provider is called — this covers references nested arbitrarily deep inside
-lists, sets, tuples, objects, and maps (e.g. a policy list whose element
-holds a reference inside a further-nested object), not just top-level or
-object/map-nested attributes, so a single `tchori apply` suffices even when
-the reference is nested inside an ordered collection (Tchori-Labs/tchori-internal#11).
+resolved against that resource's real, just-applied value before the provider
+is called. Objects, maps, lists, and tuples use their key or positional
+correspondence. Sets have no stable positional correspondence, so tchori never
+substitutes raw configuration for a reviewed unknown at or below any set,
+whether sensitive or not. It asks the provider to plan again with the concrete
+configuration and builds the set compatibility graph once; augmenting-path
+matching must find a perfect multiset match against every reviewed known value
+and collection membership. Replacement paths and the shared value-sensitive
+action classification must also remain identical. Any divergence fails before
+the provider's apply RPC, including the destroy leg of a replacement.
 
 ### Exit-code contract
 
@@ -178,15 +199,23 @@ non-JSON-response hint.
 
 ### format_version compatibility
 
-`plan.Read` rejects any plan whose `format_version` is not exactly the
-version this build of tchori writes (currently `"1.0"`) — a plan written by
-a future, schema-incompatible tchori is refused with an explicit error
-rather than silently misinterpreted.
+`plan.Read` accepts current format `"1.2"`, encrypted-private format `"1.1"`,
+and legacy `"1.0"` for migration. Missing, empty, and unsupported versions are
+rejected rather than guessed. New writes always use `"1.2"`. This prevents an
+older engine from applying a plan and then coalescing sensitive set elements
+while it writes state.
 
-The optional `drift` field does **not** increment `format_version`: it is
-additive and informational, is omitted when empty, and is ignored by apply.
-Existing `1.0` readers continue to consume the action-bearing fields with
-unchanged meaning, while drift-free documents remain byte-identical.
+The optional `drift` field remains informational and ignored by apply.
+Authenticated private storage drove `1.1`; identity-safe sensitive set
+persistence drives `1.2`.
+
+Legacy plans, and early `1.1` plans, with private data but no complete bound
+type/provider/source identity remain readable for diagnosis but cannot be
+applied: recompute the plan with this engine. Apply requires complete identity
+for every executable change, even when its private payload is empty, and
+compares it against live config/state routing before any checkpoint or provider
+mutation. Changing an alias or its canonical source cannot redirect
+authenticated private data to another provider.
 
 ### Example
 
@@ -198,12 +227,15 @@ doesn't exist yet on a first plan):
 
 ```json
 {
-  "format_version": "1.0",
+  "format_version": "1.2",
   "engine_version": "0.1.0-dev",
   "state_serial": 0,
   "changes": [
     {
       "address": "tchoritest_thing.a",
+      "type": "tchoritest_thing",
+      "provider": "tchoritest",
+      "provider_source": "tchori-labs/tchoritest",
       "action": "create",
       "before": null,
       "after": {
@@ -221,6 +253,9 @@ doesn't exist yet on a first plan):
     },
     {
       "address": "tchoritest_thing.b",
+      "type": "tchoritest_thing",
+      "provider": "tchoritest",
+      "provider_source": "tchori-labs/tchoritest",
       "action": "create",
       "before": null,
       "after": {
@@ -258,7 +293,7 @@ creates.
 
 | Field | JSON type | Meaning |
 | --- | --- | --- |
-| `format_version` | string | State document schema version. Currently always `"1.0"` (unexported `state.formatVersion`). |
+| `format_version` | string | State document schema version. Fresh/current projections use `"1.3"`; a legacy projection remains `"1.2"` until it can be restored and reprojected with live schemas. |
 | `serial` | integer | Monotonically incremented once per successful `Save` call — see Serial semantics below. |
 | `resources` | object | Map of resource address (`type.name`) to `ResourceState`. |
 | `incomplete_apply` | object, omitted when converged | Durable evidence that the last apply did not complete; see below. |
@@ -269,11 +304,68 @@ creates.
 | --- | --- | --- |
 | `type` | string | Provider resource type, e.g. `tchoritest_thing`. |
 | `provider` | string | Provider local name from config, e.g. `tchoritest`. |
-| `attributes` | object | ctyjson-encoded applied values. Every withheld sensitive leaf is JSON `null`; state never stores unknown values. |
-| `private` | base64 string, omitted if empty | Opaque provider data, round-tripped untouched. Tchori does not inspect or redact this blob. |
+| `provider_source` | string, omitted in legacy/early `1.1` input | Canonical provider registry source. New state binds this value into encrypted-envelope authentication and checks it before provider RPCs. |
+| `attributes` | object | Deterministic public projection of applied values. Every withheld sensitive leaf is JSON `null`; sensitive sets retain element count and non-sensitive association as array entries. A sensitive map inside a captured set is withheld as a whole so its keys do not leak. A sensitive map above an affected set is also whole-value `null` and uses authenticated recovery. State never stores unknown values. |
+| `private` | object, omitted if empty | Authenticated encrypted envelope with `version`, `nonce`, and `ciphertext`, as described for plans. The opaque plaintext is preserved only in memory for provider RPCs. |
+| `sensitive_set_recovery` | object | Mandatory format `1.3` authenticated projection-contract envelope. Its encrypted plaintext binds the public projection digest, authoritative sensitivity/redaction paths, generation, and any direct or collection values needed for recovery; `values` may be empty. Legacy formats may omit it when they have no recovery payload. |
+| `sensitive_recovery_version` | integer | Mandatory per-resource sensitive projection generation. Format `1.3` requires the current value `4`; generation `0` and versions `1` through `3` are accepted only from legacy formats so live schemas can restore and reproject them. A nonzero value is also authenticated as part of the recovery envelope's AES-GCM additional data. |
 | `redacted` | array of strings, omitted if empty | Sorted paths whose values are withheld, explaining why the corresponding `attributes` leaf is `null`. |
 | `sensitive_paths` | array of strings, omitted if empty | Sorted effective, index-insensitive sensitivity contract. It survives config removal and drives backups, delete plans, orphan handling, and provider-free read masking. |
 | `sensitive_scanned` | boolean, omitted when false | Provenance marker set after live schema/config resolution, including for a definitively non-sensitive resource. Read surfaces use it to distinguish checked entries from legacy entries with unknown provenance. |
+
+Standalone resource JSON used by CLI/MCP read surfaces omits both encrypted
+fields and the state-only generation marker. The state document serializer,
+not an ordinary resource JSON dump, writes provider-private data plus one
+mandatory projection-contract envelope and generation marker per current
+resource.
+
+The projection-contract envelope has a purpose distinct from provider
+`private` and authenticates the resource address, type, provider alias,
+canonical source when present, and nonzero `sensitive_recovery_version` as
+AES-GCM additional data. Its generation-4 plaintext has
+`contract_version: 1`, a SHA-256 digest of the exact public projection,
+authoritative `projection_paths` and `projection_redacted` arrays,
+`direct_paths`, and a `values` array. Generation 4 stores directly sensitive
+scalar, list, and map values plus collection recovery in `values`; the envelope
+remains mandatory when `values` is empty.
+
+On load, format `1.3` rejects a missing envelope, authenticates its resource
+identity and purpose, validates the projection digest, and replaces removable
+plaintext `sensitive_paths`/`redacted` mirrors with the authenticated contract.
+Typed restore also requires the current contract and derives generation paths
+from its authenticated payload. Removing the envelope and plaintext mirrors
+therefore cannot turn a projected `null` into provider authority.
+
+Generation 3 stores outermost affected sets and sensitive map boundaries in
+`values`; structural collection traversal distinguishes `map(set(...))` from
+`set(map(...))`, and map recovery preserves null, empty, keys, structure, and
+nested set membership exactly. Version 2 stores sets in `sets` and records the
+sensitivity paths that produced the projection. Version 1 uses the resource's
+recorded `sensitive_paths`. Valid legacy projections are checked with their
+generation-time semantics, then rotated to the generation-4 contract.
+
+Restoration validates the generation marker, authenticated paths, complete
+recovery path set, projection digest, and typed generation-time projection
+before replacing public placeholders and decoding the authoritative cty value.
+Moving either envelope to another address/type/source/purpose, changing the
+key or generation marker, editing the public projection, or removing the
+current contract fails before a provider mutation or state checkpoint.
+
+This is a current-format integrity boundary, not a globally non-downgradable
+file marker. AES-GCM additional data detects ciphertext or bound-context
+tampering, and format `1.3` rejects a missing, null, zero, or unsupported
+generation marker. An attacker who can replace the whole document can instead
+substitute or relabel a separately valid `1.0`, `1.1`, or `1.2` artifact; that
+rollback is indistinguishable from an authentic legacy input to file-local
+cryptography. Preventing it requires trusted repository/storage history or an
+external monotonic trust anchor.
+
+During `import --refresh` and plan refresh reads, a provider's concrete value
+always wins. If the provider returns `null` or `unknown` for an exact path
+already recorded in `sensitive_paths`, the engine restores only that sensitive
+path from authenticated recovery; ordinary paths are never carried forward.
+Omissions below an ambiguous collection shape fail closed before `Save`, so
+the state and backup remain unchanged.
 
 ### Incomplete apply lifecycle
 
@@ -294,6 +386,17 @@ artifact that admits it is non-converged. Stale-plan, configuration-order, and
 configuration-drift refusals write nothing. A zero-change apply writes no new
 marker, although it does clear a stale marker from an earlier run.
 
+An early `1.1` resource with no `provider_source` remains readable so operators
+can inspect and migrate it, but planning/apply refuse to send its state or
+private bytes to a provider. `tchori state sanitize` validates the stored
+type/provider alias against live configuration and schema, binds the canonical
+source, and re-encrypts state and backup under the stronger identity. A
+nonempty stored source that differs from resolved configuration is refused
+before provider discovery and before state or backup mutation; it is never
+rewritten as a migration. A nonempty redacted sensitive set without recovery is
+rejected explicitly: membership cannot be reconstructed safely from the public
+projection.
+
 Use `tchori state status` as the convergence gate: exit 0 means converged and
 exit 1 means incomplete. `plan`, `apply`, and `destroy` warn when loading a
 marked file, while planning remains available for recovery.
@@ -311,7 +414,7 @@ engine.
 ### Serial semantics
 
 - `state.Load` on a missing path returns a fresh, empty state:
-  `format_version: "1.0"`, `serial: 0`, `resources: {}` — not an error.
+  `format_version: "1.3"`, `serial: 0`, `resources: {}` — not an error.
 - Each successful `Save` increments `Serial`, regardless of whether the
   resource data actually changed. A save rejected because another process
   committed from the same base does not increment it.
@@ -324,11 +427,19 @@ engine.
 
 ### Locking, backup, and durability behavior
 
+Apply and import hold the same state sidecar lock for their complete mutating
+operation, including provider RPCs and every checkpoint. Lock acquisition is
+bounded by ten seconds and observes command cancellation. The serial is
+checked after acquiring the lock, before remote mutation. Saves within the
+operation reuse the held lock; concurrent writers cannot interleave remote
+side effects between state checkpoints.
+
 `Save` (`internal/state/state.go`):
 
-1. Acquires an flock-based lock at `path+".lock"` (`github.com/gofrs/flock`),
-   polling every 50ms up to a 10-second timeout, and releases it via `defer`.
-   If the name exists, `Save` first requires it to be a regular file on every
+1. Reuses the operation's flock-based lock at `path+".lock"` or acquires one
+   for the individual save, polling every 50ms up to a 10-second timeout.
+   A standalone save releases its own lock via `defer`.
+   If the name exists, acquisition requires it to be a regular file on every
    platform. On POSIX, no-follow and nonblocking open flags additionally make
    a symlink or filesystem FIFO raced in after that check fail fast rather
    than be followed or hang. After acquisition on every platform, the held
@@ -341,24 +452,32 @@ engine.
    state path and re-run guidance; neither the state nor its backup is touched.
 3. Parses the prior document and sanitizes every entry using persisted paths,
    live resolution, and effective-path hints before writing `path+".backup"`.
-   With no known sensitive path the copy stays byte-identical; otherwise it is
-   canonically re-serialized. Existing `redacted` markers are unioned with
-   newly changed paths. A parse failure aborts rather than copying uninspected
-   bytes. The backup deliberately applies no literal-instance exemptions and
-   retains previously persisted paths, so the prior document is scrubbed under
-   the rules that wrote it even when the current declaration was removed.
-   Because apply now performs bracketing saves, the backup left by a successful
-   apply normally contains a marker-carrying intermediate, not the pre-apply
-   state. The fresh-temp-and-rename symlink, directory, and `0600` hardening
-   remains unchanged.
+   When schema is available, sensitive-set recovery is authenticated, restored,
+   and reprojected with a matching rotated recovery payload. Without schema, an
+   existing public-projection/recovery pair is preserved byte-for-byte rather
+   than changing one half and invalidating the other. With no known sensitive
+   path the copy stays byte-identical; otherwise it is canonically re-serialized.
+   Existing `redacted` markers are unioned with newly changed paths. A parse or
+   envelope-authentication failure aborts rather than copying uninspected bytes.
+   The backup deliberately applies no literal-instance exemptions and retains
+   previously persisted paths, so the prior document is scrubbed under the
+   rules that wrote it even when the current declaration was removed. Because
+   apply performs bracketing saves, the backup left by a successful apply
+   normally contains a marker-carrying intermediate, not the pre-apply state.
+   The fresh-temp-and-rename symlink, directory, and `0600` hardening remains
+   unchanged.
 4. Sanitizes every live state entry, including resources untouched by this
-   apply. A resolvable entry uses current schema/config paths as authoritative,
-   honors per-instance literal exemptions, intersects stale markers with the
-   current set, then unions newly redacted paths. An unresolvable entry falls
-   back to persisted paths and hints without exemptions and is reported. A
-   resolved empty path set means definitively non-sensitive and records
-   `sensitive_scanned`; no resolver means persisted-hints-only behavior with no
-   provenance writes or unresolved warnings.
+   apply. Current schema/config paths are unioned with persisted paths and
+   effective hints: removing a declaration does not declassify stored secrets.
+   Live resolution restores affected sets under their recorded generation
+   paths before typed decoding, then emits a new public projection and recovery
+   payload under current policy. It honors per-instance literal exemptions
+   outside sets. An unresolved entry without set recovery falls back to
+   persisted paths and hints without exemptions and is reported. An unresolved
+   entry with set recovery is rejected: schema is required to keep the
+   authenticated pair valid. An empty combined path set is definitively
+   non-sensitive only after successful resolution, which records
+   `sensitive_scanned`.
 5. Increments `Serial`, marshals with `MarshalIndent`, writes a temp file
    (`.state-*.tmp`) in the same directory, and fsyncs the complete file before
    closing it. It atomically renames the temp file over `path`, then runs the
@@ -417,59 +536,77 @@ nodes cannot block. The guard flags apply to every unix build, but on the
 unshipped aix, solaris, and illumos targets flock opens with `O_RDWR`, and POSIX
 leaves `O_RDWR|O_NONBLOCK` FIFO-open behavior undefined.
 
-### Determinism
+### Stable ordering and encrypted payloads
 
-- Both files are written with `encoding/json.MarshalIndent(v, "", "  ")`
-  plus a trailing newline.
-- `plan.json`'s `changes` array is explicitly sorted by `address`
-  (`plan.finalize`).
-- `state.json`'s `resources` is a Go map, but `encoding/json` always
-  marshals map keys in sorted order — so the file's byte content does not
-  depend on Go map insertion order. A converged marker is a pointer with
-  `omitempty`, so converged files retain the established key set and order;
-  an incomplete marker has no timestamp. `TestSaveDeterministicAcrossInsertionOrder`
-  pins this down directly: two states built by inserting the same three
-  resources in different orders `Save` to byte-identical files.
-- Together, re-running plan or save against unchanged input reproduces the
-  same bytes (`TestPlanWriteReadDeterminism`, `TestSaveLoadRoundTrip`) — this
-  is what makes `git diff plan.json` / `git diff state.json` show only real
-  changes, never formatting noise or nondeterministic key order.
+Both files use two-space JSON indentation and a trailing newline. Plan changes
+are sorted by address; state resource map keys are sorted during JSON
+encoding. Incomplete markers have no timestamp. Public set projections are
+sorted by projected element bytes while retaining duplicates. These guarantees
+keep the reviewable structure stable rather than depending on map or
+secret-dependent set iteration order.
+
+Provider-private and projection-contract encryption use fresh random nonces
+and distinct authenticated purposes. Both bind resource address, type,
+provider alias, and canonical source when present. Identical plaintext
+therefore produces different ciphertext; a ciphertext-only diff does not imply
+infrastructure drift. No deterministic nonce is derived from content, serial,
+or address. Every resource in a current nonempty state has an encrypted
+contract, so raw resource bytes can change even when public state is unchanged.
 
 ### format_version compatibility
 
-`state.Load` applies the same rule as `plan.Read`: an *existing* state file
-must carry `format_version` exactly `"1.0"`, including rejecting a missing
-or empty field — a state file tchori itself wrote always carries `"1.0"`
-(see `Save`), so anything else is a file this engine did not write and
-should not guess about. A missing file is not subject to this check at all
-(it synthesizes a fresh empty state instead). `incomplete_apply` is an additive,
-optional field, so `format_version` remains `"1.0"`. An older tchori binary can
-read a marked file but will silently drop the marker if it re-saves that state.
+`state.Load` accepts current `"1.3"`, recovery-envelope format `"1.2"`,
+encrypted-private format `"1.1"`, and legacy `"1.0"`; it rejects missing,
+empty, and unsupported versions. A nonexistent file instead yields a fresh
+empty state. A save declares format `1.3` only after every resource has been
+restored and reprojected to generation `4`. A wholly generation-zero legacy
+state remains truthfully `1.2` when live schemas are unavailable; apply refuses
+such a state before writing its incomplete marker or calling a provider
+mutation. Format `1.1` introduced encrypted provider-private storage. Format
+`1.2` added encrypted sensitive-set recovery. Format `1.3` requires every
+resource to carry generation `4` plus the authenticated projection-contract
+envelope described above. Current files produced by an earlier build without
+that envelope or its current contract payload are rejected rather than treated
+as trustworthy; restore from a trusted copy or re-create state through an
+explicitly reviewed legacy migration. Older readers refuse newer plans/state
+rather than silently
+discarding or coalescing authoritative membership. Whole-document replacement
+or relabeling to a valid legacy artifact remains outside this file-local
+boundary, as described above.
 
 ### Example
 
-The state produced by applying the plan.json example above (test provider,
-prefix `demo-`):
+The state shape produced by applying the plan.json example above (test
+provider, prefix `demo-`) is shown below. Random nonce/ciphertext bytes are
+abbreviated:
 
 ```json
 {
-  "format_version": "1.0",
+  "format_version": "1.3",
   "serial": 4,
   "resources": {
     "tchoritest_thing.a": {
       "type": "tchoritest_thing",
       "provider": "tchoritest",
+      "provider_source": "tchori-labs/tchoritest",
       "attributes": {
         "echo": "alpha",
         "id": "demo-id-alpha",
         "name": "alpha",
         "replace_me": null,
         "tags": null
-      }
+      },
+      "sensitive_set_recovery": {
+        "version": 1,
+        "nonce": "<base64 nonce>",
+        "ciphertext": "<base64 authenticated contract>"
+      },
+      "sensitive_recovery_version": 4
     },
     "tchoritest_thing.b": {
       "type": "tchoritest_thing",
       "provider": "tchoritest",
+      "provider_source": "tchori-labs/tchoritest",
       "attributes": {
         "echo": "beta",
         "id": "demo-id-beta",
@@ -478,7 +615,13 @@ prefix `demo-`):
         "tags": {
           "parent": "demo-id-alpha"
         }
-      }
+      },
+      "sensitive_set_recovery": {
+        "version": 1,
+        "nonce": "<base64 nonce>",
+        "ciphertext": "<base64 authenticated contract>"
+      },
+      "sensitive_recovery_version": 4
     }
   }
 }
@@ -503,17 +646,18 @@ state save, in two situations:
    save of the apply, because `Save` itself increments `Serial` — comparing
    after any save would compare against a serial the apply itself just
    changed. The error names both serials and says to plan again.
-2. **Configuration drift.** Every non-delete change's address must still
-   exist in the configuration loaded fresh at apply time. If the config was
-   edited (e.g. a resource declaration removed) after the plan was written,
-   that change would otherwise silently vanish from the execution order
-   with zero diagnostics. Apply instead refuses the whole run with a "plan
-   does not match configuration" diagnostic, mirroring the stale-plan
-   check's all-or-nothing posture — a plan that no longer matches
-   configuration is not partially actionable.
+2. **Configuration and resource-identity drift.** Every non-delete change's
+   address must still exist in freshly loaded configuration. Every executable
+   change must record type, provider alias, and canonical provider source even
+   when private data is empty. Apply compares all three values against the
+   provider selected by live configuration (or the configured provider behind
+   a state-only delete), and separately checks stored state identity before any
+   provider call. Missing legacy source metadata directs the operator to
+   `tchori state sanitize`; changed routing directs the operator to recompute
+   the plan. Every refusal occurs before the state lock/save boundary.
 
-Both refusals are exit code `1`, with a structured diagnostic on stderr
-naming the problem; the fix in both cases is to run `plan` again.
+Both refusal classes are exit code `1`, with a structured diagnostic on stderr
+naming the problem.
 
 ## Result consistency at apply
 
@@ -584,15 +728,20 @@ executed counts. A run containing errors still prints `Apply incomplete` (or
 `Destroy incomplete`) with executed create, update, delete, and replace counts
 plus the number of dependency-blocked changes, then exits `1`. A provider call
 that failed was attempted but is neither reported as completed work nor as
-"not executed". A consistency error after a provider result was durably
-recorded does count that executed mutation while still making the run fail.
+"not executed". If a failed destroy response contains a decodable authoritative
+state, tchori checkpoints it before continuing failure handling: explicit null
+removes the state entry, while a changed non-null state and its private bytes
+replace the prior entry. The action remains unfinished and uncounted. A
+consistency error after a provider result was durably recorded does count that
+executed mutation while still making the run fail.
 
 Apply's durable incomplete marker records the first failed address, all
 successfully completed addresses, and every failed or blocked address still
-unfinished after independent work runs. A replace whose destroy leg succeeded
-but whose create leg failed remains absent from durable state and is not counted
-as a completed replacement. Every failed run advances the state serial, so its
-saved plan no longer matches `state.json`; run `tchori plan` before retrying.
+unfinished after independent work runs. A replace whose destroy leg returned
+null with an error remains absent from durable state but is not counted as a
+completed replacement. Every failed run that enters execution advances the
+state serial when it records the incomplete marker, so run `tchori plan` before
+retrying.
 Stale-plan, configuration-ordering, and configuration-drift refusals happen
 before the execution loop and therefore have no partial outcome.
 
@@ -626,42 +775,80 @@ original provider error already makes apply exit `1` under the
 Tchori derives sensitive paths from provider schema `Sensitive` flags plus a
 resource's optional `sensitive_attributes` list. Provider-computed values at
 those paths are withheld from state and plan artifacts. State stores a typed
-JSON `null` plus the three metadata fields above; plans replace the value with
-an unknown in both `after` and decoded `planned_raw`, list it in
-`unknown_after`, and mask it during update/replacement classification so a
-withheld computed value does not cause a perpetual diff.
+JSON `null`, plaintext reporting mirrors, and the mandatory encrypted
+projection contract described above. Plans replace the value with an unknown
+in both `after` and decoded `planned_raw`, list it in `unknown_after`, and mask
+it during update/replacement classification so a withheld computed value does
+not cause a perpetual diff.
 
-Sensitivity matching ignores collection indices, while the raw-literal
-exemption is a fully index-qualified instance. Thus one repeated-block element
-may retain an authored literal while a sibling containing a `${...}` reference
-is withheld. Literal authorship is determined from raw config syntax only;
-references, explicit nulls, absent values, and `{"env":"..."}` wrappers are
-never exempt. Set-nested blocks have no stable element identity and therefore
-fail closed with no exemptions. Per-attribute sensitivity inside a provider
-`nested_type` is not retained by current schema conversion; use
-`sensitive_attributes` for that path.
+Sensitivity matching derives logical paths directly from structured cty path
+steps, so brackets, quotes, backslashes, or Unicode in map keys cannot alter the
+schema path being redacted. The raw-literal exemption is a fully
+index-qualified instance bound to the exact authored scalar value. Thus one
+repeated-block element may retain an authored literal while a sibling
+containing a `${...}` reference is withheld; a provider-substituted value at the
+same instance is redacted. References, explicit nulls, absent values, and
+`{"env":"..."}` wrappers are never exempt.
 
-Every save sanitizes the whole state document. Live, resolvable entries are
-instance-aware and use current schema/config as authoritative, so literals
-survive unrelated saves and removing a declaration takes effect on the next
-save-producing apply. Backups, delete `before` values, orphans, and read
-rendering are conservative path-level copies with no exemption. The backup is
-the one consumer that also retains prior paths, ensuring the preceding file is
-scrubbed even when a declaration was just removed. Backup markers are unioned;
-live markers are intersected with current paths before newly changed paths are
-unioned.
+Set elements have no stable identity after a sensitive leaf becomes null or
+unknown: distinct elements can become equal and coalesce. Tchori therefore
+retains each redacted public element and separately encrypts the authoritative
+outermost affected set. Flat cty types are traversed independently of provider
+`nested_type` metadata, including sets nested in objects, maps, lists, tuples,
+or other sets; protocol 5 and flat protocol 6 schemas therefore use the same
+boundaries. Provider-declared sensitivity on the whole set, an explicit
+whole-set declaration, and a sensitive ancestor all use the same recovery
+mechanism. Per-attribute sensitivity inside provider `nested_type` objects,
+lists, maps, and sets is retained recursively.
+Sensitive maps are withheld as whole values rather than exposing their dynamic
+keys with null leaves. Inside a captured set the set recovery already preserves
+the map. Above a captured set, the smallest sensitive map boundary is itself
+authenticated and recovered, including null versus empty.
 
-`state show` and MCP `state_show` mask from persisted `sensitive_paths` in
-memory and never save. An entry with `sensitive_scanned: true` and no paths is
-known non-sensitive. A pre-change entry with neither field cannot be classified
-without launching a provider, so provider-free reads render it as stored with a
-note. Likewise, `plan` never writes state and a no-op apply saves nothing:
-legacy plaintext remains on disk until a changed apply/import or manual purge.
-If plaintext was previously committed, rotate the credential and purge
-`state.json`, `state.json.backup`, and repository history.
+Every save sanitizes the whole state document. Live, resolvable entries use the
+provider schema's cty type, preserving map elements even when a map key matches
+an attribute name, and honor only value-bound literal exemptions. Current
+sensitivity is unioned with previously recorded paths, so removing a
+declaration cannot restore a previously withheld secret. Backups, delete
+`before` values, orphans, and read rendering are conservative path-level copies
+with no exemption.
+
+Refresh drift and state-only delete projections are derived from authenticated,
+restored typed state before applying the set-aware public projection. A
+legitimate recovered set is not treated as legacy plaintext; legacy plaintext
+detection remains a separate comparison against the persisted public bytes.
+Typed masked comparison still reports genuine hidden membership drift.
+
+Default `state show` and MCP `state_show` mask persisted `sensitive_paths`
+and legacy `redacted` hints in memory and never save or launch providers. An entry with
+`sensitive_scanned: true` and no paths is known non-sensitive. A legacy entry
+with neither field cannot be classified through that provider-free path,
+which warns rather than claiming the entry is safe.
+
+`tchori state show ADDRESS --discover-sensitive` opts into provider/schema
+discovery and masks legacy output without writing state or refreshing remote
+resources. `tchori state sanitize` resolves sensitivity and rewrites current
+state plus its backup without applying infrastructure changes. It preserves
+the state lock, serial/CAS and durability contract. Schema discovery rejects
+resource type/provider mismatches and attributes incompatible with the schema
+without writing. Hinted orphans are conservatively scrubbed in state and backup,
+but sanitization exits `1` because their remaining values could not be checked.
+Entries with neither configuration nor hints are rejected without writing.
+Normal plan and no-op apply are not legacy cleanup commands. Previously
+committed plaintext still requires credential rotation and repository-history
+cleanup.
 
 The consistency diagnostic and the
 [`attempted change`](#failure-isolation-at-apply) diagnostic follow the
 same schema sensitivity rules and never print sensitive values. Provider
-`private` blobs remain opaque and are not inspected; providers must not rely on
-tchori to redact secrets stored there.
+`private` blobs remain opaque in memory, but their artifact representation is
+authenticated encryption, not redaction or plaintext base64. See
+[artifact key management](configuration.md#artifact-encryption-key).
+
+When an apply RPC reports errors alongside a valid, changed partial resource
+state, the create/update leg checkpoints that state and private recovery data.
+The apply remains incomplete, the change is not counted as completed, and
+dependent changes remain blocked. Missing or undecodable error-response state
+does not fabricate a replacement state. Deferred read, plan, and import
+responses are rejected explicitly rather than interpreted as deletion or an
+executable plan.

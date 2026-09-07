@@ -3,6 +3,7 @@ package apply_test
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -19,8 +20,16 @@ import (
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/plan"
 	"github.com/tchori-labs/tchori/internal/provider"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 	"github.com/tchori-labs/tchori/internal/state"
 )
+
+func TestMain(m *testing.M) {
+	if err := os.Setenv("TCHORI_ARTIFACT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{41}, 32))); err != nil {
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
 
 // buildTestProvider compiles the Task 5 fake provider into a temp dir and
 // returns the binary path (same pattern as the internal/provider tests).
@@ -82,6 +91,45 @@ func newHarness(t *testing.T, resources map[string]*config.Resource) *harness {
 	}
 }
 
+func TestApplyHoldsStateLockDuringProviderMutation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	t.Setenv("TCHORITEST_VERIFY_STATE_LOCK", path)
+	const addr = "tchoritest_thing.foo"
+	h := newHarness(t, map[string]*config.Resource{addr: thing("foo", "foo")})
+	h.statePath = path
+	st := loadState(t, path)
+	ctx := context.Background()
+	for _, destroy := range []bool{false, true} {
+		_, ds := apply.Apply(ctx, h.plan(t, st, destroy), h.cfg, h.providers, h.schemas, st, path)
+		if ds.HasErrors() {
+			t.Fatalf("provider mutation (destroy=%v) did not hold exclusive state lock: %+v", destroy, ds)
+		}
+	}
+}
+
+func TestApplyPersistsPartialProviderErrorState(t *testing.T) {
+	const addr = "tchoritest_thing.partial"
+	const dependentAddr = "tchoritest_thing.dependent"
+	dependent := thing("dependent", "dependent")
+	dependent.Config["tags"] = map[string]any{"parent": "${tchoritest_thing.partial.id}"}
+	h := newHarness(t, map[string]*config.Resource{
+		addr: thing("partial", "partial_failure"), dependentAddr: dependent,
+	})
+	st := loadState(t, h.statePath)
+	result, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() || len(result.NotExecuted) != 1 || result.NotExecuted[0].Address != dependentAddr {
+		t.Fatalf("partial failure must fail and block dependents: %+v %+v", result, ds)
+	}
+	saved := loadState(t, h.statePath)
+	rs := saved.Resources[addr]
+	if rs == nil || !bytes.Contains(rs.Attributes, []byte("id-partial_failure")) || string(rs.Private) != "partial-recovery" {
+		t.Fatal("recoverable provider state was discarded after partial failure")
+	}
+	if saved.Incomplete == nil || saved.Incomplete.FailedAddress != addr {
+		t.Fatal("partial provider result must not mark apply converged")
+	}
+}
+
 // plan runs the Task 10 planner over the harness config and the given state.
 func (h *harness) plan(t *testing.T, st *state.State, destroy bool) *plan.Plan {
 	t.Helper()
@@ -119,6 +167,50 @@ func secretful(addrName string, cfg map[string]any) *config.Resource {
 		values[k] = v
 	}
 	return &config.Resource{Address: "tchoritest_secretful." + addrName, Type: "tchoritest_secretful", Name: addrName, Provider: "tchoritest", Config: values}
+}
+
+func setMember(token, secret string) map[string]any {
+	return map[string]any{
+		"label": "same",
+		"token": token,
+		"details": []any{map[string]any{
+			"kind":   "same",
+			"secret": secret,
+		}},
+	}
+}
+
+func setThing(addrName, configName string) *config.Resource {
+	return &config.Resource{
+		Address:  "tchoritest_set_thing." + addrName,
+		Type:     "tchoritest_set_thing",
+		Name:     addrName,
+		Provider: "tchoritest",
+		Config: map[string]any{
+			"name": configName,
+			"attribute_members": []any{
+				setMember("attribute-token-one", "attribute-detail-one"),
+				setMember("attribute-token-two", "attribute-detail-two"),
+			},
+			"block_members": []any{
+				setMember("block-token-one", "block-detail-one"),
+				setMember("block-token-two", "block-detail-two"),
+			},
+		},
+	}
+}
+
+func flatSetThing(addrName, configName string, members []any) *config.Resource {
+	return &config.Resource{
+		Address:  "tchoritest_flat_set_thing." + addrName,
+		Type:     "tchoritest_flat_set_thing",
+		Name:     addrName,
+		Provider: "tchoritest",
+		Config: map[string]any{
+			"name":    configName,
+			"members": members,
+		},
+	}
 }
 
 // nestedThing returns a tchoritest_nested_thing resource (issue #7's
@@ -451,6 +543,543 @@ func TestApplyWithholdsSensitiveComputedAndReferencedValues(t *testing.T) {
 	}
 }
 
+func TestApplySensitiveSetLifecyclePreservesIdentity(t *testing.T) {
+	resource := setThing("demo", "demo")
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+
+	pl := h.plan(t, st, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "create" {
+		t.Fatalf("plan = %+v, want sensitive set create", pl.Changes)
+	}
+	artifact := append(append([]byte(nil), pl.Changes[0].After...), pl.Changes[0].PlannedRaw...)
+	for _, secret := range []string{"attribute-token-one", "attribute-token-two", "attribute-detail-one", "attribute-detail-two", "block-token-one", "block-token-two", "block-detail-one", "block-detail-two"} {
+		if bytes.Contains(artifact, []byte(secret)) {
+			t.Fatalf("plan artifact exposed %q", secret)
+		}
+	}
+	if _, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("Apply: %+v", ds)
+	}
+
+	data, err := os.ReadFile(h.statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"attribute-token-one", "attribute-token-two", "attribute-detail-one", "attribute-detail-two", "block-token-one", "block-token-two", "block-detail-one", "block-detail-two"} {
+		if bytes.Contains(data, []byte(secret)) {
+			t.Fatalf("state artifact exposed %q", secret)
+		}
+	}
+	if !bytes.Contains(data, []byte(`"sensitive_set_recovery"`)) {
+		t.Fatal("state omitted encrypted sensitive set recovery")
+	}
+	attrs := stateAttrs(t, h.statePath, resource.Address)
+	for _, field := range []string{"attribute_members", "block_members"} {
+		members, ok := attrs[field].([]any)
+		if !ok || len(members) != 2 {
+			t.Fatalf("%s public cardinality = %#v, want two elements", field, attrs[field])
+		}
+		for _, rawMember := range members {
+			member := rawMember.(map[string]any)
+			if member["label"] != "same" || member["token"] != nil {
+				t.Fatalf("%s public member = %#v", field, member)
+			}
+			details := member["details"].([]any)
+			if len(details) != 1 || details[0].(map[string]any)["kind"] != "same" || details[0].(map[string]any)["secret"] != nil {
+				t.Fatalf("%s public nested details = %#v", field, details)
+			}
+		}
+	}
+
+	reloaded := loadState(t, h.statePath)
+	next := h.plan(t, reloaded, false)
+	if len(next.Changes) != 1 || next.Changes[0].Action != "no-op" {
+		t.Fatalf("post-refresh plan = %+v, want no-op with both set elements restored", next.Changes)
+	}
+	destroy := h.plan(t, reloaded, true)
+	if _, ds := apply.Apply(context.Background(), destroy, h.cfg, h.providers, h.schemas, reloaded, h.statePath); ds.HasErrors() {
+		t.Fatalf("destroy: %+v", ds)
+	}
+	if got := loadState(t, h.statePath).Resources[resource.Address]; got != nil {
+		t.Fatal("destroy retained sensitive set resource")
+	}
+}
+
+func TestApplySensitiveSetRetainsProviderPlannedNormalization(t *testing.T) {
+	resource := setThing("normalized", "normalized")
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	if !bytes.Contains(pl.Changes[0].After, []byte(`"normalized":"normalized-same"`)) {
+		t.Fatalf("reviewed plan omitted provider normalization: %s", pl.Changes[0].After)
+	}
+	if _, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("Apply discarded or diverged from provider-planned normalization: %+v", ds)
+	}
+	attrs := stateAttrs(t, h.statePath, resource.Address)
+	for _, field := range []string{"attribute_members", "block_members"} {
+		for _, raw := range attrs[field].([]any) {
+			member := raw.(map[string]any)
+			if member["normalized"] != "normalized-same" {
+				t.Fatalf("%s member normalization = %#v", field, member["normalized"])
+			}
+		}
+	}
+}
+
+func TestApplySensitiveSetRejectsReplanDivergenceBeforeProviderMutation(t *testing.T) {
+	resource := setThing("diverged", "diverged")
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+
+	members := resource.Config["attribute_members"].([]any)
+	members[0].(map[string]any)["label"] = "changed-after-review"
+
+	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() || diagnosticWithSummary(ds, "set preflight diverged from reviewed plan") == nil {
+		t.Fatalf("Apply diagnostics = %+v, want set preflight divergence", ds)
+	}
+	if result.Created != 0 || result.Updated != 0 || result.Deleted != 0 || result.Replaced != 0 {
+		t.Fatalf("provider mutation result = %+v, want no completed mutation", result)
+	}
+	if got := loadState(t, h.statePath).Resources[resource.Address]; got != nil {
+		t.Fatalf("divergent re-plan persisted resource: %+v", got)
+	}
+}
+
+func TestApplyReplansUnknownNonSensitiveSetWithoutLosingProviderPlan(t *testing.T) {
+	dependency := thing("dependency", "dependency")
+	resource := flatSetThing("consumer", "consumer", []any{
+		map[string]any{ //nolint:gosec // fake schema token contains only an internal resource reference
+			"label": "same",
+			"token": "${tchoritest_thing.dependency.id}",
+		},
+	})
+	h := newHarness(t, map[string]*config.Resource{
+		dependency.Address: dependency,
+		resource.Address:   resource,
+	})
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+
+	if _, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("Apply left a non-sensitive set reference unresolved: %+v", ds)
+	}
+	attrs := stateAttrs(t, h.statePath, resource.Address)
+	members := attrs["members"].([]any)
+	if len(members) != 1 {
+		t.Fatalf("members = %#v, want one member", members)
+	}
+	member := members[0].(map[string]any)
+	if member["token"] != "id-dependency" {
+		t.Fatalf("members.token = %#v, want concrete dependency id", member["token"])
+	}
+	if member["normalized"] != "normalized-same" {
+		t.Fatalf("members.normalized = %#v, want provider-planned normalization", member["normalized"])
+	}
+}
+
+func TestApplyRejectsSensitiveSetReplaceWhenReplanBecomesNoOp(t *testing.T) {
+	resource := flatSetThing("replace-to-noop", "replace-to-noop", []any{
+		map[string]any{"label": "same", "token": "first-private"},
+	})
+	resource.SensitiveAttributes = []string{"members.token"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	resource.Config["members"] = []any{map[string]any{"label": "same", "token": "second-private"}}
+	current := loadState(t, h.statePath)
+	pl := h.plan(t, current, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "replace" {
+		t.Fatalf("reviewed action = %+v, want replace", pl.Changes)
+	}
+	resource.Config["members"] = []any{map[string]any{"label": "same", "token": "first-private"}}
+
+	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, current, h.statePath)
+	if !ds.HasErrors() || diagnosticWithSummary(ds, "set preflight diverged from reviewed plan") == nil {
+		t.Fatalf("Apply diagnostics = %+v, want action divergence", ds)
+	}
+	if result.Replaced != 0 || result.Deleted != 0 || result.Created != 0 || result.Updated != 0 {
+		t.Fatalf("result = %+v, want no provider mutation", result)
+	}
+}
+
+func TestApplyRejectsSensitiveSetUpdateWhenReplanRequiresReplace(t *testing.T) {
+	resource := flatSetThing("update-to-replace", "before", []any{
+		map[string]any{"label": "same", "token": "first-private"},
+	})
+	resource.SensitiveAttributes = []string{"members.token"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	resource.Config["name"] = "after"
+	current := loadState(t, h.statePath)
+	pl := h.plan(t, current, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "update" {
+		t.Fatalf("reviewed action = %+v, want update", pl.Changes)
+	}
+	resource.Config["members"] = []any{map[string]any{"label": "same", "token": "second-private"}}
+
+	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, current, h.statePath)
+	if !ds.HasErrors() || diagnosticWithSummary(ds, "set preflight diverged from reviewed plan") == nil {
+		t.Fatalf("Apply diagnostics = %+v, want action divergence", ds)
+	}
+	if result.Replaced != 0 || result.Deleted != 0 || result.Created != 0 || result.Updated != 0 {
+		t.Fatalf("result = %+v, want no provider mutation", result)
+	}
+}
+
+func TestPlannerWholeSetRefreshDoesNotReportFalseDrift(t *testing.T) {
+	resource := flatSetThing("whole-refresh", "whole-refresh", []any{
+		map[string]any{"label": "same", "token": "first-private"},
+		map[string]any{"label": "same", "token": "second-private"},
+	})
+	resource.SensitiveAttributes = []string{"members"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	pl := h.plan(t, loadState(t, h.statePath), false)
+	if len(pl.Drift) != 0 {
+		t.Fatalf("unchanged whole sensitive set reported drift: %+v", pl.Drift)
+	}
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "no-op" {
+		t.Fatalf("post-apply changes = %+v, want no-op", pl.Changes)
+	}
+}
+
+func TestPlannerStateOnlyDeletePreservesWholeSetProjection(t *testing.T) {
+	resource := flatSetThing("whole-delete", "whole-delete", []any{
+		map[string]any{"label": "same", "token": "first-private"},
+		map[string]any{"label": "same", "token": "second-private"},
+	})
+	resource.SensitiveAttributes = []string{"members"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	current := loadState(t, h.statePath)
+	delete(h.cfg.Resources, resource.Address)
+	pl := h.plan(t, current, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "delete" {
+		t.Fatalf("state-only changes = %+v, want delete", pl.Changes)
+	}
+	var before map[string]any
+	if err := json.Unmarshal(pl.Changes[0].Before, &before); err != nil {
+		t.Fatal(err)
+	}
+	members, ok := before["members"].([]any)
+	if !ok || len(members) != 2 {
+		t.Fatalf("delete Before members = %#v, want two projected members", before["members"])
+	}
+}
+
+func TestPlannerWholeSetRefreshDetectsMembershipDrift(t *testing.T) {
+	resource := flatSetThing("membership-drift", "drift-flat-members", []any{
+		map[string]any{"label": "same", "token": "first-private"},
+	})
+	resource.SensitiveAttributes = []string{"members"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	pl := h.plan(t, loadState(t, h.statePath), false)
+	if len(pl.Drift) != 1 || pl.Drift[0].Address != resource.Address {
+		t.Fatalf("membership drift = %+v, want one drift record", pl.Drift)
+	}
+}
+
+func TestSensitiveMapAboveSetStaysPrivateThroughPlanApplyAndBackup(t *testing.T) {
+	const (
+		privateKey   = "PRIVATE_GROUP_KEY"
+		privateToken = "PRIVATE_GROUP_TOKEN"
+	)
+	resource := flatSetThing("private-groups", "private-groups", nil)
+	resource.Config["groups"] = map[string]any{
+		privateKey: map[string]any{
+			"members": []any{map[string]any{"token": privateToken}},
+		},
+	}
+	resource.SensitiveAttributes = []string{"groups"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	planBytes, err := json.Marshal(pl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sentinel := range []string{privateKey, privateToken} {
+		if bytes.Contains(planBytes, []byte(sentinel)) {
+			t.Fatalf("plan artifact exposed %q", sentinel)
+		}
+	}
+	if _, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply did not restore the sensitive map for the provider: %+v", ds)
+	}
+
+	persisted := loadState(t, h.statePath)
+	rs := persisted.Resources[resource.Address]
+	if rs == nil || len(rs.SensitiveSetRecovery) == 0 {
+		t.Fatal("state omitted authenticated sensitive map recovery")
+	}
+	if got := stateAttrs(t, h.statePath, resource.Address)["groups"]; got != nil {
+		t.Fatalf("public state groups = %#v, want null", got)
+	}
+	schema := h.schemas["tchoritest"].ResourceTypes[resource.Type]
+	spec, sds := sensitive.ResolveWithPersisted(schema.Block, resource.SensitiveAttributes, rs.SensitivePaths, resource.Config)
+	if sds.HasErrors() {
+		t.Fatal(sds)
+	}
+	restored, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, schema.Block.ImpliedType(), rs.SensitivePaths, rs.SensitiveRecoveryVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := restored.GetAttr("groups").Index(cty.StringVal(privateKey))
+	members := group.GetAttr("members").AsValueSlice()
+	if len(members) != 1 || members[0].GetAttr("token").AsString() != privateToken {
+		t.Fatalf("restored provider authority = %#v, want exact key and membership", restored)
+	}
+
+	resource.Config["name"] = "private-groups-updated"
+	current := loadState(t, h.statePath)
+	update := h.plan(t, current, false)
+	updateBytes, err := json.Marshal(update)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sentinel := range []string{privateKey, privateToken} {
+		if bytes.Contains(updateBytes, []byte(sentinel)) {
+			t.Fatalf("update plan artifact exposed %q", sentinel)
+		}
+	}
+	if _, ds := apply.Apply(context.Background(), update, h.cfg, h.providers, h.schemas, current, h.statePath); ds.HasErrors() {
+		t.Fatalf("update Apply did not restore the sensitive map for the provider: %+v", ds)
+	}
+	for _, path := range []string{h.statePath, h.statePath + ".backup"} {
+		data, err := os.ReadFile(path) //nolint:gosec // test-controlled state path
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, sentinel := range []string{privateKey, privateToken} {
+			if bytes.Contains(data, []byte(sentinel)) {
+				t.Fatalf("%s exposed %q", filepath.Base(path), sentinel)
+			}
+		}
+	}
+}
+
+func TestStateOnlyDeleteRejectsStrippedExplicitSensitiveMapContract(t *testing.T) {
+	resource := flatSetThing("stripped-contract", "stripped-contract", nil)
+	resource.Config["groups"] = map[string]any{
+		"private-group": map[string]any{
+			"members": []any{map[string]any{"token": "private-token"}},
+		},
+	}
+	resource.SensitiveAttributes = []string{"groups"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+	delete(h.cfg.Resources, resource.Address)
+
+	data, err := os.ReadFile(h.statePath) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	persisted := document["resources"].(map[string]any)[resource.Address].(map[string]any)
+	delete(persisted, "sensitive_set_recovery")
+	delete(persisted, "sensitive_paths")
+	delete(persisted, "redacted")
+	tampered, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(h.statePath, tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.Load(h.statePath); err == nil {
+		t.Fatal("state-only delete accepted a stripped explicit-sensitive map contract before planning or apply")
+	}
+}
+
+func TestApplyRejectsUnknownDescendantInSensitiveRecoveryMap(t *testing.T) {
+	resource := flatSetThing("unknown-group-result", "unknown-group-result", nil)
+	resource.SensitiveAttributes = []string{"groups"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+
+	_, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() {
+		t.Fatal("Apply accepted a provider result with an unknown descendant in a sensitive recovery map")
+	}
+	saved := loadState(t, h.statePath)
+	if saved.Resources[resource.Address] != nil {
+		t.Fatal("Apply persisted a provider result with an unknown descendant in a sensitive recovery map")
+	}
+}
+
+func TestApplyRetainsPersistedConfigOnlySensitiveSetPolicy(t *testing.T) {
+	resource := setThing("declared", "declared")
+	resource.Config["declared_members"] = []any{
+		map[string]any{"label": "same", "token": "declared-private-one"},
+		map[string]any{"label": "same", "token": "declared-private-two"},
+	}
+	resource.SensitiveAttributes = []string{"declared_members.token"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	resource.SensitiveAttributes = nil
+	resource.Config["name"] = "renamed"
+	current := loadState(t, h.statePath)
+	pl := h.plan(t, current, false)
+	if len(pl.Changes) != 1 || pl.Changes[0].Action != "update" {
+		t.Fatalf("declaration-removal plan = %+v", pl.Changes)
+	}
+	if _, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, current, h.statePath); ds.HasErrors() {
+		t.Fatalf("declaration-removal Apply: %+v", ds)
+	}
+	data, err := os.ReadFile(h.statePath) //nolint:gosec // test-controlled state path
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"declared-private-one", "declared-private-two"} {
+		if bytes.Contains(data, []byte(secret)) {
+			t.Fatalf("removed declaration declassified %q", secret)
+		}
+	}
+	saved := loadState(t, h.statePath)
+	if !slices.Contains(saved.Resources[resource.Address].SensitivePaths, "declared_members.token") {
+		t.Fatal("apply forgot persisted config-only sensitivity")
+	}
+
+	delete(h.cfg.Resources, resource.Address)
+	destroy := h.plan(t, saved, true)
+	if _, ds := apply.Apply(context.Background(), destroy, h.cfg, h.providers, h.schemas, saved, h.statePath); ds.HasErrors() {
+		t.Fatalf("state-only delete after declaration removal: %+v", ds)
+	}
+	if got := loadState(t, h.statePath).Resources[resource.Address]; got != nil {
+		t.Fatal("state-only delete retained resource")
+	}
+}
+
+func TestApplySensitiveSetMembershipTransitionsConverge(t *testing.T) {
+	resource := setThing("transitions", "transitions")
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+
+	transition := func(name string, attributeMembers, blockMembers []any) {
+		t.Helper()
+		resource.Config["attribute_members"] = attributeMembers
+		resource.Config["block_members"] = blockMembers
+		current := loadState(t, h.statePath)
+		pl := h.plan(t, current, false)
+		if len(pl.Changes) != 1 || pl.Changes[0].Action != "update" {
+			t.Fatalf("%s plan = %+v, want update", name, pl.Changes)
+		}
+		if _, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, current, h.statePath); ds.HasErrors() {
+			t.Fatalf("%s Apply: %+v", name, ds)
+		}
+		converged := h.plan(t, loadState(t, h.statePath), false)
+		if len(converged.Changes) != 1 || converged.Changes[0].Action != "no-op" {
+			t.Fatalf("%s second plan = %+v, want no-op", name, converged.Changes)
+		}
+		attrs := stateAttrs(t, h.statePath, resource.Address)
+		if len(attrs["attribute_members"].([]any)) != len(attributeMembers) || len(attrs["block_members"].([]any)) != len(blockMembers) {
+			t.Fatalf("%s public set cardinality did not follow transition", name)
+		}
+	}
+
+	transition("sensitive member change",
+		[]any{
+			setMember("attribute-token-changed", "attribute-detail-one"),
+			setMember("attribute-token-two", "attribute-detail-two"),
+		},
+		[]any{
+			setMember("block-token-changed", "block-detail-one"),
+			setMember("block-token-two", "block-detail-two"),
+		},
+	)
+	transition("sensitive member add",
+		[]any{
+			setMember("attribute-token-changed", "attribute-detail-one"),
+			setMember("attribute-token-two", "attribute-detail-two"),
+			setMember("attribute-token-three", "attribute-detail-three"),
+		},
+		[]any{
+			setMember("block-token-changed", "block-detail-one"),
+			setMember("block-token-two", "block-detail-two"),
+			setMember("block-token-three", "block-detail-three"),
+		},
+	)
+	transition("sensitive member remove",
+		[]any{setMember("attribute-token-two", "attribute-detail-two")},
+		[]any{setMember("block-token-two", "block-detail-two")},
+	)
+	transition("sensitive set emptied", []any{}, []any{})
+}
+
+func TestApplySensitiveSetPartialFailurePersistsRecovery(t *testing.T) {
+	resource := setThing("partial", "partial-set-failure")
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); !ds.HasErrors() {
+		t.Fatal("partial provider failure unexpectedly succeeded")
+	}
+	saved := loadState(t, h.statePath)
+	rs := saved.Resources[resource.Address]
+	if rs == nil || len(rs.SensitiveSetRecovery) == 0 {
+		t.Fatal("partial provider failure discarded sensitive set recovery")
+	}
+	if got := stateAttrs(t, h.statePath, resource.Address)["attribute_members"].([]any); len(got) != 2 {
+		t.Fatalf("partial checkpoint cardinality = %d, want 2", len(got))
+	}
+}
+
+func TestPlanRejectsSensitiveSetStateWithoutRecovery(t *testing.T) {
+	resource := setThing("legacy", "legacy")
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+	ambiguous := loadState(t, h.statePath)
+	ambiguous.Resources[resource.Address].SensitiveSetRecovery = nil
+	p := &plan.Planner{
+		Config: h.cfg, State: ambiguous, Providers: h.providers, Schemas: h.schemas,
+		EngineVersion: "0.1.1", Refresh: true,
+	}
+	_, ds := p.Plan(context.Background())
+	d := diagnosticWithSummary(ds, "invalid state attributes")
+	if d == nil || !strings.Contains(d.Detail, "authenticated sensitive projection contract is required") {
+		t.Fatalf("diagnostics = %#v, want explicit missing current contract error", ds)
+	}
+}
+
 func TestApplyResourceEnvWrapperRoundTrip(t *testing.T) {
 	const envName = "TCHORI_TEST_APPLY_NAME"
 	t.Setenv(envName, "alpha")
@@ -776,8 +1405,8 @@ func TestApplyMarkerSaveFailureRefusesProviderCall(t *testing.T) {
 	pl := h.plan(t, st, false)
 	h.statePath = filepath.Join(t.TempDir(), "missing", "state.json")
 	_, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
-	if !ds.HasErrors() || !diagnosticsContain(ds, "marking state incomplete") {
-		t.Fatalf("diagnostics = %+v, want marking failure", ds)
+	if !ds.HasErrors() {
+		t.Fatal("apply must refuse mutation when it cannot prepare durable state")
 	}
 	if diagnosticsContain(ds, "apply exploded") {
 		t.Fatalf("provider was called after marker save failed: %+v", ds)
@@ -846,9 +1475,14 @@ func TestApplyStateOnlyDeleteFailureAfterSuccess(t *testing.T) {
 	h := newHarness(t, map[string]*config.Resource{alpha: thing("alpha", "alpha")})
 	st := loadState(t, h.statePath)
 	pl := h.plan(t, st, false)
-	pl.Changes = append(pl.Changes, &plan.Change{Address: orphan, Action: "delete"})
+	pl.Changes = append(pl.Changes, &plan.Change{
+		Address: orphan, Type: "tchoritest_thing", Provider: "missing",
+		ProviderSource: "example.test/missing", Action: "delete",
+	})
 	pl.Summary.Delete++
-	st.Resources[orphan] = &state.ResourceState{Type: "tchoritest_thing", Provider: "missing", Attributes: json.RawMessage(`{}`)}
+	st.Resources[orphan] = &state.ResourceState{
+		Type: "tchoritest_thing", Provider: "missing", ProviderSource: "example.test/missing", Attributes: json.RawMessage(`{}`),
+	}
 
 	_, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if !diagnosticsContain(ds, "provider not running") {
@@ -1044,9 +1678,10 @@ func TestApplyRejectsPoisonedStateReferencePropagation(t *testing.T) {
 		Serial:        7,
 		Resources: map[string]*state.ResourceState{
 			aAddr: {
-				Type:       "tchoritest_thing",
-				Provider:   "tchoritest",
-				Attributes: json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"tags":{"parent":"safe-parent"}}`),
+				Type:           "tchoritest_thing",
+				Provider:       "tchoritest",
+				ProviderSource: "tchori-labs/tchoritest",
+				Attributes:     json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"rules":null,"tags":{"parent":"safe-parent"}}`),
 			},
 		},
 	}
@@ -1072,7 +1707,10 @@ func TestApplyRejectsPoisonedStateReferencePropagation(t *testing.T) {
 	// Reproduce state left by an older engine after planning. Write directly
 	// to preserve the plan serial; the poisoned entry is intentionally not
 	// cleaned by TC-048, only refused when another outgoing value reads it.
-	st.Resources[aAddr].Attributes = json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"tags":{"parent":"${tchoritest_thing.ghost.id}"}}`)
+	st.FormatVersion = "1.2"
+	st.Resources[aAddr].SensitiveRecoveryVersion = 0
+	st.Resources[aAddr].SensitiveSetRecovery = nil
+	st.Resources[aAddr].Attributes = json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"rules":null,"tags":{"parent":"${tchoritest_thing.ghost.id}"}}`)
 	stateBytes, err = json.Marshal(st)
 	if err != nil {
 		t.Fatalf("marshal poisoned state: %v", err)
@@ -1202,9 +1840,64 @@ func TestApplyDestroyFailureBlocksDependencyDelete(t *testing.T) {
 	if blocked == nil || blocked.Address != base || blocked.Severity != diag.Error {
 		t.Fatalf("blocked diagnostic = %+v", blocked)
 	}
+
 	saved := loadState(t, h.statePath)
 	if saved.Resources[base] == nil || saved.Resources[dependentAddr] == nil {
 		t.Fatalf("destroy removed a blocked or failed resource: %+v", saved.Resources)
+	}
+}
+func TestApplyCheckpointsAuthoritativeDestroyStateOnProviderError(t *testing.T) {
+	for _, tc := range []struct {
+		action      string
+		name        string
+		wantPresent bool
+		wantEcho    string
+		wantPrivate string
+	}{
+		{action: "delete", name: "partial_destroy_null"},
+		{action: "replace", name: "partial_destroy_null"},
+		{action: "delete", name: "partial_destroy_state", wantPresent: true, wantEcho: "destroy-side-effect", wantPrivate: "destroy-partial-recovery"},
+		{action: "replace", name: "partial_destroy_state", wantPresent: true, wantEcho: "destroy-side-effect", wantPrivate: "destroy-partial-recovery"},
+	} {
+		t.Run(tc.action+"/"+tc.name, func(t *testing.T) {
+			const addr = "tchoritest_thing.subject"
+			h := newHarness(t, map[string]*config.Resource{addr: thing("subject", tc.name)})
+			st := loadState(t, h.statePath)
+			if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+				t.Fatalf("initial Apply: %+v", ds)
+			}
+			st = loadState(t, h.statePath)
+			if tc.action == "replace" {
+				h.cfg.Resources[addr].Config["replace_me"] = "replacement"
+			}
+			pl := h.plan(t, st, tc.action == "delete")
+			if len(pl.Changes) != 1 || pl.Changes[0].Action != tc.action {
+				t.Fatalf("changes = %+v, want one %s", pl.Changes, tc.action)
+			}
+
+			result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+			if !diagnosticsContain(ds, "destroy partially failed") {
+				t.Fatalf("diagnostics = %+v, want provider destroy error", ds)
+			}
+			if result.Deleted != 0 || result.Replaced != 0 {
+				t.Fatalf("result = %+v, failed destroy must remain unaccounted", result)
+			}
+			saved := loadState(t, h.statePath)
+			got := saved.Resources[addr]
+			if tc.wantPresent != (got != nil) {
+				t.Fatalf("resource presence = %v, want %v", got != nil, tc.wantPresent)
+			}
+			if got != nil {
+				var attrs map[string]any
+				if err := json.Unmarshal(got.Attributes, &attrs); err != nil {
+					t.Fatal(err)
+				}
+				if attrs["echo"] != tc.wantEcho || string(got.Private) != tc.wantPrivate {
+					t.Fatalf("checkpoint = attrs %s private %q, want echo %q private %q", got.Attributes, got.Private, tc.wantEcho, tc.wantPrivate)
+				}
+			}
+			wantIncomplete(t, saved, addr, []string{}, []string{addr})
+		})
 	}
 }
 
@@ -1214,24 +1907,26 @@ func TestApplyMultipleStateOnlyDeletesIncludeNullAndPrivateState(t *testing.T) {
 	h := newHarness(t, map[string]*config.Resource{})
 	st := &state.State{FormatVersion: "1.0", Resources: map[string]*state.ResourceState{
 		alpha: {
-			Type:       "tchoritest_thing",
-			Provider:   "tchoritest",
-			Attributes: json.RawMessage("null"),
-			Private:    []byte("alpha-private"),
+			Type:           "tchoritest_thing",
+			Provider:       "tchoritest",
+			ProviderSource: "tchori-labs/tchoritest",
+			Attributes:     json.RawMessage("null"),
+			Private:        []byte("alpha-private"),
 		},
 		zeta: {
-			Type:       "tchoritest_thing",
-			Provider:   "tchoritest",
-			Attributes: json.RawMessage(`{"echo":"zeta","id":"id-zeta","name":"zeta","replace_me":null,"tags":null}`),
-			Private:    []byte("zeta-private"),
+			Type:           "tchoritest_thing",
+			Provider:       "tchoritest",
+			ProviderSource: "tchori-labs/tchoritest",
+			Attributes:     json.RawMessage(`{"echo":"zeta","id":"id-zeta","name":"zeta","replace_me":null,"rules":null,"tags":null}`),
+			Private:        []byte("zeta-private"),
 		},
 	}}
 	if err := st.Save(h.statePath); err != nil {
 		t.Fatal(err)
 	}
 	pl := &plan.Plan{StateSerial: st.Serial, Changes: []*plan.Change{
-		{Address: alpha, Action: "delete"},
-		{Address: zeta, Action: "delete"},
+		{Address: alpha, Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Action: "delete"},
+		{Address: zeta, Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Action: "delete"},
 	}}
 	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if ds.HasErrors() {
@@ -1251,15 +1946,16 @@ func TestApplyStateOnlyDeletesKeepReverseLexicalOrderAfterFailures(t *testing.T)
 	const zeta = "tchoritest_thing.zeta"
 	exploding := func(private string) *state.ResourceState {
 		return &state.ResourceState{
-			Type:       "tchoritest_thing",
-			Provider:   "tchoritest",
-			Attributes: json.RawMessage(`{"echo":"explode_destroy","id":"id-explode_destroy","name":"explode_destroy","replace_me":null,"tags":null}`),
-			Private:    []byte(private),
+			Type:           "tchoritest_thing",
+			Provider:       "tchoritest",
+			ProviderSource: "tchori-labs/tchoritest",
+			Attributes:     json.RawMessage(`{"echo":"explode_destroy","id":"id-explode_destroy","name":"explode_destroy","replace_me":null,"rules":null,"tags":null}`),
+			Private:        []byte(private),
 		}
 	}
 	h := newHarness(t, map[string]*config.Resource{})
 	st := &state.State{FormatVersion: "1.0", Resources: map[string]*state.ResourceState{
-		alpha:  {Type: "tchoritest_thing", Provider: "tchoritest", Attributes: json.RawMessage("null")},
+		alpha:  {Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Attributes: json.RawMessage("null")},
 		middle: exploding("middle-private"),
 		zeta:   exploding("zeta-private"),
 	}}
@@ -1267,9 +1963,9 @@ func TestApplyStateOnlyDeletesKeepReverseLexicalOrderAfterFailures(t *testing.T)
 		t.Fatal(err)
 	}
 	pl := &plan.Plan{StateSerial: st.Serial, Changes: []*plan.Change{
-		{Address: alpha, Action: "delete"},
-		{Address: middle, Action: "delete"},
-		{Address: zeta, Action: "delete"},
+		{Address: alpha, Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Action: "delete"},
+		{Address: middle, Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Action: "delete"},
+		{Address: zeta, Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Action: "delete"},
 	}}
 	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
 	if !ds.HasErrors() || result.Deleted != 1 || len(result.NotExecuted) != 0 {
@@ -1374,15 +2070,18 @@ func TestApplyCreateIgnoresStalePriorState(t *testing.T) {
 	}
 
 	pl := &plan.Plan{
-		FormatVersion: "1.0",
+		FormatVersion: plan.FormatVersion,
 		EngineVersion: "0.1.0-dev",
 		StateSerial:   0,
 		Changes: []*plan.Change{{
-			Address:    addr,
-			Action:     "create",
-			Before:     json.RawMessage("null"),
-			PlannedRaw: raw,
-			Private:    pc.Private,
+			Address:        addr,
+			Type:           "tchoritest_thing",
+			Provider:       "tchoritest",
+			ProviderSource: "tchori-labs/tchoritest",
+			Action:         "create",
+			Before:         json.RawMessage("null"),
+			PlannedRaw:     raw,
+			Private:        pc.Private,
 		}},
 		Summary: plan.Summary{Create: 1},
 	}
@@ -1401,9 +2100,10 @@ func TestApplyCreateIgnoresStalePriorState(t *testing.T) {
 		Serial:        0,
 		Resources: map[string]*state.ResourceState{
 			addr: {
-				Type:       "tchoritest_thing",
-				Provider:   "tchoritest",
-				Attributes: json.RawMessage(`{"echo":"stale","id":"stale-id","name":"stale","replace_me":null,"rules":null,"tags":"not-a-map"}`),
+				Type:           "tchoritest_thing",
+				Provider:       "tchoritest",
+				ProviderSource: "tchori-labs/tchoritest",
+				Attributes:     json.RawMessage(`{"echo":"stale","id":"stale-id","name":"stale","replace_me":null,"rules":null,"tags":"not-a-map"}`),
 			},
 		},
 	}
@@ -1513,9 +2213,10 @@ func TestApplyMixedOptionalNestedObjects(t *testing.T) {
 	const attrs = `{"id":"id-demo","name":"demo","ingress":[{"service":"http://one","origin_request":null},{"service":"http://two","origin_request":{"connect_timeout":null,"no_tls_verify":null}}]}`
 	st := &state.State{FormatVersion: "1.0", Serial: 1, Resources: map[string]*state.ResourceState{
 		"tchoritest_ingress_thing.demo": {
-			Type:       "tchoritest_ingress_thing",
-			Provider:   "tchoritest",
-			Attributes: json.RawMessage(attrs),
+			Type:           "tchoritest_ingress_thing",
+			Provider:       "tchoritest",
+			ProviderSource: "tchori-labs/tchoritest",
+			Attributes:     json.RawMessage(attrs),
 		},
 	}}
 	pl := h.plan(t, st, false)
@@ -1554,8 +2255,11 @@ func TestApplyUnsupportedResourceType(t *testing.T) {
 		FormatVersion: "1.0",
 		EngineVersion: "0.1.0-dev",
 		StateSerial:   0,
-		Changes:       []*plan.Change{{Address: "tchoritest_broken_thing.boom", Action: "create"}},
-		Summary:       plan.Summary{Create: 1},
+		Changes: []*plan.Change{{
+			Address: "tchoritest_broken_thing.boom", Type: "tchoritest_broken_thing",
+			Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest", Action: "create",
+		}},
+		Summary: plan.Summary{Create: 1},
 	}
 
 	_, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
@@ -1855,4 +2559,26 @@ func TestApplyPreLoopRefusalsDoNotReportAbort(t *testing.T) {
 			t.Fatalf("diagnostics = %#v", ds)
 		}
 	})
+}
+
+func TestApplyRequiresArtifactKeyBeforeMutation(t *testing.T) {
+	const addr = "tchoritest_thing.example"
+	h := newHarness(t, map[string]*config.Resource{addr: thing("example", "example")})
+	st := loadState(t, h.statePath)
+	pl := h.plan(t, st, false)
+	t.Setenv("TCHORI_ARTIFACT_KEY", "")
+	result, ds := apply.Apply(context.Background(), pl, h.cfg, h.providers, h.schemas, st, h.statePath)
+	if !ds.HasErrors() || diagnosticWithSummary(ds, "invalid artifact key") == nil {
+		t.Fatalf("Apply diagnostics = %+v, want invalid artifact key", ds)
+	}
+	if result.Created != 0 || result.Updated != 0 || result.Deleted != 0 ||
+		result.Replaced != 0 || len(result.NotExecuted) != 0 {
+		t.Fatalf("Apply result = %+v, want zero result", result)
+	}
+	if st.Serial != 0 || st.Incomplete != nil || len(st.Resources) != 0 {
+		t.Fatal("Apply mutated in-memory state without a key")
+	}
+	if _, err := os.Stat(h.statePath); !os.IsNotExist(err) {
+		t.Fatalf("Apply created state without a key: %v", err)
+	}
 }

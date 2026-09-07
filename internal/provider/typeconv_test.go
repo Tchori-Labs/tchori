@@ -3,6 +3,7 @@ package provider
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -16,6 +17,28 @@ import (
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/provider/proto/tfplugin6"
 )
+
+func TestLoadedConfigPreservesLargeNumbers(t *testing.T) {
+	dir := t.TempDir()
+	body := `{"providers":{"test":{"source":"example/test","version":"1.0.0","config":{"value":9007199254740993}}},"resources":{"test_thing.demo":{"config":{"value":9007199254740993}}}}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, ds := config.Load(dir)
+	if ds.HasErrors() {
+		t.Fatalf("load config: %+v", ds)
+	}
+	ty := cty.Object(map[string]cty.Type{"value": cty.Number})
+	for _, raw := range []map[string]any{cfg.Providers["test"].Config, cfg.Resources["test_thing.demo"].Config} {
+		got, ds := Compose(raw, ty, EnvResolve, nil)
+		if ds.HasErrors() {
+			t.Fatalf("compose: %+v", ds)
+		}
+		if !got.GetAttr("value").RawEquals(cty.NumberIntVal(9007199254740993)) {
+			t.Fatalf("configured integer changed before provider RPC: %s", got.GetAttr("value").AsBigFloat().Text('f', 0))
+		}
+	}
+}
 
 func TestEncodeDynamicMsgpackRoundTripUnknown(t *testing.T) {
 	ty := cty.Object(map[string]cty.Type{

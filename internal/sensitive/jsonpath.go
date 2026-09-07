@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strconv"
+	"strings"
+
+	"github.com/zclconf/go-cty/cty"
 )
 
 // RedactJSON provider-freely nulls matching concrete leaves in ctyjson bytes.
-// Sensitivity is index-insensitive while exemptions are exact instance paths.
-func RedactJSON(attrs json.RawMessage, paths []string, exemptInstances []string) (json.RawMessage, []string, error) {
+// It is intentionally conservative and never honors literal exemptions; use
+// Spec.RedactJSON when a live schema and raw configuration are available.
+func RedactJSON(attrs json.RawMessage, paths []string) (json.RawMessage, []string, error) {
 	if len(paths) == 0 {
 		return append(json.RawMessage(nil), attrs...), nil, nil
 	}
@@ -22,12 +25,8 @@ func RedactJSON(attrs json.RawMessage, paths []string, exemptInstances []string)
 	}
 	sortedPaths := append([]string(nil), paths...)
 	sort.Strings(sortedPaths)
-	exempt := map[string]bool{}
-	for _, p := range exemptInstances {
-		exempt[p] = true
-	}
 	changed := map[string]bool{}
-	root = redactJSONValue(root, "", "", sortedPaths, exempt, changed, false)
+	root = redactJSONValue(root, "", sortedPaths, changed)
 	out, err := json.Marshal(root)
 	if err != nil {
 		return nil, nil, fmt.Errorf("encode attributes: %w", err)
@@ -40,13 +39,10 @@ func RedactJSON(attrs json.RawMessage, paths []string, exemptInstances []string)
 	return out, redacted, nil
 }
 
-func redactJSONValue(v any, logical, instance string, paths []string, exempt map[string]bool, changed map[string]bool, ambiguous bool) any {
+func redactJSONValue(v any, logical string, paths []string, changed map[string]bool) any {
 	if contains(paths, logical) {
 		if v == nil {
 			return nil
-		}
-		if !ambiguous && exempt[instance] {
-			return v
 		}
 		changed[logical] = true
 		return nil
@@ -54,7 +50,7 @@ func redactJSONValue(v any, logical, instance string, paths []string, exempt map
 	switch x := v.(type) {
 	case []any:
 		for i := range x {
-			x[i] = redactJSONValue(x[i], logical, fmt.Sprintf("%s[%d]", instance, i), paths, exempt, changed, ambiguous)
+			x[i] = redactJSONValue(x[i], logical, paths, changed)
 		}
 	case map[string]any:
 		keys := make([]string, 0, len(x))
@@ -65,13 +61,101 @@ func redactJSONValue(v any, logical, instance string, paths []string, exempt map
 		for _, key := range keys {
 			candidate := join(logical, key)
 			if pathPrefix(candidate, paths) {
-				_, containerMap := x[key].(map[string]any)
-				_, containerList := x[key].([]any)
-				x[key] = redactJSONValue(x[key], candidate, join(instance, key), paths, exempt, changed, ambiguous || (contains(paths, candidate) && (containerMap || containerList)))
+				x[key] = redactJSONValue(x[key], candidate, paths, changed)
 			} else {
-				x[key] = redactJSONValue(x[key], logical, instance+"["+strconv.Quote(key)+"]", paths, exempt, changed, ambiguous)
+				x[key] = redactJSONValue(x[key], logical, paths, changed)
 			}
 		}
 	}
 	return v
+}
+
+// JSONSanitizer sanitizes ctyjson bytes with a live schema while retaining
+// authenticated sensitive-set recovery separately from the public projection.
+// generationVersion and generationPaths describe the authenticated projection
+// being opened; currentPaths describe the policy to emit.
+type JSONSanitizer func(attrs json.RawMessage, recovery []byte, generationVersion int, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error)
+
+// Sanitizer binds this sensitivity specification to a concrete provider type.
+func (s *Spec) Sanitizer(ty cty.Type) JSONSanitizer {
+	return func(attrs json.RawMessage, recovery []byte, generationVersion int, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error) {
+		return s.SanitizeJSON(attrs, recovery, ty, generationVersion, generationPaths, currentPaths)
+	}
+}
+
+// SanitizeJSON opens the persisted projection under its generation-time
+// contract, then emits a fresh projection and recovery payload under the
+// current policy. A new policy may therefore withhold additional fields
+// without weakening the authenticated association of existing set recovery.
+func (s *Spec) SanitizeJSON(attrs json.RawMessage, recovery []byte, ty cty.Type, generationVersion int, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error) {
+	effectivePaths := sortedUnique(currentPaths)
+	generationPublic, err := decodeJSON(attrs)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("decode public state: %w", err)
+	}
+	var directRecoveryPaths []string
+	for _, path := range generationPaths {
+		if contains(effectivePaths, path) && publicPathContainsNull(generationPublic, path) {
+			directRecoveryPaths = append(directRecoveryPaths, path)
+		}
+	}
+	spec := &Spec{
+		paths: effectivePaths, exempt: s.exempt,
+		setPrefixes:         affectedSets(s.allSetPrefixes, effectivePaths),
+		allSetPrefixes:      s.allSetPrefixes,
+		directRecoveryPaths: sortedUnique(directRecoveryPaths),
+	}
+	value, err := spec.restoreGeneration(attrs, recovery, ty, generationPaths, generationVersion)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("decode typed attributes: %w", err)
+	}
+	out, changed, nextRecovery, err := spec.Project(value)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return out, changed, nextRecovery, nil
+}
+
+func publicPathContainsNull(root any, logical string) bool {
+	if logical == "" {
+		return root == nil
+	}
+	parts := strings.Split(logical, ".")
+	var walk func(any, int) bool
+	walk = func(value any, index int) bool {
+		if value == nil {
+			return true
+		}
+		if index == len(parts) {
+			return false
+		}
+		switch current := value.(type) {
+		case map[string]any:
+			child, ok := current[parts[index]]
+			return ok && walk(child, index+1)
+		case []any:
+			for _, child := range current {
+				if walk(child, index) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(root, 0)
+}
+
+func sortedUnique(paths []string) []string {
+	set := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if path != "" {
+			set[path] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for path := range set {
+		out = append(out, path)
+	}
+	sort.Strings(out)
+	return out
 }
