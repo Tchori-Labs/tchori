@@ -231,7 +231,13 @@ EOF
 - [ ] **7. Import.** Run `tchori import cloudflare_dns_record.<name>
       <record-id>` using the exact recorded values. Both operands are required.
       It must exit 0 and print `Imported cloudflare_dns_record.<name>
-      (id=<record-id>).`; missing operands exit 1.
+      (id=<record-id>).`; missing operands exit 1. This default path refuses an
+      address already present in state. To replace an existing entry after an
+      out-of-band live update, use the explicit
+      `tchori import --refresh cloudflare_dns_record.<name> <record-id>` path.
+      It reads only that named resource through the provider, performs no
+      Create/Update/Delete operation, and writes one atomic state replacement;
+      the default command remains refusal-only for existing addresses.
 - [ ] **8. Inspect.** `tchori state show cloudflare_dns_record.<name>` must show
       the intended object. Compare every attribute with the full API object.
 - [ ] **9. Prove a no-op plan.** `tchori plan` must exit 0 and print `No
@@ -254,9 +260,12 @@ is encrypted. Unmarked attributes can still carry token-derived data; inspect
 diffs before committing. Neither sanitization nor encryption revokes an
 already exposed credential or removes historical copies.
 
-Import never overwrites an existing state entry, so repeating it after a
-mistake exits 1. For the expected uncommitted failure (wrong object, or plan
-still changing after config adjustment), do not hand-edit state. From
+Import without `--refresh` never overwrites an existing state entry, so
+repeating it after a mistake exits 1. `--refresh` is the explicit replacement
+path: it holds the state lock, calls only provider import/read for the named
+address, and commits one format-1.2 serial increment with the existing backup
+mechanism. For the expected uncommitted failure (wrong object, or plan still
+changing after config adjustment), do not hand-edit state. From
 `infra/cloudflare`, restore the generated change with `git restore --
 state.json` (or `git checkout -- state.json`), fix config or the record ID, and
 restart at validation. If a wrong import was already merged, open a reverting
