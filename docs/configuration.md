@@ -133,12 +133,15 @@ reads of artifacts without encrypted fields do not require it merely to parse
 those artifacts. Invalid keys, failed authentication, and address/type/provider
 source/purpose tampering produce errors without revealing protected values.
 
-New state writes use format `1.3`; plan writes remain format `1.2`. This build
-reads state `1.2` recovery envelopes, `1.1` encrypted-private artifacts, and
-legacy `1.0` artifacts for migration. Older engines reject newer formats
-instead of applying a plan or rewriting state without the required sensitive
-recovery generation boundary. `tchori state sanitize` upgrades prior state and
-protects its backup without applying infrastructure changes.
+Fresh/current state writes use format `1.3`; plan writes remain format `1.2`.
+This build reads state `1.2` recovery envelopes, `1.1` encrypted-private
+artifacts, and legacy `1.0` artifacts for migration. A legacy state remains
+truthfully `1.2` until live schemas can restore and reproject every resource to
+the current generation; apply refuses provider mutations until that succeeds.
+Older engines reject newer formats instead of rewriting state without the
+required boundary. `tchori state sanitize` protects prior state and its backup
+without applying infrastructure changes, upgrading to `1.3` when live schemas
+can restore and reproject every resource.
 Previously leaked values still require credential rotation and history
 cleanup; rewriting the working tree does not erase existing commits.
 Legacy plans carrying private bytes without recorded resource identity must
@@ -151,3 +154,10 @@ Encryption protects provider-private bytes and sensitive-set identity, not the
 entire document. Resource attributes still rely on provider sensitivity
 metadata and explicit `sensitive_attributes`; treat artifacts as sensitive and
 review them before publishing.
+
+The state generation marker is a current-format integrity check, not a global
+rollback counter. Format `1.3` rejects missing, zero, or invalid current
+generation metadata, while envelope authentication detects ciphertext and
+bound-context tampering. Whole-document replacement or relabeling to a valid
+legacy artifact requires trusted repository/storage history or an external
+monotonic trust anchor to detect.

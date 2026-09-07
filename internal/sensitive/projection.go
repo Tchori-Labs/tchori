@@ -24,14 +24,6 @@ func RecoveryVersionSupported(version int) bool {
 	return version >= 1 && version <= RecoveryVersion
 }
 
-// RecoveryGeneration reports the persisted generation marker for a payload.
-func RecoveryGeneration(recovery []byte) int {
-	if len(recovery) == 0 {
-		return 0
-	}
-	return RecoveryVersion
-}
-
 type recoveryPayload struct {
 	Version          int           `json:"version"`
 	ProjectionSHA256 []byte        `json:"projection_sha256"`

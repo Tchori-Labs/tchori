@@ -26,6 +26,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/plan"
 	"github.com/tchori-labs/tchori/internal/privateblob"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 	"github.com/tchori-labs/tchori/internal/state"
 )
 
@@ -1746,7 +1747,7 @@ func TestImportRefreshScanFailureRollsBackState(t *testing.T) {
 		"provider":                   "tchoritest",
 		"provider_source":            "tchori-labs/tchoritest",
 		"attributes":                 map[string]any{"echo": "other", "id": "t-id-other", "name": map[string]any{"unexpected": true}},
-		"sensitive_recovery_version": 0,
+		"sensitive_recovery_version": sensitive.RecoveryVersion,
 		"sensitive_paths":            []string{"name"},
 		"sensitive_scanned":          true,
 	}

@@ -97,6 +97,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if len(reloaded.Resources) != 1 {
 		t.Fatalf("Load after first Save: len(Resources) = %d, want 1", len(reloaded.Resources))
 	}
+	if got := reloaded.Resources["null_resource.demo"].SensitiveRecoveryVersion; got != sensitive.RecoveryVersion {
+		t.Fatalf("current resource generation = %d, want %d", got, sensitive.RecoveryVersion)
+	}
 
 	if err := reloaded.Save(path); err != nil {
 		t.Fatalf("Save #2 = %v", err)
@@ -1290,6 +1293,7 @@ func TestSaveSanitizesBackupFromEffectiveHintWhenValueNowNull(t *testing.T) {
 }
 
 func TestSavePreservesLiteralAndRecordedSensitivity(t *testing.T) {
+	setStateArtifactKey(t, 35)
 	path := filepath.Join(t.TempDir(), "state.json")
 	initial := `{"format_version":"1.0","serial":0,"resources":{` +
 		`"secret.literal":{"type":"secret","provider":"test","attributes":{"token":"literal-token-ok"},"sensitive_paths":["token"]},` +
@@ -1305,15 +1309,38 @@ func TestSavePreservesLiteralAndRecordedSensitivity(t *testing.T) {
 	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
 		"token": {Type: cty.String, Sensitive: true},
 	}}
+	tokenType := cty.Object(map[string]cty.Type{"token": cty.String})
 	spec, ds := sensitive.Resolve(block, nil, map[string]any{"token": "literal-token-ok"}) //nolint:gosec // synthetic sensitivity fixture
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	backupSpec, ds := sensitive.Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	noteType := cty.Object(map[string]cty.Type{"note": cty.String})
+	noteBlock := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"note": {Type: cty.String, Sensitive: true},
+	}}
+	noteSpec, ds := sensitive.Resolve(noteBlock, nil, nil)
 	if ds.HasErrors() {
 		t.Fatal(ds)
 	}
 	s.SetSensitiveResolver(func(addr string, _ *ResourceState) (Resolution, bool) {
 		if addr == "secret.literal" {
-			return Resolution{Paths: spec.Paths(), SanitizeAttributes: spec.Sanitizer(cty.Object(map[string]cty.Type{"token": cty.String}))}, true
+			return Resolution{
+				Paths:              spec.Paths(),
+				ProviderSource:     "example.test/test",
+				SanitizeAttributes: spec.Sanitizer(tokenType),
+				SanitizeBackup:     backupSpec.Sanitizer(tokenType),
+			}, true
 		}
-		return Resolution{}, true
+		return Resolution{
+			ProviderSource:     "example.test/test",
+			Paths:              noteSpec.Paths(),
+			SanitizeAttributes: noteSpec.Sanitizer(noteType),
+			SanitizeBackup:     noteSpec.Sanitizer(noteType),
+		}, true
 	})
 	if err := s.Save(path); err != nil {
 		t.Fatal(err)
@@ -1580,6 +1607,9 @@ func TestSaveMigratesLegacyPrivateInStateAndBackup(t *testing.T) {
 		t.Fatal("legacy load lost private bytes")
 	}
 	s.Resources["test_thing.example"].ProviderSource = "example.test/test"
+	s.SetSensitiveResolver(func(string, *ResourceState) (Resolution, bool) {
+		return Resolution{ProviderSource: "example.test/test"}, true
+	})
 	if err := s.Save(path); err != nil {
 		t.Fatalf("Save migration after explicit source binding = %v", err)
 	}
@@ -1696,6 +1726,58 @@ func TestSaveHonorsLegacyRedactedHint(t *testing.T) {
 		if bytes.Contains(data, []byte("legacy-secret")) || !bytes.Contains(data, []byte("public")) {
 			t.Fatal("Save did not preserve public data while masking a legacy redacted hint")
 		}
+	}
+}
+
+func TestSavePreservesLegacyFormatWhenProjectionCannotBeRestored(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	document := `{"format_version":"1.0","serial":1,"resources":{"thing.old":{"type":"thing","provider":"test","attributes":{"secret":"legacy-secret"},"redacted":["secret"]}}}`
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if s.FormatVersion != recoveryFormatVersion {
+		t.Fatalf("FormatVersion = %q, want truthful legacy format %q", s.FormatVersion, recoveryFormatVersion)
+	}
+	data, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(data, []byte(`"format_version": "1.2"`)) ||
+		!bytes.Contains(data, []byte(`"sensitive_recovery_version": 0`)) {
+		t.Fatalf("unrestored legacy projection was mislabeled as current: %s", data)
+	}
+}
+
+func TestSaveRefusesIncompleteLegacyProjectionBeforeWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	document := []byte(`{"format_version":"1.0","serial":1,"resources":{"thing.old":{"type":"thing","provider":"test","attributes":{"secret":"legacy-secret"},"redacted":["secret"]}}}`)
+	if err := os.WriteFile(path, document, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Incomplete = &IncompleteApply{Remaining: []string{"thing.old"}}
+	if err := s.Save(path); err == nil {
+		t.Fatal("Save accepted an incomplete marker on an unrestored legacy projection")
+	}
+	after, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, document) {
+		t.Fatalf("refused apply preflight changed state: %s", after)
+	}
+	if _, err := os.Stat(path + ".backup"); !os.IsNotExist(err) {
+		t.Fatalf("refused apply preflight created backup: %v", err)
 	}
 }
 
@@ -1909,6 +1991,10 @@ func TestCurrentMapRecoveryGenerationCannotBeStripped(t *testing.T) {
 		{"envelope removed", func(resource map[string]any) {
 			delete(resource, "sensitive_set_recovery")
 		}, false},
+		{"envelope removed and marker reset", func(resource map[string]any) {
+			delete(resource, "sensitive_set_recovery")
+			resource["sensitive_recovery_version"] = 0
+		}, true},
 		{"marker and envelope removed", func(resource map[string]any) {
 			delete(resource, "sensitive_recovery_version")
 			delete(resource, "sensitive_set_recovery")
