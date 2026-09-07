@@ -172,11 +172,15 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 				prior = cty.NullVal(ty)
 				priorPrivate = nil
 			} else {
-				attrs, redactedPaths, recovery, err := spec.Project(rv)
+				refreshed, carryErr := spec.CarryForwardBestEffort(prior, rv, rs.SensitivePaths)
+				if carryErr != nil {
+					return nil, append(ds, diag.Errorf(addr, "cannot preserve sensitive state", carryErr.Error()))
+				}
+				attrs, redactedPaths, recovery, err := spec.Project(refreshed)
 				if err != nil {
 					return nil, append(ds, diag.Errorf(addr, "cannot redact refreshed state", err.Error()))
 				}
-				drift, err := newTypedDrift(addr, recordedAttrs, attrs, prior, rv, spec)
+				drift, err := newTypedDrift(addr, recordedAttrs, attrs, prior, refreshed, spec)
 				if err != nil {
 					ds = append(ds, diag.Errorf(addr, "cannot compare refreshed state", err.Error()))
 					return nil, ds
@@ -196,7 +200,7 @@ func (p *Planner) Plan(ctx context.Context) (*Plan, diag.Diagnostics) {
 				// drop a still-schema-valid recorded one.
 				rs.SensitivePaths = spec.Paths()
 				rs.SensitiveScanned = true
-				prior = rv
+				prior = refreshed
 				priorPrivate = rpriv
 			}
 		}

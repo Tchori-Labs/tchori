@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/zclconf/go-cty/cty"
 )
@@ -88,12 +89,21 @@ func (s *Spec) Sanitizer(ty cty.Type) JSONSanitizer {
 // without weakening the authenticated association of existing set recovery.
 func (s *Spec) SanitizeJSON(attrs json.RawMessage, recovery []byte, ty cty.Type, generationVersion int, generationPaths, currentPaths []string) (json.RawMessage, []string, []byte, error) {
 	effectivePaths := sortedUnique(currentPaths)
-	setPrefixes := affectedSets(s.allSetPrefixes, effectivePaths)
+	generationPublic, err := decodeJSON(attrs)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("decode public state: %w", err)
+	}
+	var directRecoveryPaths []string
+	for _, path := range generationPaths {
+		if contains(effectivePaths, path) && publicPathContainsNull(generationPublic, path) {
+			directRecoveryPaths = append(directRecoveryPaths, path)
+		}
+	}
 	spec := &Spec{
-		paths:          effectivePaths,
-		exempt:         s.exempt,
-		setPrefixes:    setPrefixes,
-		allSetPrefixes: s.allSetPrefixes,
+		paths: effectivePaths, exempt: s.exempt,
+		setPrefixes:         affectedSets(s.allSetPrefixes, effectivePaths),
+		allSetPrefixes:      s.allSetPrefixes,
+		directRecoveryPaths: sortedUnique(directRecoveryPaths),
 	}
 	value, err := spec.restoreGeneration(attrs, recovery, ty, generationPaths, generationVersion)
 	if err != nil {
@@ -104,6 +114,35 @@ func (s *Spec) SanitizeJSON(attrs json.RawMessage, recovery []byte, ty cty.Type,
 		return nil, nil, nil, err
 	}
 	return out, changed, nextRecovery, nil
+}
+
+func publicPathContainsNull(root any, logical string) bool {
+	if logical == "" {
+		return root == nil
+	}
+	parts := strings.Split(logical, ".")
+	var walk func(any, int) bool
+	walk = func(value any, index int) bool {
+		if value == nil {
+			return true
+		}
+		if index == len(parts) {
+			return false
+		}
+		switch current := value.(type) {
+		case map[string]any:
+			child, ok := current[parts[index]]
+			return ok && walk(child, index+1)
+		case []any:
+			for _, child := range current {
+				if walk(child, index) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(root, 0)
 }
 
 func sortedUnique(paths []string) []string {

@@ -444,7 +444,7 @@ func runImport(cmd *cobra.Command, args []string, refresh bool) (int, error) {
 		return 1, fmt.Errorf("%s: existing state identity (%s/%s) does not match configuration (%s/%s); state was not changed",
 			address, existing.Provider, existing.Type, res.Provider, res.Type)
 	}
-	if refresh && existing.ProviderSource != "" && existing.ProviderSource != rt.Config.Providers[res.Provider].Source {
+	if refresh && existing.ProviderSource != rt.Config.Providers[res.Provider].Source {
 		return 1, fmt.Errorf("%s: existing state provider source %q does not match configuration source %q; state was not changed",
 			address, existing.ProviderSource, rt.Config.Providers[res.Provider].Source)
 	}
@@ -489,6 +489,23 @@ func runImport(cmd *cobra.Command, args []string, refresh bool) (int, error) {
 		return 1, fmt.Errorf("%s: unsupported schema for resource type %q: %s", address, res.Type, unsupported)
 	}
 	ty := schema.Block.ImpliedType()
+	declaredSensitive := res.SensitiveAttributes
+	var persistedSensitive []string
+	if refresh {
+		persistedSensitive = existing.SensitivePaths
+	}
+	spec, sds := sensitive.ResolveWithPersisted(schema.Block, declaredSensitive, persistedSensitive, res.Config)
+	emitDiags(sds)
+	if sds.HasErrors() {
+		return 1, nil
+	}
+	var prior cty.Value
+	if refresh {
+		prior, err = spec.RestoreProjected(existing.Attributes, existing.SensitiveSetRecovery, ty, existing.SensitivePaths, existing.SensitiveRecoveryVersion)
+		if err != nil {
+			return 1, fmt.Errorf("%s: cannot restore persisted sensitive state: %w", address, err)
+		}
+	}
 
 	imported, private, ds := client.ImportResource(ctx, res.Type, id, ty)
 	ds = provider.Context(address, ds)
@@ -507,15 +524,11 @@ func runImport(cmd *cobra.Command, args []string, refresh bool) (int, error) {
 		return 1, fmt.Errorf("%s: resource %q does not exist", address, id)
 	}
 
-	declaredSensitive := res.SensitiveAttributes
-	var persistedSensitive []string
 	if refresh {
-		persistedSensitive = existing.SensitivePaths
-	}
-	spec, sds := sensitive.ResolveWithPersisted(schema.Block, declaredSensitive, persistedSensitive, res.Config)
-	emitDiags(sds)
-	if sds.HasErrors() {
-		return 1, nil
+		refreshed, err = spec.CarryForward(prior, refreshed, persistedSensitive)
+		if err != nil {
+			return 1, fmt.Errorf("%s: cannot preserve persisted sensitive state: %w", address, err)
+		}
 	}
 	attrs, redactedPaths, recovery, err := spec.Project(refreshed)
 	if err != nil {

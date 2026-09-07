@@ -208,7 +208,7 @@ func (s *State) UnmarshalJSON(data []byte) error {
 				rs.Private = private
 			}
 			if len(persisted.SensitiveSetRecovery) != 0 {
-				if rs.SensitiveRecoveryVersion != 0 && rs.SensitiveRecoveryVersion != sensitive.RecoveryVersion {
+				if rs.SensitiveRecoveryVersion != 0 && !sensitive.RecoveryVersionSupported(rs.SensitiveRecoveryVersion) {
 					return fmt.Errorf("open sensitive set recovery for %s: unsupported projection version %d", addr, rs.SensitiveRecoveryVersion)
 				}
 				recovery, err := privateblob.Open(persisted.SensitiveSetRecovery, sensitiveRecoveryContext(addr, rs))
@@ -247,7 +247,7 @@ func sealSensitiveSetRecovery(addr string, rs *ResourceState) (json.RawMessage, 
 	if rs.Type == "" || rs.Provider == "" || rs.ProviderSource == "" {
 		return nil, fmt.Errorf("seal sensitive set recovery for %s: type, provider, and provider source are required", addr)
 	}
-	if rs.SensitiveRecoveryVersion != 0 && rs.SensitiveRecoveryVersion != sensitive.RecoveryVersion {
+	if rs.SensitiveRecoveryVersion != 0 && !sensitive.RecoveryVersionSupported(rs.SensitiveRecoveryVersion) {
 		return nil, fmt.Errorf("seal sensitive set recovery for %s: unsupported projection version %d", addr, rs.SensitiveRecoveryVersion)
 	}
 	sealed, err := privateblob.Seal(rs.SensitiveSetRecovery, sensitiveRecoveryContext(addr, rs))
