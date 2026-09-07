@@ -87,8 +87,18 @@ func writeCompleteReleaseArtifactMatrix(t *testing.T, dir string) string {
 }
 
 func TestReleaseRejectsUnmergedTag(t *testing.T) {
-	for _, job := range []string{"dry-run", "publish"} {
-		t.Run(job, func(t *testing.T) {
+	tests := []struct {
+		name  string
+		job   string
+		event string
+		ref   string
+	}{
+		{name: "dry-run tag push", job: "dry-run", event: "push", ref: "refs/tags/v0.1.0"},
+		{name: "dry-run dispatch", job: "dry-run", event: "workflow_dispatch", ref: "refs/heads/main"},
+		{name: "publish dispatch", job: "publish", event: "workflow_dispatch", ref: "refs/heads/main"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			git := func(args ...string) {
 				t.Helper()
@@ -104,8 +114,8 @@ func TestReleaseRejectsUnmergedTag(t *testing.T) {
 			git("commit", "--allow-empty", "-m", "test: reviewed commit")
 			git("update-ref", "refs/remotes/origin/main", "HEAD")
 			git("tag", "v0.1.0")
-			script := releaseStep(t, job, "Validate release tag and dispatch ref")
-			env := []string{"GITHUB_EVENT_NAME=workflow_dispatch", "GITHUB_REF=refs/heads/main", "RELEASE_TAG=v0.1.0"}
+			script := releaseStep(t, tc.job, "Validate release tag and dispatch ref")
+			env := []string{"GITHUB_EVENT_NAME=" + tc.event, "GITHUB_REF=" + tc.ref, "RELEASE_TAG=v0.1.0"}
 			if err := releaseShell(t, dir, script, env...); err != nil {
 				t.Fatal("reviewed tag must be accepted")
 			}
@@ -117,6 +127,103 @@ func TestReleaseRejectsUnmergedTag(t *testing.T) {
 				t.Fatal("release accepted a tag outside reviewed main history")
 			}
 		})
+	}
+}
+func TestReleaseTriggerModesAreFailClosed(t *testing.T) {
+	var workflow struct {
+		On struct {
+			Push struct {
+				Tags []string `yaml:"tags"`
+			} `yaml:"push"`
+			WorkflowDispatch struct {
+				Inputs map[string]struct {
+					Required bool     `yaml:"required"`
+					Default  string   `yaml:"default"`
+					Options  []string `yaml:"options"`
+				} `yaml:"inputs"`
+			} `yaml:"workflow_dispatch"`
+		} `yaml:"on"`
+		Concurrency struct {
+			Group            string `yaml:"group"`
+			CancelInProgress bool   `yaml:"cancel-in-progress"`
+		} `yaml:"concurrency"`
+		Jobs map[string]struct {
+			If          string              `yaml:"if"`
+			Environment workflowEnvironment `yaml:"environment"`
+			Steps       []struct {
+				Name string            `yaml:"name"`
+				With map[string]string `yaml:"with"`
+				Env  map[string]string `yaml:"env"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(readRepositoryFile(t, ".github", "workflows", "release.yml"), &workflow); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(workflow.On.Push.Tags) != 1 || workflow.On.Push.Tags[0] != "v*" {
+		t.Fatalf("push tags = %v, want [v*]", workflow.On.Push.Tags)
+	}
+	mode := workflow.On.WorkflowDispatch.Inputs["mode"]
+	if !mode.Required || mode.Default != "dry-run" || strings.Join(mode.Options, ",") != "dry-run,publish" {
+		t.Fatalf("mode input = %+v, want required dry-run default with dry-run,publish options", mode)
+	}
+	if !workflow.On.WorkflowDispatch.Inputs["tag"].Required {
+		t.Fatal("tag input must be required")
+	}
+
+	wantDryRun := "github.repository == 'Tchori-Labs/tchori' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'dry-run'))"
+	if got := workflow.Jobs["dry-run"].If; got != wantDryRun {
+		t.Fatalf("dry-run condition = %q, want %q", got, wantDryRun)
+	}
+	wantPublish := "github.repository == 'Tchori-Labs/tchori' && github.event_name == 'workflow_dispatch' && inputs.mode == 'publish'"
+	if got := workflow.Jobs["publish"].If; got != wantPublish {
+		t.Fatalf("publish condition = %q, want %q", got, wantPublish)
+	}
+	if strings.Contains(workflow.Jobs["publish"].If, "github.event_name == 'push'") {
+		t.Fatal("publish condition permits tag pushes")
+	}
+	if workflow.Concurrency.CancelInProgress || workflow.Concurrency.Group != "release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}" {
+		t.Fatalf("concurrency = %+v, want fail-closed per-tag serialization", workflow.Concurrency)
+	}
+
+	step := func(job, name string) struct {
+		Name string
+		With map[string]string
+		Env  map[string]string
+	} {
+		t.Helper()
+		for _, candidate := range workflow.Jobs[job].Steps {
+			if candidate.Name == name {
+				return struct {
+					Name string
+					With map[string]string
+					Env  map[string]string
+				}{Name: candidate.Name, With: candidate.With, Env: candidate.Env}
+			}
+		}
+		t.Fatalf("missing %s step in %s", name, job)
+		return struct {
+			Name string
+			With map[string]string
+			Env  map[string]string
+		}{}
+	}
+	dryCheckout := step("dry-run", "Check out release tag")
+	if dryCheckout.With["ref"] != "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}" {
+		t.Fatalf("dry-run checkout ref = %q, want dispatch tag or pushed ref", dryCheckout.With["ref"])
+	}
+	dryVerify := step("dry-run", "Verify signed release outputs")
+	if dryVerify.Env["RELEASE_TAG"] != "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}" {
+		t.Fatalf("dry-run verification tag = %q, want dispatch tag or pushed ref name", dryVerify.Env["RELEASE_TAG"])
+	}
+	publishCheckout := step("publish", "Check out release tag")
+	if publishCheckout.With["ref"] != "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}" {
+		t.Fatalf("publish checkout ref = %q, want existing dispatch tag", publishCheckout.With["ref"])
+	}
+	publishVerify := step("publish", "Verify signed release outputs")
+	if publishVerify.Env["RELEASE_TAG"] != "${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}" {
+		t.Fatalf("publish verification tag = %q, want existing dispatch tag", publishVerify.Env["RELEASE_TAG"])
 	}
 }
 
@@ -154,23 +261,32 @@ func TestReleaseArtifactMatrixVerifiesCompleteArtifacts(t *testing.T) {
 
 func TestReleaseSignatureVerifierFailureStopsAcceptance(t *testing.T) {
 	tests := []struct {
+		name        string
 		job         string
 		workflowRef string
 		currentRef  string
 	}{
 		{
+			name:        "dry-run-dispatch",
 			job:         "dry-run",
 			workflowRef: "Tchori-Labs/tchori/.github/workflows/release.yml@refs/heads/main",
 			currentRef:  "refs/heads/main",
 		},
 		{
-			job:         "publish",
+			name:        "dry-run-tag-push",
+			job:         "dry-run",
 			workflowRef: "Tchori-Labs/tchori/.github/workflows/release.yml@refs/tags/v0.1.0",
 			currentRef:  "refs/tags/v0.1.0",
 		},
+		{
+			name:        "publish-dispatch",
+			job:         "publish",
+			workflowRef: "Tchori-Labs/tchori/.github/workflows/release.yml@refs/heads/main",
+			currentRef:  "refs/heads/main",
+		},
 	}
 	for _, tt := range tests {
-		t.Run(tt.job, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
 			dist := writeCompleteReleaseArtifactMatrix(t, dir)
 			for name, body := range map[string]string{

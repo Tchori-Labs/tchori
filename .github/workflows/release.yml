@@ -30,7 +30,7 @@ concurrency:
 jobs:
   dry-run:
     name: dry-run
-    if: github.repository == 'Tchori-Labs/tchori' && github.event_name == 'workflow_dispatch' && inputs.mode == 'dry-run'
+    if: github.repository == 'Tchori-Labs/tchori' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'dry-run'))
     environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -43,11 +43,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          ref: ${{ inputs.tag }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Validate release tag and dispatch ref
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: bash "$GITHUB_WORKSPACE/scripts/verify-release-tag.sh" "$RELEASE_TAG"
 
       - name: Set up Go
@@ -76,7 +76,7 @@ jobs:
 
       - name: Verify signed release outputs
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           bash "$GITHUB_WORKSPACE/scripts/verify-release-artifacts.sh" "$RELEASE_TAG"
           bash "$GITHUB_WORKSPACE/scripts/verify-release-signature.sh"
@@ -112,7 +112,7 @@ jobs:
 
   publish:
     name: publish
-    if: github.repository == 'Tchori-Labs/tchori' && (github.event_name == 'push' || inputs.mode == 'publish')
+    if: github.repository == 'Tchori-Labs/tchori' && github.event_name == 'workflow_dispatch' && inputs.mode == 'publish'
     environment: release
     runs-on: ubuntu-latest
     timeout-minutes: 30

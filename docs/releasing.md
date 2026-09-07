@@ -11,20 +11,30 @@ the `Tchori-Labs/main` repository. Agents may prepare a release change, but they
 must not create or push the tag, dispatch the release workflow, approve its
 deployment, or publish the release.
 
-Pushing a `v*` tag automatically starts the release workflow in the public
-`Tchori-Labs/tchori` repository. Its jobs are disabled in forks and in
-`tchori-internal`; internally prepared changes must first be transferred through
-review to the public repository. Accepted tags are `v`-prefixed semantic
-versions whose commits belong to reviewed `origin/main` history. The protected
-Environment approval is still required after the tag triggers the workflow.
+Pushing a `v*` tag automatically starts only the release workflow's
+**dry-run** job in the public `Tchori-Labs/tchori` repository. A tag push never
+starts `publish`, never creates or modifies a GitHub Release, and never exposes
+release assets. Its dry-run checks out the existing tag, validates that the tag
+is in reviewed `origin/main` history, signs the reviewable artifacts, generates
+GitHub build provenance, and uploads them for review. The jobs are disabled in
+forks and in `tchori-internal`; internally prepared changes must first be
+transferred through review to the public repository. Accepted tags are
+`v`-prefixed semantic versions whose commits belong to reviewed `origin/main`
+history.
+
+`workflow_dispatch` is the only path to `publish`. An authorized initiator
+must run it from `main`, enter the existing approved `v*` tag, select
+`mode: publish`, and do so only after the dry-run artifact and its required
+Environment review have been examined and approved. Neither dispatch mode
+creates or moves a tag. The protected `release` Environment remains a required
+gate for both dry-run and publish jobs.
 
 The ancestry check prevents an accidental release from an unreviewed commit; it
 does not authenticate the tagger or make historical workflow revisions safe.
-Anyone allowed to create or move a matching `v*` tag selects a workflow
-definition from `main` history and can trigger it. Treat tag creation/update
-permission as release authority: a human repository administrator must restrict
-and audit that live permission boundary. It is not encoded by this repository.
-The protected `release` Environment remains the final publication gate.
+Anyone allowed to create or move a matching `v*` tag can trigger a dry-run, but
+that permission alone cannot publish. A human repository administrator must
+still restrict and audit the live tag-permission boundary. It is not encoded by
+this repository.
 
 The live enforcement mechanism is the GitHub Environment named `release`.
 The reviewable source of truth is
@@ -136,11 +146,20 @@ Release-readiness also requires non-secret evidence of credential revocation
 and history remediation for
 [internal #72](https://github.com/Tchori-Labs/tchori-internal/issues/72) /
 [infra #138](https://github.com/Tchori-Labs/infra/issues/138).
-Production consumers must provision the persistent artifact key and plan
-their migration before adopting format `1.1`;
-[infra #150](https://github.com/Tchori-Labs/infra/issues/150) tracks that
-adoption. Local tests and a clean working-tree secret scan do not certify
-revocation, historical cleanup, production key provisioning, or deployment
+The current product writes `plan.json`, `state.json`, and `state.json.backup`
+in format `1.2`; it reads `1.0`, `1.1`, and `1.2` as documented in
+[formats.md](formats.md). Consumers such as
+[infra #150](https://github.com/Tchori-Labs/infra/issues/150) must plan this
+migration to the current `1.2` write format; `1.1` is only a legacy input
+format supported for reading.
+When existing state or its backup has no canonical `provider_source`, run
+`tchori state sanitize` with the matching configuration, provider schemas, and
+artifact key before planning or applying. When an existing plan lacks complete
+resource identity, or provider routing/configuration changed, recompute the
+plan before apply; state sanitization does not rewrite a plan. Previously
+leaked values still require credential rotation and history cleanup. Local
+tests and a clean working-tree secret scan do not certify revocation,
+historical cleanup, consumer key provisioning, migration, or deployment
 approval.
 
 Both release jobs reference this Environment, so once it is correctly applied
@@ -154,25 +173,28 @@ permissions.
 After the board decision and normal CODEOWNERS review have landed:
 
 1. The board-authorized tag actor creates and pushes the approved `v*` tag.
-   This triggers publish mode. For `v0.1.0`, follow ADR-0012's scoped
+   This triggers **dry-run only**. For `v0.1.0`, follow ADR-0012's scoped
    delegation above. Do not tag from an unreviewed commit.
-2. Before publishing, or when validating a workflow change, an authorized
-   initiator distinct from the required reviewer may use
-   **Actions → Release → Run workflow** from `main`, enter an existing
-   approved `v*` tag, and leave `mode` at its safe `dry-run` default. The
-   workflow checks out the tag and runs GoReleaser with `--skip=publish`, while
-   retaining real keyless signing and GitHub provenance generation. It does
-   not create a tag, GitHub Release, or public release asset. Instead, it
-   uploads a 30-day Actions artifact named
+2. The tag-triggered dry-run checks out that existing tag and runs GoReleaser
+   with `--skip=publish`, while retaining real keyless signing and GitHub
+   provenance generation. It does not create a tag, GitHub Release, or public
+   release asset. Instead, it uploads a 30-day Actions artifact named
    `release-dry-run-<run-id>-<run-attempt>` containing the archives, SBOMs,
    checksum manifest, detached signature and certificate, and the local
    `provenance.intoto.jsonl` bundle for board review.
-3. A board-approved manual publish or retry uses the same dispatch with
-   `mode: publish`. Both manual modes require an existing tag; neither creates
-   or moves one.
-4. For every mode, `@VictorCano` reviews the pending `release` Environment
+3. When a dry-run must be repeated without another tag push, an authorized
+   initiator distinct from the required reviewer may use
+   **Actions → Release → Run workflow** from `main`, enter the same existing
+   approved `v*` tag, and leave `mode` at its safe `dry-run` default. This
+   dispatch follows the same validation and artifact path, but its workflow
+   identity is the reviewed `main` ref.
+4. Only after the dry-run artifact has been reviewed and its required
+   Environment deployment has been approved may an authorized initiator use
+   **Run workflow** from `main` with `mode: publish`. Publish checks out the
+   same existing tag; it never creates or moves one.
+5. For every mode, `@VictorCano` reviews the pending `release` Environment
    deployment against the recorded board decision and approves or rejects it.
-5. In publish mode, GoReleaser uploads the signed artifacts to a **draft**
+   In publish mode, GoReleaser uploads the signed artifacts to a **draft**
    GitHub Release. `scripts/verify-release-artifacts.sh` requires all six
    platform archives, their six SPDX SBOMs, a complete checksum manifest whose
    digests match those files. `scripts/verify-release-signature.sh` then runs
@@ -255,27 +277,24 @@ gh release download "$TAG" --repo tchori-labs/tchori \
 
 ### 1. Verify the keyless signature
 
-Verify the certificate's GitHub Actions issuer and restrict its identity to the
-repository's tag-triggered release workflow:
+Verify the certificate's GitHub Actions issuer and restrict its identity to
+the workflow/ref that produced the artifact. A published release can only come
+from the explicit manual `publish` dispatch, so its identity must end in
+`@refs/heads/main`:
 
 ```sh
 cosign verify-blob \
   --certificate checksums.txt.pem \
   --signature checksums.txt.sig \
-  --certificate-identity-regexp '^https://github\.com/Tchori-Labs/tchori/\.github/workflows/release\.yml@refs/tags/v.*$' \
+  --certificate-identity-regexp '^https://github\.com/Tchori-Labs/tchori/\.github/workflows/release\.yml@refs/heads/main$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   checksums.txt
 ```
 
-A manual retry checks out the same release tag but its certificate identity can
-end in `@refs/heads/main`. For a board-approved manual retry only, replace the
-identity regexp above with this deliberately narrow alternative:
-
-```sh
---certificate-identity-regexp '^https://github\.com/Tchori-Labs/tchori/\.github/workflows/release\.yml@refs/heads/main$'
-```
-
-Do not use a repository-wide or issuer-only identity expression.
+A tag-triggered dry-run artifact instead has the exact tag identity
+`@refs/tags/v...`; a manual dry-run has the exact `@refs/heads/main` identity.
+Those artifacts are review evidence, not published releases. Do not use a
+repository-wide or issuer-only identity expression.
 
 ### 2. Verify archive and SBOM checksums
 
