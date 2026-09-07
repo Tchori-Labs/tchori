@@ -1169,3 +1169,88 @@ func TestUnknownDeclaredPath(t *testing.T) {
 }
 
 func fmtSlice(v []string) string { return fmt.Sprint(v) }
+
+func TestCarryForwardPreservesOnlyOmittedPersistedSensitivePaths(t *testing.T) {
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"secret":  {Type: cty.String, Optional: true, Sensitive: true},
+		"members": {Type: cty.List(cty.String), Optional: true, Sensitive: true},
+		"note":    {Type: cty.String, Optional: true},
+	}}
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	ty := block.ImpliedType()
+	prior := cty.ObjectVal(map[string]cty.Value{
+		"secret":  cty.StringVal("prior-secret"),
+		"members": cty.ListVal([]cty.Value{cty.StringVal("member-one"), cty.StringVal("member-two")}),
+		"note":    cty.StringVal("prior-note"),
+	})
+	refreshed := cty.ObjectVal(map[string]cty.Value{
+		"secret":  cty.NullVal(cty.String),
+		"members": cty.UnknownVal(cty.List(cty.String)),
+		"note":    cty.StringVal("remote-note"),
+	})
+	got, err := spec.CarryForward(prior, refreshed, []string{"secret", "members"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.GetAttr("secret").RawEquals(prior.GetAttr("secret")) ||
+		!got.GetAttr("members").RawEquals(prior.GetAttr("members")) {
+		t.Fatalf("carried sensitive values = %#v, want prior sensitive values", got)
+	}
+	if got.GetAttr("note").AsString() != "remote-note" {
+		t.Fatalf("ordinary note = %q, want provider value", got.GetAttr("note").AsString())
+	}
+	if !got.Type().Equals(ty) {
+		t.Fatalf("carried value type = %s, want %s", got.Type().FriendlyName(), ty.FriendlyName())
+	}
+}
+
+func TestCarryForwardPrefersCurrentConfiguredLiteral(t *testing.T) {
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"payload": {Type: cty.String, Optional: true, Sensitive: true},
+	}}
+	spec, ds := Resolve(block, nil, map[string]any{"payload": "configured-value"})
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	prior := cty.ObjectVal(map[string]cty.Value{
+		"payload": cty.StringVal("persisted-value"),
+	})
+	refreshed := cty.ObjectVal(map[string]cty.Value{
+		"payload": cty.NullVal(cty.String),
+	})
+
+	got, err := spec.CarryForward(prior, refreshed, []string{"payload"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.GetAttr("payload").AsString() != "configured-value" {
+		t.Fatalf("sensitive literal = %q, want current configured value", got.GetAttr("payload").AsString())
+	}
+}
+
+func TestCarryForwardRejectsAmbiguousSensitiveCollectionShape(t *testing.T) {
+	entryType := cty.Object(map[string]cty.Type{"token": cty.String, "label": cty.String})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"entries": {
+			Type: cty.List(entryType), Optional: true,
+			NestedType: map[string]*provider.Attr{
+				"token": {Type: cty.String, Sensitive: true},
+				"label": {Type: cty.String},
+			},
+		},
+	}}
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	prior := cty.ObjectVal(map[string]cty.Value{"entries": cty.ListVal([]cty.Value{
+		cty.ObjectVal(map[string]cty.Value{"token": cty.StringVal("prior-token"), "label": cty.StringVal("same")}),
+	})})
+	refreshed := cty.ObjectVal(map[string]cty.Value{"entries": cty.NullVal(cty.List(entryType))})
+	if _, err := spec.CarryForward(prior, refreshed, []string{"entries.token"}); err == nil {
+		t.Fatal("omitted sensitive child below a null collection was accepted")
+	}
+}

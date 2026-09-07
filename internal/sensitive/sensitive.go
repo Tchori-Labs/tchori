@@ -21,6 +21,10 @@ type Spec struct {
 	exempt         map[string]any
 	setPrefixes    []string
 	allSetPrefixes []string
+	// nil means capture direct sensitive paths under the current policy;
+	// non-nil limits capture to paths already present in the persisted policy
+	// while rotating a projection.
+	directRecoveryPaths []string
 }
 
 // Resolve is the single constructor used by persistence and planning paths.
@@ -58,6 +62,100 @@ func ResolveWithPersisted(block *provider.SchemaBlock, declared, persisted []str
 		}
 	}
 	return Resolve(block, append(append([]string(nil), declared...), recalled...), rawCfg)
+}
+
+// CarryForward restores only persisted sensitive paths that a provider omitted
+// as null or unknown during refresh. Ordinary paths are never copied. A
+// missing value below a collection is ambiguous because the engine cannot
+// prove element identity without preserving the surrounding ordinary fields,
+// so it fails closed.
+func (s *Spec) CarryForward(prior, refreshed cty.Value, persisted []string) (cty.Value, error) {
+	return s.carryForward(prior, refreshed, persisted, true)
+}
+
+// CarryForwardBestEffort preserves direct omitted sensitive attributes during
+// ordinary planning, but leaves ambiguous nested collections to the existing
+// consistency and transactional rollback checks.
+func (s *Spec) CarryForwardBestEffort(prior, refreshed cty.Value, persisted []string) (cty.Value, error) {
+	return s.carryForward(prior, refreshed, persisted, false)
+}
+
+func (s *Spec) carryForward(prior, refreshed cty.Value, persisted []string, strict bool) (cty.Value, error) {
+	if !prior.IsKnown() || !refreshed.IsKnown() || prior.IsNull() || refreshed.IsNull() {
+		return refreshed, nil
+	}
+	if !prior.Type().Equals(refreshed.Type()) {
+		return cty.NilVal, fmt.Errorf("refresh result type differs from persisted state")
+	}
+	paths := sortedUnique(persisted)
+	if len(paths) == 0 {
+		return refreshed, nil
+	}
+	return cty.Transform(refreshed, func(path cty.Path, value cty.Value) (cty.Value, error) {
+		logical := logicalPath(path)
+		exact := contains(paths, logical)
+		missing := value.IsNull() || !value.IsKnown()
+		if !exact {
+			if strict && missing && (logical == "" || hasSensitiveDescendant(logical, paths)) {
+				return cty.NilVal, fmt.Errorf("refresh omitted persisted sensitive path below %q", logical)
+			}
+			return value, nil
+		}
+		if !missing {
+			return value, nil
+		}
+		if literal, ok := s.configuredLiteral(path, value.Type()); ok {
+			return literal, nil
+		}
+		if pathHasIndex(path) {
+			if strict {
+				return cty.NilVal, fmt.Errorf("refresh omitted persisted sensitive path %q at an ambiguous collection element", logical)
+			}
+			return value, nil
+		}
+		priorValue, err := path.Apply(prior)
+		if err != nil {
+			return cty.NilVal, fmt.Errorf("cannot recover persisted sensitive path %q: %w", logical, err)
+		}
+		if !priorValue.IsKnown() || priorValue.IsNull() {
+			return value, nil
+		}
+		if !priorValue.Type().Equals(value.Type()) {
+			return cty.NilVal, fmt.Errorf("persisted sensitive path %q changed type during refresh", logical)
+		}
+		return priorValue, nil
+	})
+}
+
+func (s *Spec) configuredLiteral(path cty.Path, ty cty.Type) (cty.Value, bool) {
+	raw, ok := s.exempt[PathString(path)]
+	if !ok {
+		return cty.NilVal, false
+	}
+	value, ok := literalValue(raw)
+	if !ok || !value.Type().Equals(ty) {
+		return cty.NilVal, false
+	}
+	return value, true
+}
+
+func hasSensitiveDescendant(logical string, paths []string) bool {
+	prefix := logical + "."
+	for _, path := range paths {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func pathHasIndex(path cty.Path) bool {
+	for _, step := range path {
+		if _, ok := step.(cty.IndexStep); ok {
+			return true
+		}
+	}
+	return false
 }
 
 func affectedSets(allSetPrefixes, paths []string) []string {
@@ -399,23 +497,28 @@ func literalMatches(value cty.Value, literal any) bool {
 	if !value.IsKnown() || value.IsNull() {
 		return false
 	}
+	expected, ok := literalValue(literal)
+	return ok && value.Type().Equals(expected.Type()) && value.RawEquals(expected)
+}
+
+func literalValue(literal any) (cty.Value, bool) {
 	switch raw := literal.(type) {
 	case string:
-		return value.Type().Equals(cty.String) && value.AsString() == raw
+		return cty.StringVal(raw), true
 	case bool:
-		return value.Type().Equals(cty.Bool) && value.True() == raw
+		return cty.BoolVal(raw), true
 	case jsonNumber:
-		expected, err := cty.ParseNumberVal(raw.String())
-		return err == nil && value.Type().Equals(cty.Number) && value.RawEquals(expected)
+		value, err := cty.ParseNumberVal(raw.String())
+		return value, err == nil
 	case float64:
-		return value.Type().Equals(cty.Number) && value.RawEquals(cty.NumberFloatVal(raw))
+		return cty.NumberFloatVal(raw), true
 	case float32:
-		return value.Type().Equals(cty.Number) && value.RawEquals(cty.NumberFloatVal(float64(raw)))
+		return cty.NumberFloatVal(float64(raw)), true
 	case int:
-		return value.Type().Equals(cty.Number) && value.RawEquals(cty.NumberIntVal(int64(raw)))
+		return cty.NumberIntVal(int64(raw)), true
 	case int64:
-		return value.Type().Equals(cty.Number) && value.RawEquals(cty.NumberIntVal(raw))
+		return cty.NumberIntVal(raw), true
 	default:
-		return false
+		return cty.NilVal, false
 	}
 }

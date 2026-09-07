@@ -307,8 +307,8 @@ creates.
 | `provider_source` | string, omitted in legacy/early `1.1` input | Canonical provider registry source. New state binds this value into encrypted-envelope authentication and checks it before provider RPCs. |
 | `attributes` | object | Deterministic public projection of applied values. Every withheld sensitive leaf is JSON `null`; sensitive sets retain element count and non-sensitive association as array entries. A sensitive map inside a captured set is withheld as a whole so its keys do not leak. A sensitive map above an affected set is also whole-value `null` and uses authenticated recovery. State never stores unknown values. |
 | `private` | object, omitted if empty | Authenticated encrypted envelope with `version`, `nonce`, and `ciphertext`, as described for plans. The opaque plaintext is preserved only in memory for provider RPCs. |
-| `sensitive_set_recovery` | object, omitted if empty | Separate authenticated encrypted envelope containing complete outermost sets whose identity depends on sensitive descendants and any smallest sensitive map boundary needed to hide dynamic keys above such a set. It is opened before typed state decoding and never included in read projections. |
-| `sensitive_recovery_version` | integer | Mandatory per-resource sensitive projection generation. Format `1.3` requires the current value `3`; generation `0` is valid only in legacy formats. A nonzero value is also authenticated as part of the recovery envelope's AES-GCM additional data. |
+| `sensitive_set_recovery` | object, omitted if empty | Separate authenticated encrypted envelope containing authoritative values for directly sensitive paths plus complete outermost sets whose identity depends on sensitive descendants and any smallest sensitive map boundary needed to hide dynamic keys above such a set. It is opened before typed state decoding and never included in read projections. |
+| `sensitive_recovery_version` | integer | Mandatory per-resource sensitive projection generation. Format `1.3` requires the current value `4`; generation `0` and versions `1` through `3` are accepted only from legacy formats so live schemas can restore and reproject them. A nonzero value is also authenticated as part of the recovery envelope's AES-GCM additional data. |
 | `redacted` | array of strings, omitted if empty | Sorted paths whose values are withheld, explaining why the corresponding `attributes` leaf is `null`. |
 | `sensitive_paths` | array of strings, omitted if empty | Sorted effective, index-insensitive sensitivity contract. It survives config removal and drives backups, delete plans, orphan handling, and provider-free read masking. |
 | `sensitive_scanned` | boolean, omitted when false | Provenance marker set after live schema/config resolution, including for a definitively non-sensitive resource. Read surfaces use it to distinguish checked entries from legacy entries with unknown provenance. |
@@ -323,16 +323,18 @@ authenticates the resource address, type, provider alias, canonical source, and
 nonzero `sensitive_recovery_version` as AES-GCM additional data. Its plaintext
 is versioned and contains a SHA-256 digest of the exact public projection plus
 structured attribute/map/list paths to msgpack-encoded authoritative values.
-Recovery payload version 3 stores outermost affected sets and sensitive map
-boundaries in `values`; structural collection traversal distinguishes
-`map(set(...))` from `set(map(...))`, and map recovery preserves null, empty,
-keys, structure, and nested set membership exactly. Version 2 stores sets in
-`sets` and records the sensitivity paths that produced the projection, so
-expanding sensitivity can authenticate and restore old set membership before
-emitting a new projection/recovery pair. Version 1 payloads use the resource's
-recorded `sensitive_paths` for the same migration. Valid version 1 and 2
-projections are checked with their generation-time map projection semantics,
-then rotated to the confidential version 3 representation.
+Recovery payload version 4 stores directly sensitive scalar, list, and map
+values in `values` and records their logical paths in `direct_paths`; it also
+stores the collection recovery described below. Version 3 stores outermost
+affected sets and sensitive map boundaries in `values`; structural collection
+traversal distinguishes `map(set(...))` from `set(map(...))`, and map recovery
+preserves null, empty, keys, structure, and nested set membership exactly.
+Version 2 stores sets in `sets` and records the sensitivity paths that produced
+the projection, so expanding sensitivity can authenticate and restore old set
+membership before emitting a new projection/recovery pair. Version 1 payloads
+use the resource's recorded `sensitive_paths` for the same migration. Valid
+older projections are checked with their generation-time semantics, then
+rotated to the confidential version 4 representation.
 Restoration validates the generation marker, generation paths, complete
 recovery path set, projection digest, and typed generation-time projection
 before replacing public placeholders and decoding the authoritative cty value.
@@ -349,6 +351,13 @@ substitute or relabel a separately valid `1.0`, `1.1`, or `1.2` artifact; that
 rollback is indistinguishable from an authentic legacy input to file-local
 cryptography. Preventing it requires trusted repository/storage history or an
 external monotonic trust anchor.
+
+During `import --refresh` and plan refresh reads, a provider's concrete value
+always wins. If the provider returns `null` or `unknown` for an exact path
+already recorded in `sensitive_paths`, the engine restores only that sensitive
+path from authenticated recovery; ordinary paths are never carried forward.
+Omissions below an ambiguous collection shape fail closed before `Save`, so
+the state and backup remain unchanged.
 
 ### Incomplete apply lifecycle
 

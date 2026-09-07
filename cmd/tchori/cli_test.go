@@ -222,6 +222,26 @@ func writeSensitiveSetConfig(t *testing.T, dir string) {
 	}
 }
 
+func writeRefreshSensitiveConfig(t *testing.T, dir string) {
+	t.Helper()
+	const cfg = `{
+  "providers": {
+    "tchoritest": {
+      "source": "tchori-labs/tchoritest",
+      "version": "0.0.1",
+      "config": {"prefix": "t-"}
+    }
+  },
+  "resources": {
+    "tchoritest_refresh_sensitive.demo": {
+      "config": {"name": "omit-sensitive"}
+    }
+  }
+}`
+	if err := os.WriteFile(filepath.Join(dir, "main.tchori.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
 func writeThingResources(t *testing.T, dir string, resources map[string]string) {
 	t.Helper()
 	writeProtocolThingResources(t, dir, "tchoritest", resources)
@@ -1508,6 +1528,94 @@ func TestImportRefreshReplacesOnlyNamedResource(t *testing.T) {
 	}
 	if !bytes.Equal(backup, beforeState) {
 		t.Fatal("refresh backup does not contain the complete pre-refresh state")
+	}
+}
+
+func TestImportRefreshPreservesOmittedSensitiveState(t *testing.T) {
+	dir := t.TempDir()
+	writeRefreshSensitiveConfig(t, dir)
+	pd := "--plugin-dir=" + pluginDir
+	const (
+		address   = "tchoritest_refresh_sensitive.demo"
+		initialID = "t-id-seeded"
+		refreshID = "t-id-omit-sensitive"
+	)
+	if stdout, stderr, code := runCLIWithArtifactKey(t, dir, "import", pd, address, initialID); code != 0 {
+		t.Fatalf("initial import: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	initialSerial, _ := readStateFile(t, dir)
+	stdout, stderr, code := runCLIWithArtifactKey(t, dir, "import", "--refresh", pd, address, refreshID)
+	if code != 0 || stdout != "Refreshed "+address+".\n" {
+		t.Fatalf("sensitive refresh: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	for _, secret := range []string{"refresh-sensitive-secret", "refresh-member-one", "refresh-member-two"} {
+		if strings.Contains(stdout+stderr, secret) {
+			t.Fatalf("refresh output exposed %q", secret)
+		}
+	}
+	for _, path := range []string{filepath.Join(dir, "state.json"), filepath.Join(dir, "state.json.backup")} {
+		data, err := os.ReadFile(path) //nolint:gosec // test-controlled state artifact
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, secret := range []string{"refresh-sensitive-secret", "refresh-member-one", "refresh-member-two"} {
+			if bytes.Contains(data, []byte(secret)) {
+				t.Fatalf("%s exposed %q", filepath.Base(path), secret)
+			}
+		}
+	}
+	stateData, err := os.ReadFile(filepath.Join(dir, "state.json")) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Serial    uint64 `json:"serial"`
+		Resources map[string]struct {
+			Attributes           map[string]any `json:"attributes"`
+			SensitiveRecovery    any            `json:"sensitive_set_recovery"`
+			SensitiveRecoveryVer int            `json:"sensitive_recovery_version"`
+		} `json:"resources"`
+	}
+	if err := json.Unmarshal(stateData, &document); err != nil {
+		t.Fatal(err)
+	}
+	if document.Serial != initialSerial+1 {
+		t.Fatalf("refresh serial = %d, want exactly one increment from %d", document.Serial, initialSerial)
+	}
+	resource := document.Resources[address]
+	if resource.Attributes["secret"] != nil || resource.Attributes["members"] != nil {
+		t.Fatalf("refreshed sensitive attributes = %#v, want redacted nulls", resource.Attributes)
+	}
+	if resource.Attributes["note"] != "remote-note" {
+		t.Fatalf("ordinary note = %#v, want provider refresh value", resource.Attributes["note"])
+	}
+	if resource.SensitiveRecovery == nil || resource.SensitiveRecoveryVer == 0 {
+		t.Fatal("refreshed state omitted encrypted sensitive recovery")
+	}
+
+	stdout, stderr, code = runCLIWithArtifactKey(t, dir, "state", "show", address)
+	if code != 0 || strings.Contains(stdout+stderr, "refresh-sensitive") {
+		t.Fatalf("state show exposed refresh-sensitive data: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	var shown struct {
+		Attributes map[string]any `json:"attributes"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &shown); err != nil {
+		t.Fatalf("state show output: %v\n%s", err, stdout)
+	}
+	if shown.Attributes["secret"] != nil || shown.Attributes["members"] != nil {
+		t.Fatalf("state show sensitive attributes = %#v, want nulls", shown.Attributes)
+	}
+	if shown.Attributes["note"] != "remote-note" {
+		t.Fatalf("state show note = %#v, want remote value", shown.Attributes["note"])
+	}
+
+	stdout, stderr, code = runCLIWithArtifactKey(t, dir, "plan", pd)
+	if code != 0 || !strings.Contains(stdout, "No changes") {
+		t.Fatalf("plan after omitted-sensitive refresh: exit %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
+	}
+	if strings.Contains(stdout+stderr, "refresh-sensitive") {
+		t.Fatal("plan exposed a sensitive refresh value")
 	}
 }
 

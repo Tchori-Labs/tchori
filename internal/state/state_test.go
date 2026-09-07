@@ -1293,6 +1293,7 @@ func TestSaveSanitizesBackupFromEffectiveHintWhenValueNowNull(t *testing.T) {
 }
 
 func TestSavePreservesLiteralAndRecordedSensitivity(t *testing.T) {
+	setStateArtifactKey(t, 35)
 	path := filepath.Join(t.TempDir(), "state.json")
 	initial := `{"format_version":"1.0","serial":0,"resources":{` +
 		`"secret.literal":{"type":"secret","provider":"test","attributes":{"token":"literal-token-ok"},"sensitive_paths":["token"]},` +
@@ -1329,11 +1330,13 @@ func TestSavePreservesLiteralAndRecordedSensitivity(t *testing.T) {
 		if addr == "secret.literal" {
 			return Resolution{
 				Paths:              spec.Paths(),
+				ProviderSource:     "example.test/test",
 				SanitizeAttributes: spec.Sanitizer(tokenType),
 				SanitizeBackup:     backupSpec.Sanitizer(tokenType),
 			}, true
 		}
 		return Resolution{
+			ProviderSource:     "example.test/test",
 			Paths:              noteSpec.Paths(),
 			SanitizeAttributes: noteSpec.Sanitizer(noteType),
 			SanitizeBackup:     noteSpec.Sanitizer(noteType),

@@ -233,6 +233,20 @@ var secretfulSchema = &tfprotov6.Schema{Version: 0, Block: &tfprotov6.SchemaBloc
 	},
 	BlockTypes: []*tfprotov6.SchemaNestedBlock{{TypeName: "rules", Nesting: tfprotov6.SchemaNestedBlockNestingModeList, Block: &tfprotov6.SchemaBlock{Attributes: []*tfprotov6.SchemaAttribute{{Name: "token", Type: tftypes.String, Optional: true, Sensitive: true}}}}},
 }}
+var refreshSensitiveType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{
+	"name": tftypes.String, "id": tftypes.String, "secret": tftypes.String,
+	"members": tftypes.List{ElementType: tftypes.String}, "note": tftypes.String,
+}}
+
+var refreshSensitiveSchema = &tfprotov6.Schema{Version: 0, Block: &tfprotov6.SchemaBlock{
+	Attributes: []*tfprotov6.SchemaAttribute{
+		{Name: "name", Type: tftypes.String, Required: true},
+		{Name: "id", Type: tftypes.String, Computed: true},
+		{Name: "secret", Type: tftypes.String, Optional: true, Computed: true, Sensitive: true},
+		{Name: "members", Type: tftypes.List{ElementType: tftypes.String}, Optional: true, Computed: true, Sensitive: true},
+		{Name: "note", Type: tftypes.String, Optional: true, Computed: true},
+	},
+}}
 
 // brokenThingSchema declares tchoritest_broken_thing: a resource type whose
 // "settings" attribute is nested_type, but with a nesting mode
@@ -278,7 +292,7 @@ var _ tfprotov6.ProviderServer = (*server)(nil)
 
 func knownResourceType(typeName string) bool {
 	switch typeName {
-	case "tchoritest_thing", "tchoritest_lossy", "tchoritest_nested_thing", "tchoritest_ingress_thing", "tchoritest_server_assigned", "tchoritest_secretful", "tchoritest_set_thing", "tchoritest_flat_set_thing", "tchoritest_broken_thing":
+	case "tchoritest_thing", "tchoritest_lossy", "tchoritest_nested_thing", "tchoritest_ingress_thing", "tchoritest_server_assigned", "tchoritest_secretful", "tchoritest_refresh_sensitive", "tchoritest_set_thing", "tchoritest_flat_set_thing", "tchoritest_broken_thing":
 		return true
 	default:
 		return false
@@ -303,6 +317,7 @@ func (s *server) GetMetadata(ctx context.Context, req *tfprotov6.GetMetadataRequ
 			{TypeName: "tchoritest_ingress_thing"},
 			{TypeName: "tchoritest_server_assigned"},
 			{TypeName: "tchoritest_secretful"},
+			{TypeName: "tchoritest_refresh_sensitive"},
 			{TypeName: "tchoritest_set_thing"},
 			{TypeName: "tchoritest_flat_set_thing"},
 			{TypeName: "tchoritest_broken_thing"},
@@ -314,15 +329,16 @@ func (s *server) GetProviderSchema(ctx context.Context, req *tfprotov6.GetProvid
 	return &tfprotov6.GetProviderSchemaResponse{
 		Provider: providerSchema,
 		ResourceSchemas: map[string]*tfprotov6.Schema{
-			"tchoritest_thing":           thingSchema,
-			"tchoritest_lossy":           lossySchema,
-			"tchoritest_nested_thing":    nestedThingSchema,
-			"tchoritest_ingress_thing":   ingressThingSchema,
-			"tchoritest_server_assigned": serverAssignedSchema,
-			"tchoritest_secretful":       secretfulSchema,
-			"tchoritest_set_thing":       setThingSchema,
-			"tchoritest_flat_set_thing":  flatSetThingSchema,
-			"tchoritest_broken_thing":    brokenThingSchema,
+			"tchoritest_thing":             thingSchema,
+			"tchoritest_lossy":             lossySchema,
+			"tchoritest_nested_thing":      nestedThingSchema,
+			"tchoritest_ingress_thing":     ingressThingSchema,
+			"tchoritest_server_assigned":   serverAssignedSchema,
+			"tchoritest_secretful":         secretfulSchema,
+			"tchoritest_refresh_sensitive": refreshSensitiveSchema,
+			"tchoritest_set_thing":         setThingSchema,
+			"tchoritest_flat_set_thing":    flatSetThingSchema,
+			"tchoritest_broken_thing":      brokenThingSchema,
 		},
 		DataSourceSchemas: map[string]*tfprotov6.Schema{},
 		Functions:         map[string]*tfprotov6.Function{},
@@ -416,6 +432,12 @@ func (s *server) ValidateResourceConfig(ctx context.Context, req *tfprotov6.Vali
 		}
 		return &tfprotov6.ValidateResourceConfigResponse{}, nil
 	}
+	if req.TypeName == "tchoritest_refresh_sensitive" {
+		if _, err := req.Config.Unmarshal(refreshSensitiveType); err != nil {
+			return nil, err
+		}
+		return &tfprotov6.ValidateResourceConfigResponse{}, nil
+	}
 	if req.TypeName == "tchoritest_set_thing" {
 		if _, err := req.Config.Unmarshal(setThingType); err != nil {
 			return nil, err
@@ -475,6 +497,8 @@ func (s *server) UpgradeResourceState(ctx context.Context, req *tfprotov6.Upgrad
 		ty = serverAssignedType
 	case "tchoritest_secretful":
 		ty = secretfulType
+	case "tchoritest_refresh_sensitive":
+		ty = refreshSensitiveType
 	case "tchoritest_set_thing":
 		ty = setThingType
 	case "tchoritest_flat_set_thing":
@@ -539,6 +563,9 @@ func (s *server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 			}
 		}
 	}
+	if req.TypeName == "tchoritest_refresh_sensitive" {
+		return s.readRefreshSensitive(req)
+	}
 	if req.TypeName == "tchoritest_flat_set_thing" {
 		return s.readFlatSetThing(req)
 	}
@@ -547,6 +574,34 @@ func (s *server) ReadResource(ctx context.Context, req *tfprotov6.ReadResourceRe
 		NewState: req.CurrentState,
 		Private:  req.Private,
 	}, nil
+}
+func (s *server) readRefreshSensitive(req *tfprotov6.ReadResourceRequest) (*tfprotov6.ReadResourceResponse, error) {
+	current, err := req.CurrentState.Unmarshal(refreshSensitiveType)
+	if err != nil {
+		return nil, err
+	}
+	if current.IsNull() {
+		return &tfprotov6.ReadResourceResponse{NewState: req.CurrentState, Private: req.Private}, nil
+	}
+	var attrs map[string]tftypes.Value
+	if err := current.As(&attrs); err != nil {
+		return nil, err
+	}
+	var name string
+	if err := attrs["name"].As(&name); err != nil {
+		return nil, err
+	}
+	if name == "omit-sensitive" {
+		attrs["secret"] = tftypes.NewValue(tftypes.String, nil)
+		attrs["members"] = tftypes.NewValue(tftypes.List{ElementType: tftypes.String}, tftypes.UnknownValue)
+		attrs["note"] = tftypes.NewValue(tftypes.String, "remote-note")
+		newState, err := tfprotov6.NewDynamicValue(refreshSensitiveType, tftypes.NewValue(refreshSensitiveType, attrs))
+		if err != nil {
+			return nil, err
+		}
+		return &tfprotov6.ReadResourceResponse{NewState: &newState, Private: req.Private}, nil
+	}
+	return &tfprotov6.ReadResourceResponse{NewState: req.CurrentState, Private: req.Private}, nil
 }
 
 func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
@@ -564,6 +619,9 @@ func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanReso
 	}
 	if req.TypeName == "tchoritest_server_assigned" {
 		return s.planServerAssigned(req)
+	}
+	if req.TypeName == "tchoritest_refresh_sensitive" {
+		return s.planRefreshSensitive(req)
 	}
 	if req.TypeName == "tchoritest_secretful" {
 		return s.planSecretful(req)
@@ -650,6 +708,54 @@ func (s *server) PlanResourceChange(ctx context.Context, req *tfprotov6.PlanReso
 	}, nil
 }
 
+func (s *server) planRefreshSensitive(req *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
+	proposed, err := req.ProposedNewState.Unmarshal(refreshSensitiveType)
+	if err != nil {
+		return nil, err
+	}
+	if proposed.IsNull() {
+		return &tfprotov6.PlanResourceChangeResponse{PlannedState: req.ProposedNewState, PlannedPrivate: req.PriorPrivate}, nil
+	}
+	prior, err := req.PriorState.Unmarshal(refreshSensitiveType)
+	if err != nil {
+		return nil, err
+	}
+	var attrs map[string]tftypes.Value
+	if err := proposed.As(&attrs); err != nil {
+		return nil, err
+	}
+	if prior.IsNull() {
+		attrs["id"] = tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+	} else {
+		var priorAttrs map[string]tftypes.Value
+		if err := prior.As(&priorAttrs); err != nil {
+			return nil, err
+		}
+		attrs["id"] = priorAttrs["id"]
+		if attrs["name"].IsNull() || !attrs["name"].IsKnown() {
+			attrs["name"] = priorAttrs["name"]
+		}
+		if attrs["note"].IsNull() || !attrs["note"].IsKnown() {
+			attrs["note"] = priorAttrs["note"]
+		}
+		if !priorAttrs["secret"].IsKnown() || priorAttrs["secret"].IsNull() ||
+			!priorAttrs["members"].IsKnown() || priorAttrs["members"].IsNull() {
+			return &tfprotov6.PlanResourceChangeResponse{Diagnostics: []*tfprotov6.Diagnostic{{
+				Severity: tfprotov6.DiagnosticSeverityError,
+				Summary:  "sensitive refresh state was not recovered",
+				Detail:   "the provider did not receive complete persisted sensitive state",
+			}}}, nil
+		}
+		attrs["secret"] = priorAttrs["secret"]
+		attrs["members"] = priorAttrs["members"]
+	}
+	planned, err := tfprotov6.NewDynamicValue(refreshSensitiveType, tftypes.NewValue(refreshSensitiveType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.PlanResourceChangeResponse{PlannedState: &planned, PlannedPrivate: req.PriorPrivate}, nil
+}
+
 func (s *server) planSecretful(req *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
 	proposed, err := req.ProposedNewState.Unmarshal(secretfulType)
 	if err != nil {
@@ -708,6 +814,37 @@ func (s *server) applySecretful(req *tfprotov6.ApplyResourceChangeRequest) (*tfp
 		return nil, err
 	}
 	return &tfprotov6.ApplyResourceChangeResponse{NewState: &dv, Private: req.PlannedPrivate}, nil
+}
+
+func (s *server) applyRefreshSensitive(req *tfprotov6.ApplyResourceChangeRequest) (*tfprotov6.ApplyResourceChangeResponse, error) {
+	planned, err := req.PlannedState.Unmarshal(refreshSensitiveType)
+	if err != nil {
+		return nil, err
+	}
+	if planned.IsNull() {
+		return &tfprotov6.ApplyResourceChangeResponse{NewState: req.PlannedState}, nil
+	}
+	var attrs map[string]tftypes.Value
+	if err := planned.As(&attrs); err != nil {
+		return nil, err
+	}
+	var name string
+	if err := attrs["name"].As(&name); err != nil {
+		return nil, err
+	}
+	if !attrs["id"].IsKnown() {
+		attrs["id"] = tftypes.NewValue(tftypes.String, s.prefix+"refresh-"+name)
+	}
+	attrs["secret"] = tftypes.NewValue(tftypes.String, "refresh-sensitive-secret")
+	attrs["members"] = tftypes.NewValue(tftypes.List{ElementType: tftypes.String}, []tftypes.Value{
+		tftypes.NewValue(tftypes.String, "refresh-member-one"),
+		tftypes.NewValue(tftypes.String, "refresh-member-two"),
+	})
+	newState, err := tfprotov6.NewDynamicValue(refreshSensitiveType, tftypes.NewValue(refreshSensitiveType, attrs))
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.ApplyResourceChangeResponse{NewState: &newState, Private: req.PlannedPrivate}, nil
 }
 
 // planNestedThing plans a tchoritest_nested_thing change. "settings" (the
@@ -793,6 +930,9 @@ func (s *server) ApplyResourceChange(ctx context.Context, req *tfprotov6.ApplyRe
 	}
 	if req.TypeName == "tchoritest_secretful" {
 		return s.applySecretful(req)
+	}
+	if req.TypeName == "tchoritest_refresh_sensitive" {
+		return s.applyRefreshSensitive(req)
 	}
 	if req.TypeName == "tchoritest_set_thing" {
 		return s.applySetThing(req)
@@ -1104,6 +1244,9 @@ func (s *server) applyIngressThing(req *tfprotov6.ApplyResourceChangeRequest) (*
 // "id-" marker are rejected so the CLI's "resource does not exist" path is
 // testable.
 func (s *server) ImportResourceState(ctx context.Context, req *tfprotov6.ImportResourceStateRequest) (*tfprotov6.ImportResourceStateResponse, error) {
+	if req.TypeName == "tchoritest_refresh_sensitive" {
+		return s.importRefreshSensitive(req)
+	}
 	if req.TypeName == "tchoritest_set_thing" {
 		return s.importSetThing(req)
 	}
@@ -1155,6 +1298,34 @@ func (s *server) ImportResourceState(ctx context.Context, req *tfprotov6.ImportR
 			State:    &dv,
 		}},
 	}, nil
+}
+
+func (s *server) importRefreshSensitive(req *tfprotov6.ImportResourceStateRequest) (*tfprotov6.ImportResourceStateResponse, error) {
+	const marker = "id-"
+	idx := strings.LastIndex(req.ID, marker)
+	if idx < 0 || idx+len(marker) == len(req.ID) {
+		return &tfprotov6.ImportResourceStateResponse{Diagnostics: []*tfprotov6.Diagnostic{{
+			Severity: tfprotov6.DiagnosticSeverityError,
+			Summary:  "resource does not exist",
+			Detail:   "the refresh-sensitive fixture requires an id- name",
+		}}}, nil
+	}
+	name := req.ID[idx+len(marker):]
+	value := tftypes.NewValue(refreshSensitiveType, map[string]tftypes.Value{
+		"id":      tftypes.NewValue(tftypes.String, req.ID),
+		"name":    tftypes.NewValue(tftypes.String, name),
+		"secret":  tftypes.NewValue(tftypes.String, "refresh-sensitive-secret"),
+		"members": tftypes.NewValue(tftypes.List{ElementType: tftypes.String}, []tftypes.Value{tftypes.NewValue(tftypes.String, "refresh-member-one"), tftypes.NewValue(tftypes.String, "refresh-member-two")}),
+		"note":    tftypes.NewValue(tftypes.String, "imported-note"),
+	})
+	dynamic, err := tfprotov6.NewDynamicValue(refreshSensitiveType, value)
+	if err != nil {
+		return nil, err
+	}
+	return &tfprotov6.ImportResourceStateResponse{ImportedResources: []*tfprotov6.ImportedResource{{
+		TypeName: req.TypeName,
+		State:    &dynamic,
+	}}}, nil
 }
 
 func (s *server) MoveResourceState(ctx context.Context, req *tfprotov6.MoveResourceStateRequest) (*tfprotov6.MoveResourceStateResponse, error) {
