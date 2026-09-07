@@ -133,11 +133,12 @@ reads of artifacts without encrypted fields do not require it merely to parse
 those artifacts. Invalid keys, failed authentication, and address/type/provider
 source/purpose tampering produce errors without revealing protected values.
 
-New state and plan writes use format `1.2`. This build can read `1.1`
-encrypted-private artifacts and legacy `1.0` artifacts for migration, but old
-engines reject `1.2` instead of applying a plan whose sensitive set state they
-cannot preserve. `tchori state sanitize` upgrades prior state and protects its
-backup without applying infrastructure changes.
+New state writes use format `1.3`; plan writes remain format `1.2`. This build
+reads state `1.2` recovery envelopes, `1.1` encrypted-private artifacts, and
+legacy `1.0` artifacts for migration. Older engines reject newer formats
+instead of applying a plan or rewriting state without the required sensitive
+recovery generation boundary. `tchori state sanitize` upgrades prior state and
+protects its backup without applying infrastructure changes.
 Previously leaked values still require credential rotation and history
 cleanup; rewriting the working tree does not erase existing commits.
 Legacy plans carrying private bytes without recorded resource identity must

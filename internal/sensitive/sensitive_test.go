@@ -9,6 +9,7 @@ import (
 
 	"github.com/tchori-labs/tchori/internal/provider"
 	"github.com/zclconf/go-cty/cty"
+	"github.com/zclconf/go-cty/cty/msgpack"
 )
 
 func testBlock(nesting string) *provider.SchemaBlock {
@@ -1003,6 +1004,48 @@ func TestSensitiveFlatMapSetPreservesAuthority(t *testing.T) {
 				t.Fatalf("Restore = %#v, want %#v", restored, original)
 			}
 		})
+	}
+}
+
+func TestSensitiveFlatMapSetRejectsDescendantUnknown(t *testing.T) {
+	setType := cty.Set(cty.String)
+	mapType := cty.Map(setType)
+	resourceType := cty.Object(map[string]cty.Type{"groups": mapType})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"groups": {Type: mapType, Sensitive: true},
+	}}
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	value := cty.ObjectVal(map[string]cty.Value{
+		"groups": cty.MapVal(map[string]cty.Value{
+			"private-key": cty.UnknownVal(setType),
+		}),
+	})
+	if _, _, _, err := spec.Project(value); err == nil {
+		t.Fatal("Project accepted a shallow-known recovery map with an unknown descendant")
+	}
+	raw, err := msgpack.Marshal(value.GetAttr("groups"), mapType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public := json.RawMessage(`{"groups":null}`)
+	sum := sha256.Sum256(public)
+	recovery, err := json.Marshal(recoveryPayload{
+		Version:          RecoveryVersion,
+		ProjectionSHA256: sum[:],
+		ProjectionPaths:  spec.Paths(),
+		Values: []recoverySet{{
+			Path:  []recoveryPathStep{{Kind: "attr", Name: "groups"}},
+			Value: raw,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spec.Restore(public, recovery, resourceType); err == nil {
+		t.Fatal("Restore accepted a recovery map with an unknown descendant")
 	}
 }
 
