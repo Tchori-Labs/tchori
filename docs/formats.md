@@ -326,7 +326,10 @@ AES-GCM additional data. Its generation-4 plaintext has
 `contract_version: 1`, a SHA-256 digest of the exact public projection,
 authoritative `projection_paths` and `projection_redacted` arrays,
 `direct_paths`, and a `values` array. Generation 4 stores directly sensitive
-scalar, list, and map values plus collection recovery in `values`; the envelope
+scalar and composite boundaries plus collection recovery in `values`. When a
+sensitive ancestor must remain structurally projected around an affected set,
+each non-overlapping sensitive sibling boundary is recorded at its actual
+logical path. Non-null recovered values must be wholly known. The envelope
 remains mandatory when `values` is empty.
 
 On load, format `1.3` rejects a missing envelope, authenticates its resource
@@ -361,10 +364,11 @@ cryptography. Preventing it requires trusted repository/storage history or an
 external monotonic trust anchor.
 
 During `import --refresh` and plan refresh reads, a provider's concrete value
-always wins. If the provider returns `null` or `unknown` for an exact path
-already recorded in `sensitive_paths`, the engine restores only that sensitive
-path from authenticated recovery; ordinary paths are never carried forward.
-Omissions below an ambiguous collection shape fail closed before `Save`, so
+always wins. If the provider returns `null` or `unknown` at a path covered by
+an authenticated persisted sensitivity path, the engine restores that
+sensitive boundary from authenticated recovery; ordinary paths are never
+carried forward. Omissions below an ambiguous collection shape fail closed
+before `Save`, so
 the state and backup remain unchanged.
 
 ### Incomplete apply lifecycle
@@ -472,12 +476,14 @@ side effects between state checkpoints.
    Live resolution restores affected sets under their recorded generation
    paths before typed decoding, then emits a new public projection and recovery
    payload under current policy. It honors per-instance literal exemptions
-   outside sets. An unresolved entry without set recovery falls back to
-   persisted paths and hints without exemptions and is reported. An unresolved
-   entry with set recovery is rejected: schema is required to keep the
-   authenticated pair valid. An empty combined path set is definitively
-   non-sensitive only after successful resolution, which records
-   `sensitive_scanned`.
+   outside sets. An unresolved resource with an already authenticated current
+   generation-4 projection/contract pair is preserved without schema when no
+   new sensitivity hint requires rebinding it. Legacy recovery, or a current
+   contract that must be rebound to changed sensitivity metadata, is rejected
+   without live schema. An unresolved legacy entry without recovery falls back
+   to persisted paths and hints without exemptions and is reported. An empty
+   combined path set is definitively non-sensitive only after successful
+   resolution, which records `sensitive_scanned`.
 5. Increments `Serial`, marshals with `MarshalIndent`, writes a temp file
    (`.state-*.tmp`) in the same directory, and fsyncs the complete file before
    closing it. It atomically renames the temp file over `path`, then runs the

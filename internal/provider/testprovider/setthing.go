@@ -22,12 +22,29 @@ var setThingDeclaredMemberType = tftypes.Object{AttributeTypes: map[string]tftyp
 	"token": tftypes.String,
 }}
 
+var authorityMetadataType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{
+	"value": tftypes.String,
+}}
+
+var authorityContainerType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{
+	"members":  tftypes.Set{ElementType: tftypes.String},
+	"token":    tftypes.String,
+	"labels":   tftypes.List{ElementType: tftypes.String},
+	"metadata": authorityMetadataType,
+}}
+
+var directPayloadType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{
+	"value": tftypes.String,
+}}
+
 var setThingType = tftypes.Object{AttributeTypes: map[string]tftypes.Type{
 	"id":                tftypes.String,
 	"name":              tftypes.String,
 	"attribute_members": tftypes.Set{ElementType: setThingMemberType},
 	"block_members":     tftypes.Set{ElementType: setThingMemberType},
 	"declared_members":  tftypes.Set{ElementType: setThingDeclaredMemberType},
+	"authority":         authorityContainerType,
+	"direct_payload":    directPayloadType,
 }}
 
 var setThingMemberAttributes = []*tfprotov6.SchemaAttribute{
@@ -51,6 +68,40 @@ var setThingSchema = &tfprotov6.Schema{Version: 0, Block: &tfprotov6.SchemaBlock
 	Attributes: []*tfprotov6.SchemaAttribute{
 		{Name: "id", Type: tftypes.String, Computed: true},
 		{Name: "name", Type: tftypes.String, Required: true},
+		{
+			Name:      "authority",
+			Optional:  true,
+			Sensitive: true,
+			NestedType: &tfprotov6.SchemaObject{
+				Nesting: tfprotov6.SchemaObjectNestingModeSingle,
+				Attributes: []*tfprotov6.SchemaAttribute{
+					{Name: "members", Type: tftypes.Set{ElementType: tftypes.String}, Optional: true},
+					{Name: "token", Type: tftypes.String, Optional: true},
+					{Name: "labels", Type: tftypes.List{ElementType: tftypes.String}, Optional: true},
+					{
+						Name:     "metadata",
+						Optional: true,
+						NestedType: &tfprotov6.SchemaObject{
+							Nesting: tfprotov6.SchemaObjectNestingModeSingle,
+							Attributes: []*tfprotov6.SchemaAttribute{
+								{Name: "value", Type: tftypes.String, Optional: true},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			Name:      "direct_payload",
+			Optional:  true,
+			Sensitive: true,
+			NestedType: &tfprotov6.SchemaObject{
+				Nesting: tfprotov6.SchemaObjectNestingModeSingle,
+				Attributes: []*tfprotov6.SchemaAttribute{
+					{Name: "value", Type: tftypes.String, Optional: true},
+				},
+			},
+		},
 		{
 			Name:     "attribute_members",
 			Optional: true,
@@ -128,17 +179,54 @@ var flatSetThingSchema = &tfprotov6.Schema{Version: 0, Block: &tfprotov6.SchemaB
 	},
 }}
 
+func missingAuthorityToken(value tftypes.Value) (bool, error) {
+	if value.IsNull() {
+		return false, nil
+	}
+	if !value.IsKnown() {
+		return true, nil
+	}
+	var attrs map[string]tftypes.Value
+	if err := value.As(&attrs); err != nil {
+		return false, err
+	}
+	return !attrs["token"].IsKnown() || attrs["token"].IsNull(), nil
+}
+
+func missingAuthorityDiagnostic() *tfprotov6.Diagnostic {
+	return &tfprotov6.Diagnostic{
+		Severity: tfprotov6.DiagnosticSeverityError,
+		Summary:  "inherited sensitive authority was not recovered",
+		Detail:   "the provider did not receive the persisted authority token",
+	}
+}
+
 func (s *server) planSetThing(req *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
 	proposed, err := req.ProposedNewState.Unmarshal(setThingType)
 	if err != nil {
 		return nil, err
 	}
-	if proposed.IsNull() {
-		return &tfprotov6.PlanResourceChangeResponse{PlannedState: req.ProposedNewState, PlannedPrivate: req.PriorPrivate}, nil
-	}
 	prior, err := req.PriorState.Unmarshal(setThingType)
 	if err != nil {
 		return nil, err
+	}
+	if !prior.IsNull() {
+		var priorAttrs map[string]tftypes.Value
+		if err := prior.As(&priorAttrs); err != nil {
+			return nil, err
+		}
+		missing, err := missingAuthorityToken(priorAttrs["authority"])
+		if err != nil {
+			return nil, err
+		}
+		if missing {
+			return &tfprotov6.PlanResourceChangeResponse{
+				Diagnostics: []*tfprotov6.Diagnostic{missingAuthorityDiagnostic()},
+			}, nil
+		}
+	}
+	if proposed.IsNull() {
+		return &tfprotov6.PlanResourceChangeResponse{PlannedState: req.ProposedNewState, PlannedPrivate: req.PriorPrivate}, nil
 	}
 	var attrs map[string]tftypes.Value
 	if err := proposed.As(&attrs); err != nil {
@@ -386,6 +474,25 @@ func (s *server) applySetThing(req *tfprotov6.ApplyResourceChangeRequest) (*tfpr
 	if err != nil {
 		return nil, err
 	}
+	prior, err := req.PriorState.Unmarshal(setThingType)
+	if err != nil {
+		return nil, err
+	}
+	if !prior.IsNull() {
+		var priorAttrs map[string]tftypes.Value
+		if err := prior.As(&priorAttrs); err != nil {
+			return nil, err
+		}
+		missing, err := missingAuthorityToken(priorAttrs["authority"])
+		if err != nil {
+			return nil, err
+		}
+		if missing {
+			return &tfprotov6.ApplyResourceChangeResponse{
+				Diagnostics: []*tfprotov6.Diagnostic{missingAuthorityDiagnostic()},
+			}, nil
+		}
+	}
 	if planned.IsNull() {
 		return &tfprotov6.ApplyResourceChangeResponse{NewState: req.PlannedState}, nil
 	}
@@ -400,9 +507,25 @@ func (s *server) applySetThing(req *tfprotov6.ApplyResourceChangeRequest) (*tfpr
 	if !attrs["id"].IsKnown() {
 		attrs["id"] = tftypes.NewValue(tftypes.String, s.prefix+"id-"+name)
 	}
+	partialUnknown := name == "partial-unknown-sensitive-payload"
+	if partialUnknown {
+		attrs["direct_payload"] = tftypes.NewValue(directPayloadType, map[string]tftypes.Value{
+			"value": tftypes.NewValue(tftypes.String, tftypes.UnknownValue),
+		})
+	}
 	newState, err := tfprotov6.NewDynamicValue(setThingType, tftypes.NewValue(setThingType, attrs))
 	if err != nil {
 		return nil, err
+	}
+	if partialUnknown {
+		return &tfprotov6.ApplyResourceChangeResponse{
+			NewState: &newState,
+			Diagnostics: []*tfprotov6.Diagnostic{{
+				Severity: tfprotov6.DiagnosticSeverityError,
+				Summary:  "sensitive payload partially failed",
+				Detail:   "the remote object exists with incomplete sensitive state",
+			}},
+		}, nil
 	}
 	if name == "partial-set-failure" {
 		return &tfprotov6.ApplyResourceChangeResponse{
@@ -446,6 +569,8 @@ func (s *server) importSetThing(req *tfprotov6.ImportResourceStateRequest) (*tfp
 		"attribute_members": members("imported-attribute"),
 		"declared_members":  tftypes.NewValue(tftypes.Set{ElementType: setThingDeclaredMemberType}, nil),
 		"block_members":     members("imported-block"),
+		"authority":         tftypes.NewValue(authorityContainerType, nil),
+		"direct_payload":    tftypes.NewValue(directPayloadType, nil),
 	})
 	dynamic, err := tfprotov6.NewDynamicValue(setThingType, value)
 	if err != nil {

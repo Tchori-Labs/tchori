@@ -21,10 +21,6 @@ type Spec struct {
 	exempt         map[string]any
 	setPrefixes    []string
 	allSetPrefixes []string
-	// nil means capture direct sensitive paths under the current policy;
-	// non-nil limits capture to paths already present in the persisted policy
-	// while rotating a projection.
-	directRecoveryPaths []string
 }
 
 // Resolve is the single constructor used by persistence and planning paths.
@@ -93,9 +89,9 @@ func (s *Spec) carryForward(prior, refreshed cty.Value, persisted []string, stri
 	}
 	return cty.Transform(refreshed, func(path cty.Path, value cty.Value) (cty.Value, error) {
 		logical := logicalPath(path)
-		exact := contains(paths, logical)
+		effective := coveredBySensitivePath(logical, paths)
 		missing := value.IsNull() || !value.IsKnown()
-		if !exact {
+		if !effective {
 			if strict && missing && (logical == "" || hasSensitiveDescendant(logical, paths)) {
 				return cty.NilVal, fmt.Errorf("refresh omitted persisted sensitive path below %q", logical)
 			}

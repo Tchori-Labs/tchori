@@ -937,6 +937,129 @@ func TestApplyRejectsUnknownDescendantInSensitiveRecoveryMap(t *testing.T) {
 	}
 }
 
+func TestApplyInheritedSensitiveContainerRetainsProviderAuthority(t *testing.T) {
+	const secret = "inherited-provider-authority-sentinel"
+	resource := setThing("authority-bundle", "authority-bundle")
+	resource.Config["authority"] = map[string]any{
+		"members": []any{"member"},
+		"token":   secret,
+		"labels":  []any{"sensitive-label"},
+		"metadata": map[string]any{
+			"value": "sensitive-object",
+		},
+	}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial apply lost inherited authority: %+v", ds)
+	}
+	data, err := os.ReadFile(h.statePath) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(secret)) {
+		t.Fatal("state exposed inherited sensitive authority")
+	}
+	current := loadState(t, h.statePath)
+	rs := current.Resources[resource.Address]
+	schema := h.schemas["tchoritest"].ResourceTypes[resource.Type]
+	spec, specDs := sensitive.ResolveWithPersisted(schema.Block, nil, rs.SensitivePaths, nil)
+	if specDs.HasErrors() {
+		t.Fatal(specDs)
+	}
+	restored, err := spec.RestoreProjected(
+		rs.Attributes, rs.SensitiveSetRecovery, schema.Block.ImpliedType(),
+		rs.SensitivePaths, rs.SensitiveRecoveryVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := restored.GetAttr("authority").GetAttr("token"); !got.IsKnown() || got.IsNull() || got.AsString() != secret {
+		t.Fatalf("restored authority token = %#v", got)
+	}
+
+	resource.Config["name"] = "authority-bundle-updated"
+	update := h.plan(t, current, false)
+	if len(update.Changes) != 1 || update.Changes[0].Action != "update" {
+		t.Fatalf("update plan = %+v", update.Changes)
+	}
+	if bytes.Contains(append(append([]byte(nil), update.Changes[0].Before...), update.Changes[0].After...), []byte(secret)) {
+		t.Fatal("provider-facing update plan exposed inherited sensitive authority")
+	}
+	if _, ds := apply.Apply(context.Background(), update, h.cfg, h.providers, h.schemas, current, h.statePath); ds.HasErrors() {
+		t.Fatalf("update provider did not receive inherited authority: %+v", ds)
+	}
+
+	current = loadState(t, h.statePath)
+	delete(h.cfg.Resources, resource.Address)
+	destroy := h.plan(t, current, false)
+	if len(destroy.Changes) != 1 || destroy.Changes[0].Action != "delete" {
+		t.Fatalf("state-only plan = %+v", destroy.Changes)
+	}
+	if bytes.Contains(destroy.Changes[0].Before, []byte(secret)) {
+		t.Fatal("state-only delete plan exposed inherited sensitive authority")
+	}
+	if _, ds := apply.Apply(context.Background(), destroy, h.cfg, h.providers, h.schemas, current, h.statePath); ds.HasErrors() {
+		t.Fatalf("state-only delete provider did not receive inherited authority: %+v", ds)
+	}
+	if got := loadState(t, h.statePath).Resources[resource.Address]; got != nil {
+		t.Fatal("state-only delete retained inherited-sensitive resource")
+	}
+	for _, path := range []string{h.statePath, h.statePath + ".backup"} {
+		artifact, err := os.ReadFile(path) //nolint:gosec // test-controlled state artifacts
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(artifact, []byte(secret)) {
+			t.Fatalf("%s exposed inherited sensitive authority", path)
+		}
+	}
+}
+
+func TestStateOnlyDeleteRetainsFormerLiteralExemptionAuthority(t *testing.T) {
+	const secret = "formerly-exempt-delete-authority"
+	resource := secretful("literal-delete-authority", map[string]any{"token": secret})
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	current := loadState(t, h.statePath)
+	delete(h.cfg.Resources, resource.Address)
+	destroy := h.plan(t, current, false)
+	if len(destroy.Changes) != 1 || destroy.Changes[0].Action != "delete" {
+		t.Fatalf("state-only plan = %+v", destroy.Changes)
+	}
+	if bytes.Contains(destroy.Changes[0].Before, []byte(secret)) {
+		t.Fatal("state-only delete plan exposed a formerly exempt secret")
+	}
+	if _, ds := apply.Apply(context.Background(), destroy, h.cfg, h.providers, h.schemas, current, h.statePath); ds.HasErrors() {
+		t.Fatalf("state-only delete lost formerly exempt provider authority: %+v", ds)
+	}
+	for _, path := range []string{h.statePath, h.statePath + ".backup"} {
+		artifact, err := os.ReadFile(path) //nolint:gosec // test-controlled state artifacts
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(artifact, []byte(secret)) {
+			t.Fatalf("%s exposed a formerly exempt secret after policy rotation", path)
+		}
+	}
+}
+
+func TestApplyPartialUnknownDirectCompositeWritesNoCheckpoint(t *testing.T) {
+	resource := setThing("partial-unknown-sensitive-payload", "partial-unknown-sensitive-payload")
+	resource.Config["direct_payload"] = map[string]any{"value": "known-before-provider"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); !ds.HasErrors() {
+		t.Fatal("partial provider result with a shallow-known sensitive object unexpectedly succeeded")
+	}
+	if got := loadState(t, h.statePath).Resources[resource.Address]; got != nil {
+		t.Fatal("partial provider result installed a poisoned sensitive checkpoint")
+	}
+}
+
 func TestApplyRetainsPersistedConfigOnlySensitiveSetPolicy(t *testing.T) {
 	resource := setThing("declared", "declared")
 	resource.Config["declared_members"] = []any{
