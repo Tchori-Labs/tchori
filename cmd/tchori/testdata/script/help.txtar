@@ -18,6 +18,12 @@ stdout '^Global Flags:$'
 stdout '^      --plugin-dir string   directory searched first for provider binaries'
 ! stderr .
 
+exec tchori import --help
+stdout '^Adopt an existing real-world resource into state under a config-declared address$'
+stdout '^  tchori import ADDRESS ID \[flags\]$'
+stdout '^      --refresh.*replace an existing state entry by importing and reading exactly this resource$'
+! stderr .
+
 -- root-help.txt --
 tchori is an agent-native everything-as-code engine
 

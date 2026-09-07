@@ -385,22 +385,26 @@ func runDestroy(cmd *cobra.Command, out string) (int, error) {
 // --- import ------------------------------------------------------------------
 
 func newImportCmd() *cobra.Command {
-	return &cobra.Command{
+	var refresh bool
+	cmd := &cobra.Command{
 		Use:   "import ADDRESS ID",
 		Short: "Adopt an existing real-world resource into state under a config-declared address",
 		Args:  cobra.ExactArgs(2),
-		RunE:  exitRun(runImport),
+		RunE: exitRun(func(cmd *cobra.Command, args []string) (int, error) {
+			return runImport(cmd, args, refresh)
+		}),
 	}
+	cmd.Flags().BoolVar(&refresh, "refresh", false, "replace an existing state entry by importing and reading exactly this resource")
+	return cmd
 }
 
 // runImport maps a real resource to a config-declared address: the address
 // must exist in config (so provider/type resolve, matching Terraform's
-// classic import requirement) and must not already exist in state (no
-// overwrite). It calls the provider's ImportResourceState, refreshes the
-// imported object via ReadResource, and persists the result on success. A
-// null refreshed value ("resource does not exist") errors without writing
-// state.
-func runImport(cmd *cobra.Command, args []string) (int, error) {
+// classic import requirement). Without --refresh it must not already exist in
+// state. With --refresh it must already exist and is replaced only after the
+// provider import/read and sensitive projection both succeed. The provider
+// calls are read-only; state.Save performs the single atomic replacement.
+func runImport(cmd *cobra.Command, args []string, refresh bool) (int, error) {
 	ctx := cmd.Context()
 	address, id := args[0], args[1]
 
@@ -429,8 +433,20 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 		return 1, err
 	}
 	defer unlock()
-	if _, exists := st.Resources[address]; exists {
-		return 1, fmt.Errorf("%s already exists in state; import does not overwrite", address)
+	existing, exists := st.Resources[address]
+	if exists && !refresh {
+		return 1, fmt.Errorf("%s already exists in state; import does not overwrite (use --refresh to replace it explicitly)", address)
+	}
+	if refresh && !exists {
+		return 1, fmt.Errorf("%s is not in state; --refresh requires an existing state entry", address)
+	}
+	if refresh && (existing.Type != res.Type || existing.Provider != res.Provider) {
+		return 1, fmt.Errorf("%s: existing state identity (%s/%s) does not match configuration (%s/%s); state was not changed",
+			address, existing.Provider, existing.Type, res.Provider, res.Type)
+	}
+	if refresh && existing.ProviderSource != "" && existing.ProviderSource != rt.Config.Providers[res.Provider].Source {
+		return 1, fmt.Errorf("%s: existing state provider source %q does not match configuration source %q; state was not changed",
+			address, existing.ProviderSource, rt.Config.Providers[res.Provider].Source)
 	}
 	st.SetSensitiveResolver(func(addr string, rs *state.ResourceState) (state.Resolution, bool) {
 		r := rt.Config.Resources[addr]
@@ -445,7 +461,7 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 		if !known || sch == nil {
 			return state.Resolution{}, false
 		}
-		spec, rds := sensitive.Resolve(sch.Block, r.SensitiveAttributes, r.Config)
+		spec, rds := sensitive.ResolveWithPersisted(sch.Block, r.SensitiveAttributes, rs.SensitivePaths, r.Config)
 		if rds.HasErrors() {
 			return state.Resolution{}, false
 		}
@@ -491,7 +507,12 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 		return 1, fmt.Errorf("%s: resource %q does not exist", address, id)
 	}
 
-	spec, sds := sensitive.Resolve(schema.Block, res.SensitiveAttributes, res.Config)
+	declaredSensitive := res.SensitiveAttributes
+	var persistedSensitive []string
+	if refresh {
+		persistedSensitive = existing.SensitivePaths
+	}
+	spec, sds := sensitive.ResolveWithPersisted(schema.Block, declaredSensitive, persistedSensitive, res.Config)
 	emitDiags(sds)
 	if sds.HasErrors() {
 		return 1, nil
@@ -516,7 +537,11 @@ func runImport(cmd *cobra.Command, args []string) (int, error) {
 		emitDiags(diag.Diagnostics{diag.Warnf(unresolved, "state entry could not be checked for sensitive values", "provider schema or live configuration was unavailable")})
 	}
 
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Imported %s (id=%s).\n", address, id)
+	if refresh {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Refreshed %s.\n", address)
+	} else {
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Imported %s (id=%s).\n", address, id)
+	}
 	return 0, nil
 }
 

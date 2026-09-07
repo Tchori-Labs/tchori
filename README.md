@@ -292,10 +292,16 @@ Rules, matching Terraform's classic `import`:
 - `ADDRESS` must already be declared in config so its provider and type
   resolve — import does not create config for you.
 - `ADDRESS` must **not** already exist in `state.json` — import never
-  overwrites; adopt each real resource exactly once.
-- tchori calls the provider's `ImportResourceState`, then refreshes the
-  result via `ReadResource` before persisting it. A null refresh result
-  ("resource does not exist") errors without writing state.
+  overwrites; adopt each real resource exactly once. To explicitly replace an
+  existing entry after an out-of-band update, use
+  `tchori import --refresh ADDRESS ID`; `--refresh` requires that address to
+  already exist.
+- In either mode, tchori calls the provider's `ImportResourceState`, then
+  refreshes the result via `ReadResource` before persisting it. A null refresh
+  result ("resource does not exist") errors without writing state. `--refresh`
+  performs no Create/Update/Delete operation, holds the state lock throughout,
+  and atomically saves only the named address while preserving unrelated
+  resources.
 - Exit codes: `0` on success, `1` on any error. Import never uses exit code
   `2` — it is not a plan/apply command.
 
