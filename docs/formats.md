@@ -307,7 +307,7 @@ creates.
 | `provider_source` | string, omitted in legacy/early `1.1` input | Canonical provider registry source. New state binds this value into encrypted-envelope authentication and checks it before provider RPCs. |
 | `attributes` | object | Deterministic public projection of applied values. Every withheld sensitive leaf is JSON `null`; sensitive sets retain element count and non-sensitive association as array entries. A sensitive map inside a captured set is withheld as a whole so its keys do not leak. A sensitive map above an affected set is also whole-value `null` and uses authenticated recovery. State never stores unknown values. |
 | `private` | object, omitted if empty | Authenticated encrypted envelope with `version`, `nonce`, and `ciphertext`, as described for plans. The opaque plaintext is preserved only in memory for provider RPCs. |
-| `sensitive_set_recovery` | object, omitted if empty | Separate authenticated encrypted envelope containing authoritative values for directly sensitive paths plus complete outermost sets whose identity depends on sensitive descendants and any smallest sensitive map boundary needed to hide dynamic keys above such a set. It is opened before typed state decoding and never included in read projections. |
+| `sensitive_set_recovery` | object | Mandatory format `1.3` authenticated projection-contract envelope. Its encrypted plaintext binds the public projection digest, authoritative sensitivity/redaction paths, generation, and any direct or collection values needed for recovery; `values` may be empty. Legacy formats may omit it when they have no recovery payload. |
 | `sensitive_recovery_version` | integer | Mandatory per-resource sensitive projection generation. Format `1.3` requires the current value `4`; generation `0` and versions `1` through `3` are accepted only from legacy formats so live schemas can restore and reproject them. A nonzero value is also authenticated as part of the recovery envelope's AES-GCM additional data. |
 | `redacted` | array of strings, omitted if empty | Sorted paths whose values are withheld, explaining why the corresponding `attributes` leaf is `null`. |
 | `sensitive_paths` | array of strings, omitted if empty | Sorted effective, index-insensitive sensitivity contract. It survives config removal and drives backups, delete plans, orphan handling, and provider-free read masking. |
@@ -315,33 +315,41 @@ creates.
 
 Standalone resource JSON used by CLI/MCP read surfaces omits both encrypted
 fields and the state-only generation marker. The state document serializer,
-not an ordinary resource JSON dump, writes provider-private and sensitive-set
-recovery envelopes plus the mandatory marker.
+not an ordinary resource JSON dump, writes provider-private data plus one
+mandatory projection-contract envelope and generation marker per current
+resource.
 
-The recovery envelope has a purpose distinct from provider `private` and
-authenticates the resource address, type, provider alias, canonical source, and
-nonzero `sensitive_recovery_version` as AES-GCM additional data. Its plaintext
-is versioned and contains a SHA-256 digest of the exact public projection plus
-structured attribute/map/list paths to msgpack-encoded authoritative values.
-Recovery payload version 4 stores directly sensitive scalar, list, and map
-values in `values` and records their logical paths in `direct_paths`; it also
-stores the collection recovery described below. Version 3 stores outermost
-affected sets and sensitive map boundaries in `values`; structural collection
-traversal distinguishes `map(set(...))` from `set(map(...))`, and map recovery
-preserves null, empty, keys, structure, and nested set membership exactly.
-Version 2 stores sets in `sets` and records the sensitivity paths that produced
-the projection, so expanding sensitivity can authenticate and restore old set
-membership before emitting a new projection/recovery pair. Version 1 payloads
-use the resource's recorded `sensitive_paths` for the same migration. Valid
-older projections are checked with their generation-time semantics, then
-rotated to the confidential version 4 representation.
-Restoration validates the generation marker, generation paths, complete
+The projection-contract envelope has a purpose distinct from provider
+`private` and authenticates the resource address, type, provider alias,
+canonical source when present, and nonzero `sensitive_recovery_version` as
+AES-GCM additional data. Its generation-4 plaintext has
+`contract_version: 1`, a SHA-256 digest of the exact public projection,
+authoritative `projection_paths` and `projection_redacted` arrays,
+`direct_paths`, and a `values` array. Generation 4 stores directly sensitive
+scalar, list, and map values plus collection recovery in `values`; the envelope
+remains mandatory when `values` is empty.
+
+On load, format `1.3` rejects a missing envelope, authenticates its resource
+identity and purpose, validates the projection digest, and replaces removable
+plaintext `sensitive_paths`/`redacted` mirrors with the authenticated contract.
+Typed restore also requires the current contract and derives generation paths
+from its authenticated payload. Removing the envelope and plaintext mirrors
+therefore cannot turn a projected `null` into provider authority.
+
+Generation 3 stores outermost affected sets and sensitive map boundaries in
+`values`; structural collection traversal distinguishes `map(set(...))` from
+`set(map(...))`, and map recovery preserves null, empty, keys, structure, and
+nested set membership exactly. Version 2 stores sets in `sets` and records the
+sensitivity paths that produced the projection. Version 1 uses the resource's
+recorded `sensitive_paths`. Valid legacy projections are checked with their
+generation-time semantics, then rotated to the generation-4 contract.
+
+Restoration validates the generation marker, authenticated paths, complete
 recovery path set, projection digest, and typed generation-time projection
 before replacing public placeholders and decoding the authoritative cty value.
 Moving either envelope to another address/type/source/purpose, changing the
-key or generation marker, editing the public projection, or removing recovery
-required by a current-generation marker fails before a provider mutation or
-state checkpoint.
+key or generation marker, editing the public projection, or removing the
+current contract fails before a provider mutation or state checkpoint.
 
 This is a current-format integrity boundary, not a globally non-downgradable
 file marker. AES-GCM additional data detects ciphertext or bound-context
@@ -537,12 +545,13 @@ sorted by projected element bytes while retaining duplicates. These guarantees
 keep the reviewable structure stable rather than depending on map or
 secret-dependent set iteration order.
 
-Provider-private and sensitive-set recovery encryption use fresh random nonces
-on each serialization and distinct authenticated purposes. Both bind resource
-address, type, provider alias, and canonical source. Identical plaintext
+Provider-private and projection-contract encryption use fresh random nonces
+and distinct authenticated purposes. Both bind resource address, type,
+provider alias, and canonical source when present. Identical plaintext
 therefore produces different ciphertext; a ciphertext-only diff does not imply
 infrastructure drift. No deterministic nonce is derived from content, serial,
-or address. Artifacts with neither encrypted payload remain deterministic.
+or address. Every resource in a current nonempty state has an encrypted
+contract, so raw resource bytes can change even when public state is unchanged.
 
 ### format_version compatibility
 
@@ -555,17 +564,21 @@ state remains truthfully `1.2` when live schemas are unavailable; apply refuses
 such a state before writing its incomplete marker or calling a provider
 mutation. Format `1.1` introduced encrypted provider-private storage. Format
 `1.2` added encrypted sensitive-set recovery. Format `1.3` requires every
-resource to carry the value `4`, so removing a current recovery envelope and
-resetting its generation to `0` remains invalid while the document still
-declares `1.3`. Older readers refuse newer plans/state rather than silently
+resource to carry generation `4` plus the authenticated projection-contract
+envelope described above. Current files produced by an earlier build without
+that envelope or its current contract payload are rejected rather than treated
+as trustworthy; restore from a trusted copy or re-create state through an
+explicitly reviewed legacy migration. Older readers refuse newer plans/state
+rather than silently
 discarding or coalescing authoritative membership. Whole-document replacement
 or relabeling to a valid legacy artifact remains outside this file-local
 boundary, as described above.
 
 ### Example
 
-The state produced by applying the plan.json example above (test provider,
-prefix `demo-`):
+The state shape produced by applying the plan.json example above (test
+provider, prefix `demo-`) is shown below. Random nonce/ciphertext bytes are
+abbreviated:
 
 ```json
 {
@@ -583,6 +596,11 @@ prefix `demo-`):
         "replace_me": null,
         "tags": null
       },
+      "sensitive_set_recovery": {
+        "version": 1,
+        "nonce": "<base64 nonce>",
+        "ciphertext": "<base64 authenticated contract>"
+      },
       "sensitive_recovery_version": 4
     },
     "tchoritest_thing.b": {
@@ -597,6 +615,11 @@ prefix `demo-`):
         "tags": {
           "parent": "demo-id-alpha"
         }
+      },
+      "sensitive_set_recovery": {
+        "version": 1,
+        "nonce": "<base64 nonce>",
+        "ciphertext": "<base64 authenticated contract>"
       },
       "sensitive_recovery_version": 4
     }
@@ -752,10 +775,11 @@ original provider error already makes apply exit `1` under the
 Tchori derives sensitive paths from provider schema `Sensitive` flags plus a
 resource's optional `sensitive_attributes` list. Provider-computed values at
 those paths are withheld from state and plan artifacts. State stores a typed
-JSON `null` plus the three metadata fields above; plans replace the value with
-an unknown in both `after` and decoded `planned_raw`, list it in
-`unknown_after`, and mask it during update/replacement classification so a
-withheld computed value does not cause a perpetual diff.
+JSON `null`, plaintext reporting mirrors, and the mandatory encrypted
+projection contract described above. Plans replace the value with an unknown
+in both `after` and decoded `planned_raw`, list it in `unknown_after`, and mask
+it during update/replacement classification so a withheld computed value does
+not cause a perpetual diff.
 
 Sensitivity matching derives logical paths directly from structured cty path
 steps, so brackets, quotes, backslashes, or Unicode in map keys cannot alter the

@@ -19,6 +19,13 @@ import (
 	"github.com/zclconf/go-cty/cty"
 )
 
+func TestMain(m *testing.M) {
+	if err := os.Setenv("TCHORI_ARTIFACT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{99}, 32))); err != nil {
+		os.Exit(1)
+	}
+	os.Exit(m.Run())
+}
+
 // TestLoadMissing verifies Load returns an empty, well-formed format 1.3 state.
 func TestLoadMissing(t *testing.T) {
 	dir := t.TempDir()
@@ -1357,7 +1364,10 @@ func TestSavePreservesLiteralAndRecordedSensitivity(t *testing.T) {
 
 func TestSaveResolverOutcomes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	s := &State{Resources: map[string]*ResourceState{"known": {Attributes: json.RawMessage(`{}`)}, "orphan": {Attributes: json.RawMessage(`{}`)}}}
+	s := &State{Resources: map[string]*ResourceState{
+		"known":  {Type: "thing", Provider: "test", Attributes: json.RawMessage(`{}`)},
+		"orphan": {Type: "thing", Provider: "test", Attributes: json.RawMessage(`{}`)},
+	}}
 	s.SetSensitiveResolver(func(addr string, _ *ResourceState) (Resolution, bool) {
 		if addr == "known" {
 			return Resolution{}, true
@@ -1633,6 +1643,24 @@ func TestSaveMigratesLegacyPrivateInStateAndBackup(t *testing.T) {
 	}
 }
 
+func TestCurrentProjectionContractRequiresArtifactKey(t *testing.T) {
+	t.Setenv("TCHORI_ARTIFACT_KEY", "")
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"test_thing.example": {
+			Type: "test_thing", Provider: "test", ProviderSource: "example.test/test",
+			Attributes: json.RawMessage(`{"id":"public"}`),
+		},
+	}}
+	err := s.Save(path)
+	if err == nil || !strings.Contains(err.Error(), "TCHORI_ARTIFACT_KEY") {
+		t.Fatalf("Save error = %v, want mandatory current projection contract key error", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("key failure wrote current state: %v", statErr)
+	}
+}
+
 func TestSaveKeyFailureLeavesStateAndBackupUnchanged(t *testing.T) {
 	setStateArtifactKey(t, 25)
 	path := filepath.Join(t.TempDir(), "state.json")
@@ -1752,6 +1780,26 @@ func TestSavePreservesLegacyFormatWhenProjectionCannotBeRestored(t *testing.T) {
 	if !bytes.Contains(data, []byte(`"format_version": "1.2"`)) ||
 		!bytes.Contains(data, []byte(`"sensitive_recovery_version": 0`)) {
 		t.Fatalf("unrestored legacy projection was mislabeled as current: %s", data)
+	}
+}
+
+func TestSaveKeepsUnresolvedPathFreeLegacyProjectionAtGenerationZero(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	document := `{"format_version":"1.0","serial":1,"resources":{"thing.old":{"type":"thing","provider":"test","attributes":{"id":"public"}}}}`
+	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	if s.FormatVersion != recoveryFormatVersion ||
+		s.Resources["thing.old"].SensitiveRecoveryVersion != 0 {
+		t.Fatalf("unresolved path-free legacy state was mislabeled as current: format=%q generation=%d",
+			s.FormatVersion, s.Resources["thing.old"].SensitiveRecoveryVersion)
 	}
 }
 
@@ -1927,13 +1975,73 @@ func TestSensitiveSetRecoveryIsEncryptedBoundAndBackedUp(t *testing.T) {
 	if err := os.WriteFile(strippedPath, strippedData, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	strippedState, err := Load(strippedPath)
+	if _, err := Load(strippedPath); err == nil {
+		t.Fatal("Load accepted a current resource without its authenticated projection contract")
+	}
+}
+
+func TestCurrentProjectionContractRestoresAuthenticatedMetadata(t *testing.T) {
+	setStateArtifactKey(t, 35)
+	resourceType := cty.Object(map[string]cty.Type{"secret": cty.String, "public": cty.String})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"secret": {Type: cty.String, Sensitive: true},
+		"public": {Type: cty.String},
+	}}
+	spec, ds := sensitive.Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	public, redacted, contract, err := spec.Project(cty.ObjectVal(map[string]cty.Value{
+		"secret": cty.StringVal("contract-private"),
+		"public": cty.StringVal("visible"),
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	rs := strippedState.Resources["secret.set"]
-	if _, err := spec.RestoreProjected(rs.Attributes, rs.SensitiveSetRecovery, resourceType, rs.SensitivePaths, rs.SensitiveRecoveryVersion); err == nil {
-		t.Fatal("RestoreProjected accepted stripped version 3 recovery")
+	path := filepath.Join(t.TempDir(), "state.json")
+	s := &State{Resources: map[string]*ResourceState{
+		"secret.scalar": {
+			Type: "secret", Provider: "test", ProviderSource: "example.test/test",
+			Attributes: public, SensitiveSetRecovery: contract,
+			SensitiveRecoveryVersion: sensitive.RecoveryVersion,
+			Redacted:                 redacted, SensitivePaths: spec.Paths(), SensitiveScanned: true,
+		},
+	}}
+	if err := s.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path) //nolint:gosec // test-controlled artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	resource := document["resources"].(map[string]any)["secret.scalar"].(map[string]any)
+	delete(resource, "sensitive_paths")
+	delete(resource, "redacted")
+	tampered, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := loaded.Resources["secret.scalar"]
+	if !equalStrings(rs.SensitivePaths, spec.Paths()) ||
+		!equalStrings(rs.Redacted, redacted) {
+		t.Fatalf("authenticated metadata was not restored: paths=%v redacted=%v", rs.SensitivePaths, rs.Redacted)
+	}
+	if _, err := spec.RestoreProjected(
+		rs.Attributes, rs.SensitiveSetRecovery, resourceType,
+		rs.SensitivePaths, rs.SensitiveRecoveryVersion,
+	); err != nil {
+		t.Fatalf("restored authenticated contract is unusable: %v", err)
 	}
 }
 
@@ -1942,9 +2050,9 @@ func TestCurrentMapRecoveryGenerationCannotBeStripped(t *testing.T) {
 	mapType := cty.Map(cty.Set(cty.String))
 	resourceType := cty.Object(map[string]cty.Type{"groups": mapType})
 	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
-		"groups": {Type: mapType, Sensitive: true},
+		"groups": {Type: mapType},
 	}}
-	spec, ds := sensitive.Resolve(block, nil, nil)
+	spec, ds := sensitive.Resolve(block, []string{"groups"}, nil)
 	if ds.HasErrors() {
 		t.Fatal(ds)
 	}
@@ -1990,7 +2098,7 @@ func TestCurrentMapRecoveryGenerationCannotBeStripped(t *testing.T) {
 		}, true},
 		{"envelope removed", func(resource map[string]any) {
 			delete(resource, "sensitive_set_recovery")
-		}, false},
+		}, true},
 		{"envelope removed and marker reset", func(resource map[string]any) {
 			delete(resource, "sensitive_set_recovery")
 			resource["sensitive_recovery_version"] = 0
@@ -1998,6 +2106,11 @@ func TestCurrentMapRecoveryGenerationCannotBeStripped(t *testing.T) {
 		{"marker and envelope removed", func(resource map[string]any) {
 			delete(resource, "sensitive_recovery_version")
 			delete(resource, "sensitive_set_recovery")
+		}, true},
+		{"contract envelope and plaintext contract removed", func(resource map[string]any) {
+			delete(resource, "sensitive_set_recovery")
+			delete(resource, "sensitive_paths")
+			delete(resource, "redacted")
 		}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

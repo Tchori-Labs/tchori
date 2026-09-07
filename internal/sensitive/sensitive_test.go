@@ -395,6 +395,7 @@ func TestFlatTypedSetSensitivityPreservesBoundaries(t *testing.T) {
 			value: cty.ObjectVal(map[string]cty.Value{
 				"members": cty.NullVal(cty.Set(cty.String)),
 			}),
+			wantRecovery: true,
 		},
 		{
 			name: "empty",
@@ -824,6 +825,9 @@ func TestSensitiveSetRecoveryRotatesAcrossPolicyExpansion(t *testing.T) {
 		t.Fatal(err)
 	}
 	legacy.Version = 1
+	legacy.ContractVersion = 0
+	legacy.ProjectionRedacted = nil
+	legacy.DirectPaths = nil
 	legacy.ProjectionPaths = nil
 	legacy.Sets = legacy.Values
 	legacy.Values = nil
@@ -887,10 +891,10 @@ func TestNewlyAffectedSensitiveSetRotatesFromPublicState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(recovery) != 0 {
-		t.Fatal("non-sensitive generation unexpectedly emitted recovery")
+	if len(recovery) == 0 {
+		t.Fatal("non-sensitive current generation omitted its authenticated contract")
 	}
-	rotatedPublic, _, rotatedRecovery, err := newSpec.SanitizeJSON(public, recovery, resourceType, 0, oldSpec.Paths(), newSpec.Paths())
+	rotatedPublic, _, rotatedRecovery, err := newSpec.SanitizeJSON(public, recovery, resourceType, RecoveryVersion, oldSpec.Paths(), newSpec.Paths())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1109,6 +1113,9 @@ func TestLegacySetRecoveryWithSensitiveMapMigratesToConfidentialProjection(t *te
 		t.Run(fmt.Sprintf("version_%d", version), func(t *testing.T) {
 			legacy := current
 			legacy.Version = version
+			legacy.ContractVersion = 0
+			legacy.ProjectionRedacted = nil
+			legacy.DirectPaths = nil
 			legacy.ProjectionSHA256 = sum[:]
 			if version == 1 {
 				legacy.ProjectionPaths = nil
@@ -1158,6 +1165,39 @@ func TestTupleAlternativeDeclaredPathUsesIndexInsensitiveTraversal(t *testing.T)
 	}}
 	if _, ds := Resolve(block, []string{"container.members"}, nil); ds.HasErrors() {
 		t.Fatalf("tuple alternative path was rejected: %v", ds)
+	}
+}
+
+func TestCurrentProjectionAlwaysCarriesAuthenticatedContract(t *testing.T) {
+	resourceType := cty.Object(map[string]cty.Type{"secret": cty.String, "public": cty.String})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"secret": {Type: cty.String, Sensitive: true},
+		"public": {Type: cty.String},
+	}}
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	original := cty.ObjectVal(map[string]cty.Value{
+		"secret": cty.StringVal("contract-private"),
+		"public": cty.StringVal("visible"),
+	})
+	public, _, contract, err := spec.Project(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contract) == 0 {
+		t.Fatal("current scalar-only projection omitted its authenticated contract")
+	}
+	if _, err := spec.RestoreProjected(public, nil, resourceType, spec.Paths(), RecoveryVersion); err == nil {
+		t.Fatal("current generation restore accepted a missing authenticated contract")
+	}
+	restored, err := spec.RestoreProjected(public, contract, resourceType, nil, RecoveryVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored.RawEquals(original) {
+		t.Fatal("authenticated contract did not restore the directly sensitive scalar")
 	}
 }
 

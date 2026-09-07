@@ -241,6 +241,9 @@ func (s *State) UnmarshalJSON(data []byte) error {
 					addr, recoveryVersion, formatVersion, sensitive.RecoveryVersion,
 				)
 			}
+			if header.FormatVersion == formatVersion && len(persisted.SensitiveSetRecovery) == 0 {
+				return fmt.Errorf("invalid state: resource %q omits mandatory authenticated sensitive projection contract", addr)
+			}
 			if recoveryVersion != 0 && !sensitive.RecoveryVersionSupported(recoveryVersion) {
 				return fmt.Errorf("open sensitive set recovery for %s: unsupported projection version %d", addr, recoveryVersion)
 			}
@@ -259,9 +262,19 @@ func (s *State) UnmarshalJSON(data []byte) error {
 			if len(persisted.SensitiveSetRecovery) != 0 {
 				recovery, err := privateblob.Open(persisted.SensitiveSetRecovery, sensitiveRecoveryContext(addr, rs))
 				if err != nil {
-					return fmt.Errorf("open sensitive set recovery for %s: %w", addr, err)
+					return fmt.Errorf("open sensitive projection contract for %s: %w", addr, err)
 				}
 				rs.SensitiveSetRecovery = recovery
+				if header.FormatVersion == formatVersion {
+					paths, redacted, err := sensitive.ValidateProjectionContract(
+						rs.Attributes, recovery, rs.SensitiveRecoveryVersion,
+					)
+					if err != nil {
+						return fmt.Errorf("validate sensitive projection contract for %s: %w", addr, err)
+					}
+					rs.SensitivePaths = paths
+					rs.Redacted = redacted
+				}
 			}
 			resources[addr] = rs
 		}
@@ -287,18 +300,33 @@ func sealResourcePrivate(addr string, rs *ResourceState) (json.RawMessage, error
 }
 
 func sealSensitiveSetRecovery(addr string, rs *ResourceState) (json.RawMessage, error) {
+	if rs.SensitiveRecoveryVersion == sensitive.RecoveryVersion {
+		if len(rs.SensitiveSetRecovery) == 0 {
+			return nil, fmt.Errorf("seal sensitive projection contract for %s: generation %d contract is required", addr, sensitive.RecoveryVersion)
+		}
+		paths, redacted, err := sensitive.ValidateProjectionContract(
+			rs.Attributes, rs.SensitiveSetRecovery, rs.SensitiveRecoveryVersion,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("seal sensitive projection contract for %s: %w", addr, err)
+		}
+		if !equalStrings(paths, sortedUnique(rs.SensitivePaths)) ||
+			!equalStrings(redacted, sortedUnique(rs.Redacted)) {
+			return nil, fmt.Errorf("seal sensitive projection contract for %s: plaintext sensitivity metadata does not match its authenticated contract", addr)
+		}
+	}
 	if len(rs.SensitiveSetRecovery) == 0 {
 		return nil, nil
 	}
-	if rs.Type == "" || rs.Provider == "" || rs.ProviderSource == "" {
-		return nil, fmt.Errorf("seal sensitive set recovery for %s: type, provider, and provider source are required", addr)
+	if rs.Type == "" || rs.Provider == "" {
+		return nil, fmt.Errorf("seal sensitive projection contract for %s: type and provider are required", addr)
 	}
 	if rs.SensitiveRecoveryVersion != 0 && !sensitive.RecoveryVersionSupported(rs.SensitiveRecoveryVersion) {
-		return nil, fmt.Errorf("seal sensitive set recovery for %s: unsupported projection version %d", addr, rs.SensitiveRecoveryVersion)
+		return nil, fmt.Errorf("seal sensitive projection contract for %s: unsupported projection version %d", addr, rs.SensitiveRecoveryVersion)
 	}
 	sealed, err := privateblob.Seal(rs.SensitiveSetRecovery, sensitiveRecoveryContext(addr, rs))
 	if err != nil {
-		return nil, fmt.Errorf("seal sensitive set recovery for %s: %w", addr, err)
+		return nil, fmt.Errorf("seal sensitive projection contract for %s: %w", addr, err)
 	}
 	return json.RawMessage(sealed), nil
 }
@@ -648,11 +676,32 @@ func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 		}
 		if len(paths) == 0 {
 			if resolved {
+				beforeRecovery := append([]byte(nil), prior.SensitiveSetRecovery...)
+				beforeVersion := prior.SensitiveRecoveryVersion
+				beforePaths := append([]string(nil), prior.SensitivePaths...)
+				beforeRedacted := append([]string(nil), prior.Redacted...)
+				prior.SensitivePaths = nil
+				prior.Redacted = nil
 				prior.SensitiveRecoveryVersion = sensitive.RecoveryVersion
-				changedDocument = true
+				contract, err := sensitive.NewProjectionContract(prior.Attributes, nil, nil)
+				if err != nil {
+					return nil, false, fmt.Errorf("build backup projection contract for %s: %w", addr, err)
+				}
+				prior.SensitiveSetRecovery = contract
+				if !bytes.Equal(beforeRecovery, prior.SensitiveSetRecovery) ||
+					beforeVersion != prior.SensitiveRecoveryVersion ||
+					!equalStrings(beforePaths, prior.SensitivePaths) ||
+					!equalStrings(beforeRedacted, prior.Redacted) {
+					changedDocument = true
+				}
 			}
 			continue
 		}
+		beforeAttributes := append(json.RawMessage(nil), prior.Attributes...)
+		beforeRecovery := append([]byte(nil), prior.SensitiveSetRecovery...)
+		beforeVersion := prior.SensitiveRecoveryVersion
+		beforePaths := append([]string(nil), prior.SensitivePaths...)
+		beforeRedacted := append([]string(nil), prior.Redacted...)
 		if backupSanitizer != nil {
 			attrs, changed, recovery, err := backupSanitizer(
 				prior.Attributes, prior.SensitiveSetRecovery, prior.SensitiveRecoveryVersion, generationPaths, paths,
@@ -661,10 +710,23 @@ func (s *State) prepareBackup(path string) ([]byte, bool, error) {
 				return nil, false, fmt.Errorf("sanitize backup attributes for %s: %w", addr, err)
 			}
 			prior.Attributes = attrs
-			prior.SensitiveSetRecovery = recovery
 			prior.SensitiveRecoveryVersion = sensitive.RecoveryVersion
+			prior.SensitivePaths = append([]string(nil), paths...)
 			prior.Redacted = unionStrings(prior.Redacted, changed)
-			changedDocument = true
+			recovery, err = sensitive.RebindProjectionContract(
+				prior.Attributes, recovery, prior.SensitivePaths, prior.Redacted,
+			)
+			if err != nil {
+				return nil, false, fmt.Errorf("build backup projection contract for %s: %w", addr, err)
+			}
+			prior.SensitiveSetRecovery = recovery
+			if !bytes.Equal(beforeAttributes, prior.Attributes) ||
+				!bytes.Equal(beforeRecovery, prior.SensitiveSetRecovery) ||
+				beforeVersion != prior.SensitiveRecoveryVersion ||
+				!equalStrings(beforePaths, prior.SensitivePaths) ||
+				!equalStrings(beforeRedacted, prior.Redacted) {
+				changedDocument = true
+			}
 			continue
 		}
 		if len(prior.SensitiveSetRecovery) != 0 {
@@ -738,9 +800,6 @@ func (s *State) sanitizeAll() error {
 		if rs == nil {
 			continue
 		}
-		if currentProjection && rs.SensitiveRecoveryVersion == 0 {
-			rs.SensitiveRecoveryVersion = sensitive.RecoveryVersion
-		}
 		generationPaths := append([]string(nil), rs.SensitivePaths...)
 		paths := unionStrings(generationPaths, rs.Redacted, s.sensitiveHints[addr])
 		sanitizer := sensitive.JSONSanitizer(nil)
@@ -766,7 +825,18 @@ func (s *State) sanitizeAll() error {
 				rs.SensitivePaths = nil
 				rs.Redacted = nil
 			}
-			rs.SensitiveRecoveryVersion = sensitive.RecoveryVersion
+			if resolved || currentProjection {
+				rs.SensitiveRecoveryVersion = sensitive.RecoveryVersion
+				contract, err := sensitive.NewProjectionContract(rs.Attributes, rs.SensitivePaths, rs.Redacted)
+				if err != nil {
+					return fmt.Errorf("build sensitive projection contract for %s: %w", addr, err)
+				}
+				rs.SensitiveSetRecovery = contract
+			}
+			continue
+		}
+		if !resolved && rs.SensitiveRecoveryVersion == sensitive.RecoveryVersion &&
+			len(rs.SensitiveSetRecovery) != 0 && len(s.sensitiveHints[addr]) == 0 {
 			continue
 		}
 		var (
@@ -792,8 +862,24 @@ func (s *State) sanitizeAll() error {
 		if resolved && sanitizer != nil {
 			rs.SensitiveSetRecovery = recovery
 			rs.SensitiveRecoveryVersion = sensitive.RecoveryVersion
+		} else if currentProjection {
+			rs.SensitiveRecoveryVersion = sensitive.RecoveryVersion
+			rs.SensitivePaths = append([]string(nil), paths...)
 		}
 		rs.Redacted = unionStrings(rs.Redacted, changed)
+		if rs.SensitiveRecoveryVersion == sensitive.RecoveryVersion {
+			if len(rs.SensitiveSetRecovery) == 0 {
+				recovery, err = sensitive.NewProjectionContract(rs.Attributes, rs.SensitivePaths, rs.Redacted)
+			} else {
+				recovery, err = sensitive.RebindProjectionContract(
+					rs.Attributes, rs.SensitiveSetRecovery, rs.SensitivePaths, rs.Redacted,
+				)
+			}
+			if err != nil {
+				return fmt.Errorf("build sensitive projection contract for %s: %w", addr, err)
+			}
+			rs.SensitiveSetRecovery = recovery
+		}
 	}
 	sort.Strings(s.unresolved)
 	return nil
@@ -823,6 +909,18 @@ func sortedUnique(parts []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 func unionStrings(groups ...[]string) []string {
 	var all []string

@@ -1496,6 +1496,20 @@ func TestImportRefreshReplacesOnlyNamedResource(t *testing.T) {
 		t.Fatal(err)
 	}
 	beforeSerial, beforeResources := readStateFile(t, dir)
+	withoutContractEnvelope := func(raw json.RawMessage) []byte {
+		t.Helper()
+		var resource map[string]any
+		if err := json.Unmarshal(raw, &resource); err != nil {
+			t.Fatal(err)
+		}
+		delete(resource, "sensitive_set_recovery")
+		normalized, err := json.Marshal(resource)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return normalized
+	}
+	beforeUnrelated := withoutContractEnvelope(beforeResources["tchoritest_thing.two"])
 
 	stdout, stderr, code := runCLIWithArtifactKey(t, dir, "import", "--refresh", pd, "tchoritest_thing.one", "t-id-one-refreshed")
 	if code != 0 {
@@ -1519,8 +1533,8 @@ func TestImportRefreshReplacesOnlyNamedResource(t *testing.T) {
 	if bytes.Equal(beforeResources["tchoritest_thing.one"], afterResources["tchoritest_thing.one"]) {
 		t.Fatal("refresh did not replace the named resource")
 	}
-	if !bytes.Equal(beforeResources["tchoritest_thing.two"], afterResources["tchoritest_thing.two"]) {
-		t.Fatal("refresh changed an unrelated resource")
+	if afterUnrelated := withoutContractEnvelope(afterResources["tchoritest_thing.two"]); !bytes.Equal(beforeUnrelated, afterUnrelated) {
+		t.Fatal("refresh changed an unrelated resource outside its randomized contract envelope")
 	}
 	backup, err := os.ReadFile(filepath.Join(dir, "state.json.backup")) //nolint:gosec // test-controlled state artifact
 	if err != nil {
@@ -1733,25 +1747,23 @@ func TestImportRefreshScanFailureRollsBackState(t *testing.T) {
 	}
 
 	statePath := filepath.Join(dir, "state.json")
-	var document map[string]any
-	stateBytes, err := os.ReadFile(statePath) //nolint:gosec // test-controlled state artifact
+	t.Setenv("TCHORI_ARTIFACT_KEY", testArtifactKey)
+	st, err := state.Load(statePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(stateBytes, &document); err != nil {
+	attributes := json.RawMessage(`{"echo":"other","id":"t-id-other","name":{"unexpected":true}}`)
+	contract, err := sensitive.NewProjectionContract(attributes, []string{"name"}, nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	resources := document["resources"].(map[string]any)
-	resources["tchoritest_thing.other"] = map[string]any{
-		"type":                       "tchoritest_thing",
-		"provider":                   "tchoritest",
-		"provider_source":            "tchori-labs/tchoritest",
-		"attributes":                 map[string]any{"echo": "other", "id": "t-id-other", "name": map[string]any{"unexpected": true}},
-		"sensitive_recovery_version": sensitive.RecoveryVersion,
-		"sensitive_paths":            []string{"name"},
-		"sensitive_scanned":          true,
+	st.Resources["tchoritest_thing.other"] = &state.ResourceState{
+		Type: "tchoritest_thing", Provider: "tchoritest", ProviderSource: "tchori-labs/tchoritest",
+		Attributes: attributes, SensitiveSetRecovery: contract,
+		SensitiveRecoveryVersion: sensitive.RecoveryVersion,
+		SensitivePaths:           []string{"name"}, SensitiveScanned: true,
 	}
-	corrupt, err := json.MarshalIndent(document, "", "  ")
+	corrupt, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		t.Fatal(err)
 	}

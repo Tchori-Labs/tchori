@@ -115,23 +115,25 @@ sensitive-attribute behavior and override mechanism.
 `TCHORI_ARTIFACT_KEY` is an engine setting, separate from provider environment
 wrappers. Supply exactly 32 random bytes encoded with standard base64 through
 the environment. Tchori uses AES-256-GCM to protect opaque provider private
-data in state, backups, and plans. State uses a distinct authenticated envelope
-for the full membership of sets containing sensitive leaves; the engine opens
-that recovery only before provider operations and never renders it.
+data in state, backups, and plans. Every resource in format `1.3` state also
+has a distinct authenticated projection-contract envelope, even when no typed
+collection values need recovery. The engine opens that contract before using
+typed state and never renders it.
 
 Generate a workspace key once and store it in your secret manager. Inject
 that same key into subsequent CLI/MCP sessions and automation. Do not place
 it in config, command-line arguments, source control, logs, or alongside the
 artifacts it protects. Key loss prevents recovery of encrypted provider-private
-and sensitive-set data. There is no plaintext fallback or automatic replacement
-key.
+data and validation of current state projection contracts. There is no
+plaintext fallback or automatic replacement key.
 
-Apply and import check the key before resource mutations, even when the
-provider has not yet returned encrypted data. Reading encrypted artifacts and
-writing either nonempty private data class also require the key. Validation and
-reads of artifacts without encrypted fields do not require it merely to parse
-those artifacts. Invalid keys, failed authentication, and address/type/provider
-source/purpose tampering produce errors without revealing protected values.
+Every read or write of a nonempty format `1.3` state requires the key because
+each current resource carries a mandatory contract envelope. Apply and import
+also validate the key before resource mutations. Legacy `1.0`, `1.1`, and
+`1.2` artifacts without encrypted fields remain readable without a key, but
+upgrading them to current state requires one. Invalid keys, failed
+authentication, and address/type/provider source/purpose tampering produce
+errors without revealing protected values.
 
 Fresh/current state writes use format `1.3`; plan writes remain format `1.2`.
 This build reads state `1.2` recovery envelopes, `1.1` encrypted-private
@@ -149,15 +151,16 @@ be recomputed before apply; reading them does not authenticate which provider
 should receive their private data. Current plans are refused if their recorded
 type/provider differs from the live execution target.
 
+The current contract authenticates each resource's public projection and
+sensitivity contract; it does not authenticate top-level serials, resource-map
+membership, or the document as a whole. Resource sensitivity still originates
+in provider metadata and explicit `sensitive_attributes`; treat artifacts as
+sensitive and review them before publishing.
 
-Encryption protects provider-private bytes and sensitive-set identity, not the
-entire document. Resource attributes still rely on provider sensitivity
-metadata and explicit `sensitive_attributes`; treat artifacts as sensitive and
-review them before publishing.
-
-The state generation marker is a current-format integrity check, not a global
-rollback counter. Format `1.3` rejects missing, zero, or invalid current
-generation metadata, while envelope authentication detects ciphertext and
-bound-context tampering. Whole-document replacement or relabeling to a valid
-legacy artifact requires trusted repository/storage history or an external
-monotonic trust anchor to detect.
+The state generation marker and mandatory projection envelope form a
+current-format integrity check, not a global rollback counter. Format `1.3`
+rejects missing, zero, or invalid generation metadata and any resource without
+an authenticated contract; envelope authentication detects ciphertext,
+projection, sensitivity-contract, and bound-context tampering. Whole-document
+replacement or relabeling to a valid legacy artifact requires trusted
+repository/storage history or an external monotonic trust anchor to detect.

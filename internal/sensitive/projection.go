@@ -24,13 +24,17 @@ func RecoveryVersionSupported(version int) bool {
 	return version >= 1 && version <= RecoveryVersion
 }
 
+const projectionContractVersion = 1
+
 type recoveryPayload struct {
-	Version          int           `json:"version"`
-	ProjectionSHA256 []byte        `json:"projection_sha256"`
-	ProjectionPaths  []string      `json:"projection_paths,omitempty"`
-	DirectPaths      []string      `json:"direct_paths,omitempty"`
-	Sets             []recoverySet `json:"sets,omitempty"`
-	Values           []recoverySet `json:"values,omitempty"`
+	Version            int           `json:"version"`
+	ContractVersion    int           `json:"contract_version,omitempty"`
+	ProjectionSHA256   []byte        `json:"projection_sha256"`
+	ProjectionPaths    []string      `json:"projection_paths,omitempty"`
+	ProjectionRedacted []string      `json:"projection_redacted,omitempty"`
+	DirectPaths        []string      `json:"direct_paths,omitempty"`
+	Sets               []recoverySet `json:"sets,omitempty"`
+	Values             []recoverySet `json:"values,omitempty"`
 }
 
 type recoverySet struct {
@@ -55,11 +59,11 @@ func (s *Spec) Marshal(v cty.Value) (json.RawMessage, []string, []string, error)
 	return s.marshal(v, false)
 }
 
-// Project produces the public projection plus the smallest authoritative
-// recovery payload: each outermost set whose identity depends on a sensitive
-// descendant, each sensitive dynamic-key map that must be hidden above such a
-// set, and each directly sensitive path whose value must survive an omitted
-// provider refresh. Callers must encrypt recovery before storage.
+// Project produces a public projection and its authenticated generation
+// contract. The contract is mandatory even when no values require recovery;
+// otherwise it carries directly sensitive values, identity-sensitive sets, and
+// confidential map boundaries. Callers must encrypt it before current state
+// persistence.
 func (s *Spec) Project(v cty.Value) (json.RawMessage, []string, []byte, error) {
 	public, redacted, unknown, values, err := s.project(v, true)
 	if err != nil {
@@ -69,18 +73,103 @@ func (s *Spec) Project(v cty.Value) (json.RawMessage, []string, []byte, error) {
 		return nil, nil, nil, fmt.Errorf("state contains unknown values at %v", unknown)
 	}
 	values = uniqueRecoveryValues(values)
-	if len(values) == 0 {
-		return public, redacted, nil, nil
+	contract, err := encodeProjectionContract(public, s.Paths(), redacted, directRecoveryPaths(values, s), values)
+	if err != nil {
+		return nil, nil, nil, err
 	}
-	sum := sha256.Sum256(public)
-	recovery, err := json.Marshal(recoveryPayload{
-		Version: RecoveryVersion, ProjectionSHA256: sum[:], ProjectionPaths: s.Paths(),
-		DirectPaths: directRecoveryPaths(values, s), Values: values,
+	return public, redacted, contract, nil
+}
+
+// NewProjectionContract binds an already-produced public projection to its
+// authoritative sensitivity contract when no typed value recovery is needed.
+func NewProjectionContract(public json.RawMessage, paths, redacted []string) ([]byte, error) {
+	return encodeProjectionContract(public, paths, redacted, nil, nil)
+}
+
+// ValidateProjectionContract verifies a current generation contract after its
+// encrypted state envelope has authenticated resource identity and purpose.
+func ValidateProjectionContract(public json.RawMessage, contract []byte, generationVersion int) ([]string, []string, error) {
+	payload, err := decodeRecoveryPayload(contract)
+	if err != nil || generationVersion != RecoveryVersion ||
+		payload.Version != RecoveryVersion || payload.ContractVersion != projectionContractVersion ||
+		len(payload.Sets) != 0 ||
+		!equalStrings(payload.ProjectionPaths, sortedUnique(payload.ProjectionPaths)) ||
+		!equalStrings(payload.ProjectionRedacted, sortedUnique(payload.ProjectionRedacted)) ||
+		!equalStrings(payload.DirectPaths, sortedUnique(payload.DirectPaths)) {
+		return nil, nil, errors.New("invalid authenticated sensitive projection contract")
+	}
+	if err := validateProjectionDigest(public, payload.ProjectionSHA256); err != nil {
+		return nil, nil, err
+	}
+	return append([]string(nil), payload.ProjectionPaths...), append([]string(nil), payload.ProjectionRedacted...), nil
+}
+
+// RebindProjectionContract updates authenticated plaintext metadata after a
+// state migration has deliberately retained historical redaction provenance.
+// The typed recovered values remain unchanged.
+func RebindProjectionContract(public json.RawMessage, contract []byte, paths, redacted []string) ([]byte, error) {
+	payload, err := decodeRecoveryPayload(contract)
+	if err != nil || payload.Version != RecoveryVersion ||
+		payload.ContractVersion != projectionContractVersion || len(payload.Sets) != 0 {
+		return nil, errors.New("invalid authenticated sensitive projection contract")
+	}
+	if err := validateProjectionDigest(public, payload.ProjectionSHA256); err != nil {
+		return nil, err
+	}
+	return encodeProjectionContract(public, paths, redacted, payload.DirectPaths, payload.Values)
+}
+
+func encodeProjectionContract(public json.RawMessage, paths, redacted, directPaths []string, values []recoverySet) ([]byte, error) {
+	root, err := decodeJSON(public)
+	if err != nil {
+		return nil, fmt.Errorf("decode public state projection: %w", err)
+	}
+	canonicalPublic, err := json.Marshal(root)
+	if err != nil {
+		return nil, errors.New("encode public state projection")
+	}
+	sum := sha256.Sum256(canonicalPublic)
+	contract, err := json.Marshal(recoveryPayload{
+		Version: RecoveryVersion, ContractVersion: projectionContractVersion,
+		ProjectionSHA256: sum[:], ProjectionPaths: sortedUnique(paths),
+		ProjectionRedacted: sortedUnique(redacted), DirectPaths: sortedUnique(directPaths), Values: values,
 	})
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("encode sensitive recovery: %w", err)
+		return nil, fmt.Errorf("encode sensitive projection contract: %w", err)
 	}
-	return public, redacted, recovery, nil
+	return contract, nil
+}
+
+func decodeRecoveryPayload(recovery []byte) (recoveryPayload, error) {
+	var payload recoveryPayload
+	dec := json.NewDecoder(bytes.NewReader(recovery))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&payload); err != nil {
+		return recoveryPayload{}, errors.New("invalid sensitive recovery payload")
+	}
+	if err := dec.Decode(&struct{}{}); err != io.EOF {
+		return recoveryPayload{}, errors.New("invalid sensitive recovery payload")
+	}
+	return payload, nil
+}
+
+func validateProjectionDigest(public json.RawMessage, want []byte) error {
+	if len(want) != sha256.Size {
+		return errors.New("invalid sensitive recovery payload")
+	}
+	root, err := decodeJSON(public)
+	if err != nil {
+		return fmt.Errorf("decode public state: %w", err)
+	}
+	canonicalPublic, err := json.Marshal(root)
+	if err != nil {
+		return errors.New("encode public state projection")
+	}
+	sum := sha256.Sum256(canonicalPublic)
+	if !bytes.Equal(sum[:], want) {
+		return errors.New("sensitive recovery does not match public state")
+	}
+	return nil
 }
 
 func (s *Spec) marshal(v cty.Value, capture bool) (json.RawMessage, []string, []string, error) {
@@ -302,8 +391,8 @@ func (s *Spec) Restore(public json.RawMessage, recovery []byte, ty cty.Type) (ct
 
 // RestoreProjected authenticates and reconstructs state using the sensitivity
 // paths and recovery generation recorded with that state. Recovery versions 2
-// and 3 authenticate their own generation paths; the path argument preserves
-// safe migration of version 1 state.
+// through 4 authenticate their own generation paths; the path argument
+// preserves safe migration of version 1 state.
 func (s *Spec) RestoreProjected(public json.RawMessage, recovery []byte, ty cty.Type, generationPaths []string, generationVersion int) (cty.Value, error) {
 	return s.restoreGeneration(public, recovery, ty, generationPaths, generationVersion)
 }
@@ -316,6 +405,9 @@ func (s *Spec) restoreGeneration(public json.RawMessage, recovery []byte, ty cty
 
 	generation := s.withPaths(generationPaths)
 	if len(recovery) == 0 {
+		if generationVersion >= RecoveryVersion {
+			return cty.NilVal, fmt.Errorf("authenticated sensitive projection contract is required for generation %d", RecoveryVersion)
+		}
 		expected := map[string]expectedSet{}
 		if err := generation.collectExpectedRecovery(root, ty, "", nil, expected, generationVersion >= 3, generationVersion >= 4, generation.paths); err != nil {
 			return cty.NilVal, err
@@ -326,14 +418,9 @@ func (s *Spec) restoreGeneration(public json.RawMessage, recovery []byte, ty cty
 		return ctyjson.Unmarshal(public, ty)
 	}
 
-	var payload recoveryPayload
-	dec := json.NewDecoder(bytes.NewReader(recovery))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&payload); err != nil {
-		return cty.NilVal, errors.New("invalid sensitive recovery payload")
-	}
-	if err := dec.Decode(&struct{}{}); err != io.EOF {
-		return cty.NilVal, errors.New("invalid sensitive recovery payload")
+	payload, err := decodeRecoveryPayload(recovery)
+	if err != nil {
+		return cty.NilVal, err
 	}
 	if !RecoveryVersionSupported(payload.Version) ||
 		(generationVersion != 0 && payload.Version != generationVersion) {
@@ -341,6 +428,15 @@ func (s *Spec) restoreGeneration(public json.RawMessage, recovery []byte, ty cty
 	}
 	if len(payload.ProjectionSHA256) != sha256.Size {
 		return cty.NilVal, errors.New("invalid sensitive recovery payload")
+	}
+	if generationVersion >= RecoveryVersion && payload.ContractVersion != projectionContractVersion {
+		return cty.NilVal, errors.New("authenticated sensitive projection contract is required")
+	}
+	if payload.ContractVersion != 0 {
+		if payload.Version != RecoveryVersion || payload.ContractVersion != projectionContractVersion ||
+			!equalStrings(payload.ProjectionRedacted, sortedUnique(payload.ProjectionRedacted)) {
+			return cty.NilVal, errors.New("invalid authenticated sensitive projection contract")
+		}
 	}
 	if payload.Version >= 2 {
 		if !equalStrings(payload.ProjectionPaths, sortedUnique(payload.ProjectionPaths)) {
@@ -380,7 +476,7 @@ func (s *Spec) restoreGeneration(public json.RawMessage, recovery []byte, ty cty
 	if err := generation.collectExpectedRecovery(root, ty, "", nil, expected, includeMaps, includeSensitiveValues, payload.DirectPaths); err != nil {
 		return cty.NilVal, err
 	}
-	if len(expected) == 0 || len(recoveredValues) != len(expected) {
+	if len(recoveredValues) != len(expected) || (payload.ContractVersion == 0 && len(expected) == 0) {
 		return cty.NilVal, errors.New("sensitive recovery path set does not match its generation contract")
 	}
 	seen := map[string]bool{}

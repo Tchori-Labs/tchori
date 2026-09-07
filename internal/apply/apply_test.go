@@ -881,6 +881,46 @@ func TestSensitiveMapAboveSetStaysPrivateThroughPlanApplyAndBackup(t *testing.T)
 		}
 	}
 }
+
+func TestStateOnlyDeleteRejectsStrippedExplicitSensitiveMapContract(t *testing.T) {
+	resource := flatSetThing("stripped-contract", "stripped-contract", nil)
+	resource.Config["groups"] = map[string]any{
+		"private-group": map[string]any{
+			"members": []any{map[string]any{"token": "private-token"}},
+		},
+	}
+	resource.SensitiveAttributes = []string{"groups"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial Apply: %+v", ds)
+	}
+	delete(h.cfg.Resources, resource.Address)
+
+	data, err := os.ReadFile(h.statePath) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(data, &document); err != nil {
+		t.Fatal(err)
+	}
+	persisted := document["resources"].(map[string]any)[resource.Address].(map[string]any)
+	delete(persisted, "sensitive_set_recovery")
+	delete(persisted, "sensitive_paths")
+	delete(persisted, "redacted")
+	tampered, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(h.statePath, tampered, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.Load(h.statePath); err == nil {
+		t.Fatal("state-only delete accepted a stripped explicit-sensitive map contract before planning or apply")
+	}
+}
+
 func TestApplyRejectsUnknownDescendantInSensitiveRecoveryMap(t *testing.T) {
 	resource := flatSetThing("unknown-group-result", "unknown-group-result", nil)
 	resource.SensitiveAttributes = []string{"groups"}
@@ -1035,8 +1075,8 @@ func TestPlanRejectsSensitiveSetStateWithoutRecovery(t *testing.T) {
 	}
 	_, ds := p.Plan(context.Background())
 	d := diagnosticWithSummary(ds, "invalid state attributes")
-	if d == nil || !strings.Contains(d.Detail, "legacy redacted state cannot safely reconstruct set identity") {
-		t.Fatalf("diagnostics = %#v, want explicit unsafe legacy ambiguity", ds)
+	if d == nil || !strings.Contains(d.Detail, "authenticated sensitive projection contract is required") {
+		t.Fatalf("diagnostics = %#v, want explicit missing current contract error", ds)
 	}
 }
 
@@ -1667,6 +1707,9 @@ func TestApplyRejectsPoisonedStateReferencePropagation(t *testing.T) {
 	// Reproduce state left by an older engine after planning. Write directly
 	// to preserve the plan serial; the poisoned entry is intentionally not
 	// cleaned by TC-048, only refused when another outgoing value reads it.
+	st.FormatVersion = "1.2"
+	st.Resources[aAddr].SensitiveRecoveryVersion = 0
+	st.Resources[aAddr].SensitiveSetRecovery = nil
 	st.Resources[aAddr].Attributes = json.RawMessage(`{"echo":"a","id":"id-a","name":"a","replace_me":null,"rules":null,"tags":{"parent":"${tchoritest_thing.ghost.id}"}}`)
 	stateBytes, err = json.Marshal(st)
 	if err != nil {
