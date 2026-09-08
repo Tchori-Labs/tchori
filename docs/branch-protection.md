@@ -12,7 +12,7 @@ the JSON in Git does not apply it by itself.
 | Requirement | Ruleset definition |
 | --- | --- |
 | Changes use a pull request with at least one approval from the owner selected by [`.github/CODEOWNERS`](../.github/CODEOWNERS); unattributed changes require an extra approval. | `pull_request.required_approving_review_count` is `1`, `require_code_owner_review` is `true`, and `require_extra_approval_for_unattributed_changes` is `true`. The current CODEOWNER is `@VictorCano`; change CODEOWNERS rather than duplicating the identity in the ruleset. |
-| New pushes invalidate stale approval and review conversations are resolved. | `dismiss_stale_reviews_on_push` and `required_review_thread_resolution` are `true`. `require_last_push_approval` is deliberately `false`; the sole CODEOWNER is also the mandatory human merger of agent PRs into `develop`, so enabling it deadlocks the `develop` → `main` promotion instead of adding an independent reviewer. |
+| New pushes invalidate stale approval and review conversations are resolved. | `dismiss_stale_reviews_on_push` and `required_review_thread_resolution` are `true`. `require_last_push_approval` is deliberately `false`; the sole CODEOWNER can also merge reviewed agent PRs into `develop`, so requiring a different last-push approver can deadlock the `develop` → `main` promotion. Explicitly delegated agent merge execution does not remove the current-head human review requirement. |
 | CI succeeds on the current base branch before merge. | `required_status_checks` contains only the `check` context and `strict_required_status_checks_policy` is `true`. The `check` job directly runs the repository's formatting, vet, lint, and test gates. |
 | Force pushes and deletion of `main` are blocked. | `non_fast_forward` and `deletion` rules are present. |
 | No bot, App, deploy key, role, team, or agent has standing bypass. | `bypass_actors` is empty. This is stricter than a repository-wide Admin-role exception and prevents a present or future admin bot from inheriting bypass. |
@@ -22,8 +22,11 @@ the JSON in Git does not apply it by itself.
 The CODEOWNER approval still has to target the current head: stale-review
 dismissal invalidates it after every new push. A bot cannot satisfy the
 CODEOWNER rule, and `bypass_actors` remains empty. This preserves independent
-human review without requiring the sole reviewer to be different from the
-human who merged the last reviewed integration into `develop`.
+human review without requiring the sole reviewer to be different from a human
+who merged the last reviewed integration into `develop`. An agent may execute
+a merge only under the explicit, head-bound CODEOWNER delegation described in
+[`CLAUDE.md`](../CLAUDE.md#commits); it cannot submit the human approval or
+bypass this ruleset.
 
 There is no standing break-glass bypass. In an emergency, a repository admin
 must obtain the same recorded human authorization used for other apply
@@ -275,7 +278,12 @@ rulebook in [`AGENTS.md`](../AGENTS.md):
 
 - CODEOWNERS approval is the apply gate for `main`; the current owner comes
   from `.github/CODEOWNERS` (`@VictorCano`).
-- Agents never merge or approve their own pull requests.
+- Agents never approve their own pull requests or submit reviews as a human.
+  They may execute a merge as Tchorizo only after explicit CODEOWNER
+  authorization for the exact current head, a recorded human approval, and
+  successful required checks, following [`CLAUDE.md`](../CLAUDE.md#commits).
+  New commits invalidate the authorization; delegated execution grants no
+  branch-protection bypass.
 - Releases still require board sign-off recorded in `Tchori-Labs/main`.
   The separate protected `release` Environment is declared, applied, and
   audited through the [release-Environment runbook](releasing.md#release-environment-requirements).
