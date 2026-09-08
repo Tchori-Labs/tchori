@@ -7,9 +7,10 @@ artifacts. Preparing this workflow does not authorize a release.
 
 Per [`CLAUDE.md`](../CLAUDE.md), no release may be tagged or published until a
 human board decision explicitly approves it and that decision is recorded in
-the `Tchori-Labs/main` repository. Agents may prepare a release change, but they
-must not create or push the tag, dispatch the release workflow, approve its
-deployment, or publish the release.
+the `Tchori-Labs/main` repository. Agents may prepare a release change.
+Tag creation/push is forbidden except for the version-and-commit-scoped
+delegations in [`CLAUDE.md`](../CLAUDE.md#releases). Those exceptions do not
+authorize workflow dispatch, deployment approval, or release publication.
 
 Pushing a `v*` tag automatically starts only the release workflow's
 **dry-run** job in the public `Tchori-Labs/tchori` repository. A tag push never
@@ -129,8 +130,9 @@ It covers a reviewed promotion on public `main`, not unreviewed local changes.
 Because `@VictorCano` is the sole reviewer and self-review is forbidden, the
 decision delegates the first tag push to Tchorizo and deployment approval to
 Victor. A workflow triggered by Victor cannot also be approved by Victor;
-future releases need a distinct authorized initiator or a reviewed change to
-the reviewer policy.
+only an explicitly delegated initiator may create the `v0.1.1` tag as below.
+Other releases still require a distinct authorized initiator or a reviewed
+change to the reviewer policy.
 
 **Existing first-release attempt:** `v0.1.0` already resolves to public commit
 `74af4ff52ddaf0c07771865bafa60630bc5b7c6e`.
@@ -139,8 +141,28 @@ was observed waiting for approval; approving it would publish that old
 commit, not subsequent security fixes. Do not move or recreate the tag to
 hide this difference.
 [The existing board decision issue](https://github.com/Tchori-Labs/main/issues/163)
-records `v0.1.1` as the next release version. That choice does not authorize
-tag creation, release dispatch, deployment approval, or publication.
+records `v0.1.1` as the next release version, with
+[VictorCano's approval](https://github.com/Tchori-Labs/main/issues/163#issuecomment-5578320537)
+responding to the candidate commit
+`aeeb8f0dae1195a78cfd66058d0a00223c3306ad`.
+
+### Scoped v0.1.1 tag delegation
+
+After independent human review and merge of this delegation into public
+`main`, Tchorizo may create and push only `refs/tags/v0.1.1` in
+`Tchori-Labs/tchori`, targeting exactly the approved commit above, not the
+later commit that adopts this policy. Follow the canonical preconditions in
+[`CLAUDE.md`](../CLAUDE.md#releases): reviewed ancestry, passing required
+checks, and a passing live release-Environment audit.
+
+Use Tchorizo's identity and no force or bypass. If the remote tag already
+resolves to the approved commit, report success without recreating it. If it
+resolves elsewhere, stop; never move or delete `v0.1.0` or `v0.1.1`.
+The approved commit's workflow starts only a protected dry-run on tag push.
+VictorCano still reviews its Environment deployment. Subsequent manual
+dispatch/publication needs its separately authorized initiator; this tag
+delegation grants neither permission. It also grants no run cancellation,
+credential, administrative, or self-adoption authority.
 
 Release-readiness also requires non-secret evidence of credential revocation
 and history remediation for
@@ -173,8 +195,9 @@ permissions.
 After the board decision and normal CODEOWNERS review have landed:
 
 1. The board-authorized tag actor creates and pushes the approved `v*` tag.
-   This triggers **dry-run only**. For `v0.1.0`, follow ADR-0012's scoped
-   delegation above. Do not tag from an unreviewed commit.
+   This triggers **dry-run only**. Follow ADR-0012 for `v0.1.0`, or the
+   [scoped tag delegation](#scoped-v011-tag-delegation) for `v0.1.1`.
+   Do not tag another commit or infer authority for another version.
 2. The tag-triggered dry-run checks out that existing tag and runs GoReleaser
    with `--skip=publish`, while retaining real keyless signing and GitHub
    provenance generation. It does not create a tag, GitHub Release, or public
