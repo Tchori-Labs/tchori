@@ -1341,6 +1341,189 @@ func TestLegacySetRecoveryWithSensitiveMapMigratesToConfidentialProjection(t *te
 	}
 }
 
+func TestLegacyV3WrappedMapRecoveryMigratesToCurrentProjection(t *testing.T) {
+	memberType := cty.Object(map[string]cty.Type{"members": cty.Set(cty.String)})
+	mapType := cty.Map(memberType)
+	privateMap := cty.MapVal(map[string]cty.Value{
+		"private-group-key": cty.ObjectVal(map[string]cty.Value{
+			"members": cty.SetVal([]cty.Value{
+				cty.StringVal("private-member-one"),
+				cty.StringVal("private-member-two"),
+			}),
+		}),
+	})
+	tests := []struct {
+		name  string
+		ty    cty.Type
+		value cty.Value
+	}{
+		{
+			name:  "list wrapper",
+			ty:    cty.List(mapType),
+			value: cty.ListVal([]cty.Value{privateMap}),
+		},
+		{
+			name:  "tuple wrapper",
+			ty:    cty.Tuple([]cty.Type{mapType}),
+			value: cty.TupleVal([]cty.Value{privateMap}),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resourceType := cty.Object(map[string]cty.Type{"groups": tc.ty})
+			block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+				"groups": {Type: tc.ty, Sensitive: true},
+			}}
+			spec, ds := Resolve(block, nil, nil)
+			if ds.HasErrors() {
+				t.Fatal(ds)
+			}
+			original := cty.ObjectVal(map[string]cty.Value{"groups": tc.value})
+			raw, err := msgpack.Marshal(tc.value, tc.ty)
+			if err != nil {
+				t.Fatal(err)
+			}
+			legacyPublic := json.RawMessage(`{"groups":null}`)
+			sum := sha256.Sum256(legacyPublic)
+			legacy := recoveryPayload{
+				Version:          3,
+				ProjectionSHA256: sum[:],
+				ProjectionPaths:  []string{"groups"},
+				Values: []recoverySet{{
+					Path:  []recoveryPathStep{{Kind: "attr", Name: "groups"}},
+					Value: raw,
+				}},
+			}
+			legacyRecovery, err := json.Marshal(legacy)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			restored, err := spec.RestoreProjected(legacyPublic, legacyRecovery, resourceType, spec.Paths(), 0)
+			if err != nil {
+				t.Fatalf("RestoreProjected rejected valid v3 %s recovery: %v", tc.name, err)
+			}
+			if !restored.RawEquals(original) {
+				t.Fatalf("v3 %s recovery lost authoritative value", tc.name)
+			}
+
+			public, _, recovery, err := spec.SanitizeJSON(
+				legacyPublic, legacyRecovery, resourceType, 0, spec.Paths(), spec.Paths(),
+			)
+			if err != nil {
+				t.Fatalf("SanitizeJSON rejected valid v3 %s recovery: %v", tc.name, err)
+			}
+			if strings.Contains(string(public), "private-group-key") ||
+				strings.Contains(string(public), "private-member") {
+				t.Fatalf("current projection disclosed migrated v3 %s authority: %s", tc.name, public)
+			}
+			if string(public) != `{"groups":[null]}` {
+				t.Fatalf("current %s projection = %s, want collection with confidential map element", tc.name, public)
+			}
+			rotated, err := spec.Restore(public, recovery, resourceType)
+			if err != nil {
+				t.Fatalf("current contract could not restore migrated v3 %s authority: %v", tc.name, err)
+			}
+			if !rotated.RawEquals(original) {
+				t.Fatalf("current contract lost migrated v3 %s authority", tc.name)
+			}
+
+			laterV3Public := json.RawMessage(`{"groups":[null]}`)
+			laterV3Sum := sha256.Sum256(laterV3Public)
+			mapRaw, err := msgpack.Marshal(privateMap, mapType)
+			if err != nil {
+				t.Fatal(err)
+			}
+			laterV3Recovery, err := json.Marshal(recoveryPayload{
+				Version:          3,
+				ProjectionSHA256: laterV3Sum[:],
+				ProjectionPaths:  []string{"groups"},
+				Values: []recoverySet{{
+					Path: []recoveryPathStep{
+						{Kind: "attr", Name: "groups"},
+						{Kind: "index", Index: 0},
+					},
+					Value: mapRaw,
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			laterV3Restored, err := spec.RestoreProjected(
+				laterV3Public, laterV3Recovery, resourceType, spec.Paths(), 3,
+			)
+			if err != nil {
+				t.Fatalf("RestoreProjected rejected later v3 %s projection: %v", tc.name, err)
+			}
+			if !laterV3Restored.RawEquals(original) {
+				t.Fatalf("later v3 %s projection lost authoritative value", tc.name)
+			}
+
+			legacy.Values[0].Path = []recoveryPathStep{
+				{Kind: "attr", Name: "groups"},
+				{Kind: "index", Index: 0},
+			}
+			tampered, err := json.Marshal(legacy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := spec.RestoreProjected(legacyPublic, tampered, resourceType, spec.Paths(), 0); err == nil {
+				t.Fatalf("v3 %s recovery accepted a tampered historical path", tc.name)
+			}
+		})
+	}
+}
+
+func TestLaterV3NullWrappedMapWithSiblingRecoveryRemainsValid(t *testing.T) {
+	memberType := cty.Object(map[string]cty.Type{"members": cty.Set(cty.String)})
+	groupsType := cty.List(cty.Map(memberType))
+	siblingsType := cty.Set(cty.String)
+	resourceType := cty.Object(map[string]cty.Type{
+		"groups":   groupsType,
+		"siblings": siblingsType,
+	})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"groups":   {Type: groupsType, Sensitive: true},
+		"siblings": {Type: siblingsType, Sensitive: true},
+	}}
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	siblings := cty.SetVal([]cty.Value{cty.StringVal("private-sibling")})
+	original := cty.ObjectVal(map[string]cty.Value{
+		"groups":   cty.NullVal(groupsType),
+		"siblings": siblings,
+	})
+	public := json.RawMessage(`{"groups":null,"siblings":[null]}`)
+	sum := sha256.Sum256(public)
+	siblingRaw, err := msgpack.Marshal(siblings, siblingsType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovery, err := json.Marshal(recoveryPayload{
+		Version:          3,
+		ProjectionSHA256: sum[:],
+		ProjectionPaths:  []string{"groups", "siblings"},
+		Values: []recoverySet{{
+			Path:  []recoveryPathStep{{Kind: "attr", Name: "siblings"}},
+			Value: siblingRaw,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	restored, err := spec.RestoreProjected(public, recovery, resourceType, spec.Paths(), 3)
+	if err != nil {
+		t.Fatalf("RestoreProjected rejected later v3 null wrapper with sibling recovery: %v", err)
+	}
+	if !restored.RawEquals(original) {
+		t.Fatal("later v3 null wrapper with sibling recovery lost authoritative value")
+	}
+}
+
 func TestTupleAlternativeDeclaredPathUsesIndexInsensitiveTraversal(t *testing.T) {
 	containerType := cty.Tuple([]cty.Type{
 		cty.Object(map[string]cty.Type{"members": cty.Set(cty.String)}),

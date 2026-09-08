@@ -409,7 +409,7 @@ func (s *Spec) restoreGeneration(public json.RawMessage, recovery []byte, ty cty
 			return cty.NilVal, fmt.Errorf("authenticated sensitive projection contract is required for generation %d", RecoveryVersion)
 		}
 		expected := map[string]expectedSet{}
-		if err := generation.collectExpectedRecovery(root, ty, "", nil, expected, generationVersion >= 3, generationVersion >= 4, generation.paths); err != nil {
+		if err := generation.collectExpectedRecovery(root, ty, "", nil, expected, generationVersion, generation.paths, nil); err != nil {
 			return cty.NilVal, err
 		}
 		if len(expected) != 0 {
@@ -462,7 +462,6 @@ func (s *Spec) restoreGeneration(public json.RawMessage, recovery []byte, ty cty
 	}
 
 	includeMaps := payload.Version >= 3
-	includeSensitiveValues := payload.Version >= 4
 	recoveredValues := payload.Sets
 	if includeMaps {
 		if len(payload.Sets) != 0 {
@@ -472,37 +471,48 @@ func (s *Spec) restoreGeneration(public json.RawMessage, recovery []byte, ty cty
 	} else if len(payload.Values) != 0 {
 		return cty.NilVal, errors.New("invalid sensitive recovery payload")
 	}
+	recoveredPaths := make(map[string]bool, len(recoveredValues))
+	for _, recovered := range recoveredValues {
+		key := recoveryPathKey(recovered.Path)
+		if recoveredPaths[key] {
+			return cty.NilVal, errors.New("sensitive recovery path does not match public state")
+		}
+		recoveredPaths[key] = true
+	}
 	expected := map[string]expectedSet{}
-	if err := generation.collectExpectedRecovery(root, ty, "", nil, expected, includeMaps, includeSensitiveValues, payload.DirectPaths); err != nil {
+	if err := generation.collectExpectedRecovery(root, ty, "", nil, expected, payload.Version, payload.DirectPaths, recoveredPaths); err != nil {
 		return cty.NilVal, err
 	}
 	if len(recoveredValues) != len(expected) || (payload.ContractVersion == 0 && len(expected) == 0) {
 		return cty.NilVal, errors.New("sensitive recovery path set does not match its generation contract")
 	}
-	seen := map[string]bool{}
 	for _, recovered := range recoveredValues {
 		key := recoveryPathKey(recovered.Path)
 		want, ok := expected[key]
-		if !ok || seen[key] {
+		if !ok {
 			return cty.NilVal, errors.New("sensitive recovery path does not match public state")
 		}
-		seen[key] = true
 		value, err := msgpack.Unmarshal(recovered.Value, want.Type)
 		if err != nil || !value.IsKnown() ||
 			(payload.Version >= 4 && !value.IsWhollyKnown()) ||
-			(payload.Version == 3 && want.Type.IsMapType() && !value.IsWhollyKnown()) ||
+			(payload.Version == 3 && (want.Type.IsMapType() || want.LegacyV3MapBoundary) && !value.IsWhollyKnown()) ||
 			(!want.AllowNull && value.IsNull()) || !value.Type().Equals(want.Type) {
 			return cty.NilVal, errors.New("invalid sensitive recovery value")
 		}
 
+		var projected []byte
 		var projectedRedacted, projectedUnknown []string
 		var projectedValues []recoverySet
-		projected, err := generation.projectValue(
-			value, nil, want.Logical, false, false,
-			coveredBySensitivePath(want.Logical, generation.paths),
-			payload.Version < 3,
-			&projectedRedacted, &projectedUnknown, &projectedValues,
-		)
+		if want.LegacyV3MapBoundary {
+			projected = []byte("null")
+		} else {
+			projected, err = generation.projectValue(
+				value, nil, want.Logical, false, false,
+				coveredBySensitivePath(want.Logical, generation.paths),
+				payload.Version < 3,
+				&projectedRedacted, &projectedUnknown, &projectedValues,
+			)
+		}
 		if err != nil || len(projectedUnknown) != 0 {
 			return cty.NilVal, errors.New("invalid sensitive recovery value")
 		}
@@ -555,19 +565,24 @@ func equalStrings(a, b []string) bool {
 }
 
 type expectedSet struct {
-	Type      cty.Type
-	Logical   string
-	Public    any
-	AllowNull bool
+	Type                cty.Type
+	Logical             string
+	Public              any
+	AllowNull           bool
+	LegacyV3MapBoundary bool
 }
 
-func (s *Spec) collectExpectedRecovery(v any, ty cty.Type, logical string, path []recoveryPathStep, out map[string]expectedSet, includeMaps, includeSensitiveValues bool, directPaths []string) error {
-	if includeMaps && s.recoversMap(ty, logical) {
+func (s *Spec) collectExpectedRecovery(v any, ty cty.Type, logical string, path []recoveryPathStep, out map[string]expectedSet, generationVersion int, directPaths []string, recoveredPaths map[string]bool) error {
+	legacyV3Boundary := generationVersion == 3 && v == nil &&
+		recoveredPaths[recoveryPathKey(path)] && s.recoversLegacyV3CollectionMap(ty, logical)
+	if generationVersion >= 3 && (s.recoversMap(ty, logical) || legacyV3Boundary) {
 		if v != nil {
 			return fmt.Errorf("public state at %q exposes a sensitive map", logical)
 		}
 		cloned := append([]recoveryPathStep(nil), path...)
-		out[recoveryPathKey(cloned)] = expectedSet{Type: ty, Logical: logical, Public: nil, AllowNull: true}
+		out[recoveryPathKey(cloned)] = expectedSet{
+			Type: ty, Logical: logical, Public: nil, AllowNull: true, LegacyV3MapBoundary: legacyV3Boundary,
+		}
 		return nil
 	}
 	if ty.IsSetType() && contains(s.setPrefixes, logical) {
@@ -581,7 +596,7 @@ func (s *Spec) collectExpectedRecovery(v any, ty cty.Type, logical string, path 
 		out[recoveryPathKey(cloned)] = expectedSet{Type: ty, Logical: logical, Public: v}
 		return nil
 	}
-	if includeSensitiveValues && contains(directPaths, logical) && v == nil {
+	if generationVersion >= 4 && contains(directPaths, logical) && v == nil {
 		cloned := append([]recoveryPathStep(nil), path...)
 		out[recoveryPathKey(cloned)] = expectedSet{Type: ty, Logical: logical, Public: nil, AllowNull: true}
 		return nil
@@ -600,7 +615,7 @@ func (s *Spec) collectExpectedRecovery(v any, ty cty.Type, logical string, path 
 			if !exists {
 				return fmt.Errorf("public state at %q lacks attribute %q", logical, name)
 			}
-			if err := s.collectExpectedRecovery(child, childType, join(logical, name), appendRecoveryPath(path, recoveryPathStep{Kind: "attr", Name: name}), out, includeMaps, includeSensitiveValues, directPaths); err != nil {
+			if err := s.collectExpectedRecovery(child, childType, join(logical, name), appendRecoveryPath(path, recoveryPathStep{Kind: "attr", Name: name}), out, generationVersion, directPaths, recoveredPaths); err != nil {
 				return err
 			}
 		}
@@ -610,7 +625,7 @@ func (s *Spec) collectExpectedRecovery(v any, ty cty.Type, logical string, path 
 			return fmt.Errorf("public state at %q is not a map", logical)
 		}
 		for key, child := range object {
-			if err := s.collectExpectedRecovery(child, ty.ElementType(), logical, appendRecoveryPath(path, recoveryPathStep{Kind: "key", Name: key}), out, includeMaps, includeSensitiveValues, directPaths); err != nil {
+			if err := s.collectExpectedRecovery(child, ty.ElementType(), logical, appendRecoveryPath(path, recoveryPathStep{Kind: "key", Name: key}), out, generationVersion, directPaths, recoveredPaths); err != nil {
 				return err
 			}
 		}
@@ -624,7 +639,7 @@ func (s *Spec) collectExpectedRecovery(v any, ty cty.Type, logical string, path 
 			return fmt.Errorf("public state at %q has tuple arity %d; want %d", logical, len(items), len(elementTypes))
 		}
 		for i, child := range items {
-			if err := s.collectExpectedRecovery(child, elementTypes[i], logical, appendRecoveryPath(path, recoveryPathStep{Kind: "index", Index: i}), out, includeMaps, includeSensitiveValues, directPaths); err != nil {
+			if err := s.collectExpectedRecovery(child, elementTypes[i], logical, appendRecoveryPath(path, recoveryPathStep{Kind: "index", Index: i}), out, generationVersion, directPaths, recoveredPaths); err != nil {
 				return err
 			}
 		}
@@ -634,12 +649,52 @@ func (s *Spec) collectExpectedRecovery(v any, ty cty.Type, logical string, path 
 			return fmt.Errorf("public state at %q is not an array", logical)
 		}
 		for i, child := range items {
-			if err := s.collectExpectedRecovery(child, ty.ElementType(), logical, appendRecoveryPath(path, recoveryPathStep{Kind: "index", Index: i}), out, includeMaps, includeSensitiveValues, directPaths); err != nil {
+			if err := s.collectExpectedRecovery(child, ty.ElementType(), logical, appendRecoveryPath(path, recoveryPathStep{Kind: "index", Index: i}), out, generationVersion, directPaths, recoveredPaths); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// recoversLegacyV3CollectionMap reproduces the v3 boundary bug for authenticated
+// state migration only. Early v3 flattened list and tuple traversal while
+// discovering maps, so a map above a strictly nested affected set could cause
+// the enclosing list or tuple to be captured and projected as null. Later v3
+// projections retained the wrapper array and therefore follow normal discovery.
+// Current projections use recoversMap and never select these wrapper values.
+func (s *Spec) recoversLegacyV3CollectionMap(ty cty.Type, logical string) bool {
+	if (!ty.IsListType() && !ty.IsTupleType()) ||
+		!coveredBySensitivePath(logical, s.paths) ||
+		!legacyV3TypeHasMapAtLogicalPath(ty) {
+		return false
+	}
+	containsAffectedSet := false
+	for _, setPrefix := range s.setPrefixes {
+		if strings.HasPrefix(logical, setPrefix+".") {
+			return false
+		}
+		if strings.HasPrefix(setPrefix, logical+".") {
+			containsAffectedSet = true
+		}
+	}
+	return containsAffectedSet
+}
+
+func legacyV3TypeHasMapAtLogicalPath(ty cty.Type) bool {
+	switch {
+	case ty.IsMapType():
+		return true
+	case ty.IsListType(), ty.IsSetType():
+		return legacyV3TypeHasMapAtLogicalPath(ty.ElementType())
+	case ty.IsTupleType():
+		for _, elementType := range ty.TupleElementTypes() {
+			if legacyV3TypeHasMapAtLogicalPath(elementType) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func appendRecoveryValue(v cty.Value, path cty.Path, logical, label string, values *[]recoverySet) error {
