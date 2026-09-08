@@ -287,10 +287,12 @@ rulebook in [`AGENTS.md`](../AGENTS.md):
 - Releases still require board sign-off recorded in `Tchori-Labs/main`.
   The separate protected `release` Environment is declared, applied, and
   audited through the [release-Environment runbook](releasing.md#release-environment-requirements).
-  Agents may prepare a release PR. Tag creation/push is allowed only under
-  the explicit version-and-commit-scoped exceptions in
-  [`CLAUDE.md`](../CLAUDE.md#releases); merge delegation alone grants no tag,
-  release-dispatch, deployment-approval, or publication permission.
+  The human may expressly delegate release commands, including tag creation
+  and publication workflow dispatch, under
+  [`CLAUDE.md`](../CLAUDE.md#releases). This does not delegate CODEOWNER or
+  Environment approval or grant bypass. Merge authorization alone is not
+  release authorization; an explicit release instruction can cover the full
+  scoped sequence without another policy PR.
 
 The release and board-sign-off rules are unchanged by this ruleset.
 `AGENTS.md` remains the authoritative human-gate rulebook.

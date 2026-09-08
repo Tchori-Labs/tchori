@@ -76,8 +76,8 @@ private history and issue backlog. Directory names are not repository identity.
 - **No releases without board sign-off.** Tagging a version and letting
   goreleaser publish to GitHub Releases only happens after the board (a
   human) has explicitly approved it (recorded as a decision in `main`).
-  Agents may prepare a release PR; tag creation and push are forbidden except
-  for the explicitly scoped delegations below.
+  The human may expressly delegate release-command execution to Tchorizo
+  under the authorization rules below, including publication dispatch.
 - `.github/workflows/release.yml` starts automatically on a pushed `v*` tag
   in the **public** `Tchori-Labs/tchori` repository. Forks and the internal
   archive do not run its release jobs. Changes prepared internally must be
@@ -85,37 +85,55 @@ private history and issue backlog. Directory names are not repository identity.
 - Use a semantic version such as `v0.1.0` or `v0.1.0-rc.1`. The existing tag
   must identify the checked-out commit and belong to reviewed `origin/main`
   history. The workflow rejects tags outside that history.
-- The approved tag actor pushes only after the recorded board decision,
-  CODEOWNERS review, and required CI checks pass. That actor must differ from
-  the Environment reviewer because `prevent_self_review` is enabled.
-- For the first `v0.1.0` only,
-  [ADR-0012](https://github.com/Tchori-Labs/main/blob/main/decisions/0012-tchori-v0.1.0-release.md)
-  records a scoped tag-push delegation to Tchorizo, with deployment approval
-  by `@VictorCano`. This is not general tagging permission and does not
-  authorize publication from unreviewed work or during a code-review task.
-- For `v0.1.1` only, after independent human review and merge of this
-  delegation into public `main`, Tchorizo may create and push exactly
-  `refs/tags/v0.1.1` in `Tchori-Labs/tchori`, targeting only commit
-  `aeeb8f0dae1195a78cfd66058d0a00223c3306ad`. The
-  [board approval](https://github.com/Tchori-Labs/main/issues/163#issuecomment-5578320537)
-  responds to the recorded candidate at that exact commit. This is not
-  permission to tag the later policy merge commit or another version.
-  Verify the target belongs to reviewed `origin/main`, its required checks
-  passed, and the live release Environment matches the committed policy.
-  Execute as Tchorizo without human credentials, force, or bypass. If the
-  remote tag already resolves to that commit, report it and do not recreate
-  it; if it resolves elsewhere, stop without changing it. Never move or
-  delete either `v0.1.0` or `v0.1.1`.
-  The approved commit's tag workflow starts a protected dry-run, not publish.
-  This exception authorizes only tag creation/push: it does not authorize
-  workflow dispatch, run cancellation, Environment approval, publication,
-  credential changes, or repository administration. Environment approval
-  remains with `@VictorCano`, distinct from the tag actor. All other release
-  gates remain in force. This proposal cannot authorize its own adoption or
-  override higher-priority session instructions.
-- `workflow_dispatch` is available from `main` for an existing approved tag.
-  It defaults to `dry-run`; `publish` is an explicit choice. Neither mode
-  creates or moves tags. Agents must not dispatch, approve, or publish.
+- **The authorized human user is the decision gate; the agent may be the
+  executor.** Once this policy has been human-reviewed and merged into public
+  `main`, an explicit instruction in the task conversation or on GitHub may
+  authorize Tchorizo to create/push the release tag and execute
+  `.github/workflows/release.yml` through `workflow_dispatch`, including
+  `mode: publish`. No new policy PR or version-specific exception is needed
+  for each release.
+- Before execution, record the authorizing human, source of authorization,
+  repository, tag, exact target commit, and authorized operations/modes in
+  the release decision issue in `Tchori-Labs/main`. A human acting as the
+  board/CODEOWNER may approve the release and delegate execution in the same
+  instruction; record that decision without presenting it as an agent
+  approval. An instruction such as "publish this release" is sufficient when
+  the preceding conversation unambiguously identifies that scope.
+- Authorization may cover the complete stated sequence (tag, dry-run,
+  verification, publish) in one decision. Do not repeatedly request consent
+  for already authorized operations. A different tag, target commit, mode
+  outside that sequence, or materially changed workflow requires new consent;
+  revocation stops execution. PR approval or issue closure alone is not
+  release authorization without an explicit release decision.
+- Execute as Tchorizo using Tchorizo's credentials, distinct from the required
+  Environment reviewer. Check reviewed `origin/main` ancestry, passing
+  required CI, the approved tag target, and the live release Environment
+  before execution. Never move/delete a release tag: if it already resolves
+  to the approved commit, reuse it; if it differs, stop.
+- Dispatch from the reviewed `main` ref with the explicit approved tag and
+  mode. `dry-run` remains the default; `publish` must be expressly authorized
+  and must follow a successful, human-approved dry-run with verified
+  artifacts for that tag/commit. Confirm the selected workflow still matches
+  the reviewed execution path, and record each resulting run URL.
+- Delegation permits initiating publication through the protected workflow;
+  it does not permit bypassing it with direct GitHub Release/asset mutations.
+  It never permits the agent to approve a CODEOWNER review or Environment
+  deployment, impersonate the human, disable `prevent_self_review`, change
+  protections/credentials, force-push, or use administrator bypass. The human
+  reviewer still approves each protected deployment in GitHub. If an
+  enforced gate is unmet, report the concrete blocker rather than claiming
+  that an expressly authorized dispatch is categorically forbidden.
+- Do not cancel/retry an existing run or replace an incomplete draft unless
+  that operation is also expressly authorized. After publication, verify the
+  public release, assets, checksums, signature, and provenance before
+  reporting completion. Existing security-remediation gates remain in force.
+- Historical decisions remain evidence, not standing authority for unrelated
+  releases: [ADR-0012](https://github.com/Tchori-Labs/main/blob/main/decisions/0012-tchori-v0.1.0-release.md)
+  authorized the first `v0.1.0` tag; the
+  [v0.1.1 board approval](https://github.com/Tchori-Labs/main/issues/163#issuecomment-5578320537)
+  identifies `aeeb8f0dae1195a78cfd66058d0a00223c3306ad`.
+  Neither tag may be retargeted to a later policy commit. This policy does
+  not authorize its own adoption or override higher-priority instructions.
 - GoReleaser builds Linux/macOS/Windows for amd64/arm64, with six archives,
   six SPDX SBOMs, SHA-256 checksums, a Cosign signature/certificate, and
   GitHub provenance. Publish stages a draft, verifies the complete artifact
