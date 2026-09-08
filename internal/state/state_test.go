@@ -2215,7 +2215,7 @@ func TestBackupReprojectsSensitiveSetRecoveryAfterRemovingLiteralExemptions(t *t
 	if !restored.GetAttr("members").RawEquals(original.GetAttr("members")) {
 		t.Fatal("backup lost authoritative set membership")
 	}
-	if !restored.GetAttr("note").IsNull() {
-		t.Fatal("backup retained a sensitive literal exemption")
+	if !restored.RawEquals(original) {
+		t.Fatal("backup lost authority while removing a literal exemption")
 	}
 }

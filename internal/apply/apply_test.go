@@ -937,6 +937,129 @@ func TestApplyRejectsUnknownDescendantInSensitiveRecoveryMap(t *testing.T) {
 	}
 }
 
+func TestApplyInheritedSensitiveContainerRetainsProviderAuthority(t *testing.T) {
+	const secret = "inherited-provider-authority-sentinel"
+	resource := setThing("authority-bundle", "authority-bundle")
+	resource.Config["authority"] = map[string]any{
+		"members": []any{"member"},
+		"token":   secret,
+		"labels":  []any{"sensitive-label"},
+		"metadata": map[string]any{
+			"value": "sensitive-object",
+		},
+	}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("initial apply lost inherited authority: %+v", ds)
+	}
+	data, err := os.ReadFile(h.statePath) //nolint:gosec // test-controlled state artifact
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(secret)) {
+		t.Fatal("state exposed inherited sensitive authority")
+	}
+	current := loadState(t, h.statePath)
+	rs := current.Resources[resource.Address]
+	schema := h.schemas["tchoritest"].ResourceTypes[resource.Type]
+	spec, specDs := sensitive.ResolveWithPersisted(schema.Block, nil, rs.SensitivePaths, nil)
+	if specDs.HasErrors() {
+		t.Fatal(specDs)
+	}
+	restored, err := spec.RestoreProjected(
+		rs.Attributes, rs.SensitiveSetRecovery, schema.Block.ImpliedType(),
+		rs.SensitivePaths, rs.SensitiveRecoveryVersion,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := restored.GetAttr("authority").GetAttr("token"); !got.IsKnown() || got.IsNull() || got.AsString() != secret {
+		t.Fatalf("restored authority token = %#v", got)
+	}
+
+	resource.Config["name"] = "authority-bundle-updated"
+	update := h.plan(t, current, false)
+	if len(update.Changes) != 1 || update.Changes[0].Action != "update" {
+		t.Fatalf("update plan = %+v", update.Changes)
+	}
+	if bytes.Contains(append(append([]byte(nil), update.Changes[0].Before...), update.Changes[0].After...), []byte(secret)) {
+		t.Fatal("provider-facing update plan exposed inherited sensitive authority")
+	}
+	if _, ds := apply.Apply(context.Background(), update, h.cfg, h.providers, h.schemas, current, h.statePath); ds.HasErrors() {
+		t.Fatalf("update provider did not receive inherited authority: %+v", ds)
+	}
+
+	current = loadState(t, h.statePath)
+	delete(h.cfg.Resources, resource.Address)
+	destroy := h.plan(t, current, false)
+	if len(destroy.Changes) != 1 || destroy.Changes[0].Action != "delete" {
+		t.Fatalf("state-only plan = %+v", destroy.Changes)
+	}
+	if bytes.Contains(destroy.Changes[0].Before, []byte(secret)) {
+		t.Fatal("state-only delete plan exposed inherited sensitive authority")
+	}
+	if _, ds := apply.Apply(context.Background(), destroy, h.cfg, h.providers, h.schemas, current, h.statePath); ds.HasErrors() {
+		t.Fatalf("state-only delete provider did not receive inherited authority: %+v", ds)
+	}
+	if got := loadState(t, h.statePath).Resources[resource.Address]; got != nil {
+		t.Fatal("state-only delete retained inherited-sensitive resource")
+	}
+	for _, path := range []string{h.statePath, h.statePath + ".backup"} {
+		artifact, err := os.ReadFile(path) //nolint:gosec // test-controlled state artifacts
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(artifact, []byte(secret)) {
+			t.Fatalf("%s exposed inherited sensitive authority", path)
+		}
+	}
+}
+
+func TestStateOnlyDeleteRetainsFormerLiteralExemptionAuthority(t *testing.T) {
+	const secret = "formerly-exempt-delete-authority"
+	resource := secretful("literal-delete-authority", map[string]any{"token": secret})
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	current := loadState(t, h.statePath)
+	delete(h.cfg.Resources, resource.Address)
+	destroy := h.plan(t, current, false)
+	if len(destroy.Changes) != 1 || destroy.Changes[0].Action != "delete" {
+		t.Fatalf("state-only plan = %+v", destroy.Changes)
+	}
+	if bytes.Contains(destroy.Changes[0].Before, []byte(secret)) {
+		t.Fatal("state-only delete plan exposed a formerly exempt secret")
+	}
+	if _, ds := apply.Apply(context.Background(), destroy, h.cfg, h.providers, h.schemas, current, h.statePath); ds.HasErrors() {
+		t.Fatalf("state-only delete lost formerly exempt provider authority: %+v", ds)
+	}
+	for _, path := range []string{h.statePath, h.statePath + ".backup"} {
+		artifact, err := os.ReadFile(path) //nolint:gosec // test-controlled state artifacts
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(artifact, []byte(secret)) {
+			t.Fatalf("%s exposed a formerly exempt secret after policy rotation", path)
+		}
+	}
+}
+
+func TestApplyPartialUnknownDirectCompositeWritesNoCheckpoint(t *testing.T) {
+	resource := setThing("partial-unknown-sensitive-payload", "partial-unknown-sensitive-payload")
+	resource.Config["direct_payload"] = map[string]any{"value": "known-before-provider"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); !ds.HasErrors() {
+		t.Fatal("partial provider result with a shallow-known sensitive object unexpectedly succeeded")
+	}
+	if got := loadState(t, h.statePath).Resources[resource.Address]; got != nil {
+		t.Fatal("partial provider result installed a poisoned sensitive checkpoint")
+	}
+}
+
 func TestApplyRetainsPersistedConfigOnlySensitiveSetPolicy(t *testing.T) {
 	resource := setThing("declared", "declared")
 	resource.Config["declared_members"] = []any{
@@ -2468,6 +2591,153 @@ func TestApplyReportsPartialProgressAndAttemptedUpdateAfterProvider400(t *testin
 	}
 	if got := stateAttrs(t, h.statePath, first)["name"]; got != "alpha2" {
 		t.Fatalf("first update in state = %#v, want alpha2", got)
+	}
+}
+
+func TestApplyProviderErrorRedactsEffectiveSensitiveAttribute(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		oldValue, newValue string
+		removeDeclaration  bool
+	}{
+		{name: "current policy", oldValue: "provider-error-old-sentinel", newValue: "provider-error-new-sentinel"},
+		{name: "persisted policy after config removal", oldValue: "persisted-old-sentinel", newValue: "persisted-new-sentinel", removeDeclaration: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const envName = "TCHORI_TEST_DIAGNOSTIC_LABEL"
+			t.Setenv(envName, tc.oldValue)
+			resource := nestedThing("redaction", "stable", map[string]any{
+				"label": map[string]any{"env": envName},
+			})
+			resource.SensitiveAttributes = []string{"settings.label"}
+			h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+			ctx := context.Background()
+
+			st := loadState(t, h.statePath)
+			if _, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+				t.Fatalf("seed Apply: %#v", ds)
+			}
+
+			t.Setenv(envName, tc.newValue)
+			resource.Config["name"] = "diagnostic_error"
+			if tc.removeDeclaration {
+				resource.SensitiveAttributes = nil
+			}
+			st = loadState(t, h.statePath)
+			_, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+			if !ds.HasErrors() || diagnosticWithSummary(ds, "diagnostic update failed") == nil {
+				t.Fatalf("Apply diagnostics = %#v, want provider error", ds)
+			}
+			attempted := diagnosticWithSummary(ds, "attempted change")
+			if attempted == nil {
+				t.Fatalf("diagnostics = %#v, want attempted-change context", ds)
+			}
+			if strings.Contains(attempted.Detail, tc.oldValue) || strings.Contains(attempted.Detail, tc.newValue) ||
+				!strings.Contains(attempted.Detail, "settings.label: (sensitive value) -> (sensitive value)") {
+				t.Fatalf("attempted-change diagnostic exposed effective sensitive value: %q", attempted.Detail)
+			}
+		})
+	}
+}
+
+func TestApplyConsistencyRedactsEffectiveSensitiveAttribute(t *testing.T) {
+	const (
+		envName  = "TCHORI_TEST_CONSISTENCY_LABEL"
+		oldValue = "consistency-old-sentinel"
+		newValue = "consistency-new-sentinel"
+	)
+	t.Setenv(envName, oldValue)
+	resource := nestedThing("consistency", "stable", map[string]any{
+		"label": map[string]any{"env": envName},
+	})
+	resource.SensitiveAttributes = []string{"settings.label"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	ctx := context.Background()
+
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("seed Apply: %#v", ds)
+	}
+
+	t.Setenv(envName, newValue)
+	resource.Config["name"] = "diagnostic_inconsistent"
+	st = loadState(t, h.statePath)
+	_, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	consistency := diagnosticWithSummary(ds, "provider produced inconsistent result after apply")
+	if consistency == nil {
+		t.Fatalf("diagnostics = %#v, want inconsistent-result error", ds)
+	}
+	if strings.Contains(consistency.Detail, oldValue) || strings.Contains(consistency.Detail, newValue) ||
+		strings.Contains(consistency.Detail, "consistency-applied-sentinel") ||
+		!strings.Contains(consistency.Detail, "settings.label: planned (sensitive value), applied (sensitive value)") {
+		t.Fatalf("consistency diagnostic exposed effective sensitive value: %q", consistency.Detail)
+	}
+}
+
+func TestApplyProviderErrorRedactsSensitiveMapIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		oldKey, newKey    string
+		removeDeclaration bool
+	}{
+		{name: "current policy", oldKey: "current-old-key-sentinel", newKey: "current-new-key-sentinel"},
+		{name: "persisted policy after config removal", oldKey: "persisted-old-key-sentinel", newKey: "persisted-new-key-sentinel", removeDeclaration: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resource := thing("map-redaction", "stable")
+			resource.Config["tags"] = map[string]any{tc.oldKey: "old-map-value-sentinel"}
+			resource.SensitiveAttributes = []string{"tags"}
+			h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+			ctx := context.Background()
+
+			st := loadState(t, h.statePath)
+			if _, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+				t.Fatalf("seed Apply: %#v", ds)
+			}
+
+			resource.Config["name"] = "api_400"
+			resource.Config["tags"] = map[string]any{tc.newKey: "new-map-value-sentinel"}
+			if tc.removeDeclaration {
+				resource.SensitiveAttributes = nil
+			}
+			st = loadState(t, h.statePath)
+			_, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+			attempted := diagnosticWithSummary(ds, "attempted change")
+			if !ds.HasErrors() || attempted == nil {
+				t.Fatalf("Apply diagnostics = %#v, want provider error with attempted-change context", ds)
+			}
+			if !strings.Contains(attempted.Detail, `name: "stable" -> "api_400"`) ||
+				!strings.Contains(attempted.Detail, "tags: (sensitive value) -> (sensitive value)") {
+				t.Fatalf("attempted-change diagnostic lost useful aggregate context: %q", attempted.Detail)
+			}
+			for _, forbidden := range []string{tc.oldKey, tc.newKey, "old-map-value-sentinel", "new-map-value-sentinel"} {
+				if strings.Contains(attempted.Detail, forbidden) {
+					t.Fatalf("attempted-change diagnostic exposed %q: %s", forbidden, attempted.Detail)
+				}
+			}
+		})
+	}
+}
+
+func TestApplyConsistencyRedactsSensitiveMapIdentity(t *testing.T) {
+	resource := lossyThing("diagnostic_key_inconsistent", map[string]any{
+		"flag": true,
+		"tags": map[string]any{"sensitive-map-key-sentinel": "sensitive-map-value-sentinel"},
+	})
+	resource.SensitiveAttributes = []string{"tags"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+
+	_, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	consistency := diagnosticWithSummary(ds, "provider produced inconsistent result after apply")
+	if consistency == nil || !strings.Contains(consistency.Detail, "flag: planned true, applied false") ||
+		!strings.Contains(consistency.Detail, "tags: planned (sensitive value), applied (sensitive value)") {
+		t.Fatalf("diagnostics = %#v, want visible public difference and redacted map aggregate", ds)
+	}
+	for _, forbidden := range []string{"sensitive-map-key-sentinel", "sensitive-map-value-sentinel", "injected"} {
+		if strings.Contains(consistency.Detail, forbidden) {
+			t.Fatalf("consistency diagnostic exposed %q: %s", forbidden, consistency.Detail)
+		}
 	}
 }
 

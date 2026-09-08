@@ -775,6 +775,67 @@ func TestSensitiveSetRecoverySurvivesRemovedDeclarationAndEmptySet(t *testing.T)
 	}
 }
 
+func TestInheritedSensitiveContainerRecoversNonSetSiblings(t *testing.T) {
+	metadataType := cty.Object(map[string]cty.Type{"value": cty.String})
+	containerType := cty.Object(map[string]cty.Type{
+		"members":  cty.Set(cty.String),
+		"token":    cty.String,
+		"labels":   cty.List(cty.String),
+		"metadata": metadataType,
+	})
+	resourceType := cty.Object(map[string]cty.Type{"container": containerType})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"container": {
+			Type: containerType, Sensitive: true,
+			NestedType: map[string]*provider.Attr{
+				"members":  {Type: cty.Set(cty.String)},
+				"token":    {Type: cty.String},
+				"labels":   {Type: cty.List(cty.String)},
+				"metadata": {Type: metadataType},
+			},
+		},
+	}}
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	original := cty.ObjectVal(map[string]cty.Value{
+		"container": cty.ObjectVal(map[string]cty.Value{
+			"members": cty.SetVal([]cty.Value{cty.StringVal("member")}),
+			"token":   cty.StringVal("inherited-token-sentinel"),
+			"labels": cty.ListVal([]cty.Value{
+				cty.StringVal("inherited-label-sentinel"),
+			}),
+			"metadata": cty.ObjectVal(map[string]cty.Value{
+				"value": cty.StringVal("inherited-object-sentinel"),
+			}),
+		}),
+	})
+	public, _, recovery, err := spec.Project(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"inherited-token-sentinel", "inherited-label-sentinel", "inherited-object-sentinel"} {
+		if strings.Contains(string(public), secret) {
+			t.Fatalf("public projection disclosed %q: %s", secret, public)
+		}
+	}
+	var contract recoveryPayload
+	if err := json.Unmarshal(recovery, &contract); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmtSlice(contract.DirectPaths); got != "[container.labels container.metadata container.token]" {
+		t.Fatalf("DirectPaths = %s", got)
+	}
+	restored, err := spec.Restore(public, recovery, resourceType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !restored.RawEquals(original) {
+		t.Fatalf("Restore = %#v, want exact inherited-sensitive authority", restored)
+	}
+}
+
 func TestSensitiveSetRecoveryRotatesAcrossPolicyExpansion(t *testing.T) {
 	memberType := cty.Object(map[string]cty.Type{"label": cty.String, "token": cty.String})
 	resourceType := cty.Object(map[string]cty.Type{
@@ -856,8 +917,60 @@ func TestSensitiveSetRecoveryRotatesAcrossPolicyExpansion(t *testing.T) {
 	if !restored.GetAttr("members").RawEquals(original.GetAttr("members")) {
 		t.Fatal("policy expansion lost authoritative membership")
 	}
-	if !restored.GetAttr("note").IsNull() {
-		t.Fatal("expanded non-set sensitivity was not withheld")
+	if !restored.RawEquals(original) {
+		t.Fatal("policy expansion lost newly sensitive direct authority")
+	}
+}
+
+func TestPolicyRotationCapturesEveryNewDirectSensitiveBoundary(t *testing.T) {
+	cases := []struct {
+		name  string
+		ty    cty.Type
+		value cty.Value
+	}{
+		{name: "scalar", ty: cty.String, value: cty.StringVal("new-scalar-secret")},
+		{name: "null", ty: cty.String, value: cty.NullVal(cty.String)},
+		{name: "empty_list", ty: cty.List(cty.String), value: cty.ListValEmpty(cty.String)},
+		{name: "list", ty: cty.List(cty.String), value: cty.ListVal([]cty.Value{cty.StringVal("new-list-secret")})},
+		{name: "empty_map", ty: cty.Map(cty.String), value: cty.MapValEmpty(cty.String)},
+		{name: "map", ty: cty.Map(cty.String), value: cty.MapVal(map[string]cty.Value{"key": cty.StringVal("new-map-secret")})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resourceType := cty.Object(map[string]cty.Type{"value": tc.ty})
+			oldBlock := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+				"value": {Type: tc.ty},
+			}}
+			newBlock := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+				"value": {Type: tc.ty, Sensitive: true},
+			}}
+			oldSpec, ds := Resolve(oldBlock, nil, nil)
+			if ds.HasErrors() {
+				t.Fatal(ds)
+			}
+			newSpec, ds := Resolve(newBlock, nil, nil)
+			if ds.HasErrors() {
+				t.Fatal(ds)
+			}
+			original := cty.ObjectVal(map[string]cty.Value{"value": tc.value})
+			public, _, recovery, err := oldSpec.Project(original)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rotatedPublic, _, rotatedRecovery, err := newSpec.SanitizeJSON(
+				public, recovery, resourceType, RecoveryVersion, oldSpec.Paths(), newSpec.Paths(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restored, err := newSpec.Restore(rotatedPublic, rotatedRecovery, resourceType)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !restored.RawEquals(original) {
+				t.Fatalf("rotation restored %#v, want %#v", restored, original)
+			}
+		})
 	}
 }
 
@@ -1053,6 +1166,79 @@ func TestSensitiveFlatMapSetRejectsDescendantUnknown(t *testing.T) {
 	}
 }
 
+func TestDirectSensitiveCompositeRejectsUnknownDescendants(t *testing.T) {
+	cases := []struct {
+		name  string
+		ty    cty.Type
+		value cty.Value
+	}{
+		{
+			name: "object",
+			ty:   cty.Object(map[string]cty.Type{"child": cty.String}),
+			value: cty.ObjectVal(map[string]cty.Value{
+				"child": cty.UnknownVal(cty.String),
+			}),
+		},
+		{
+			name:  "list",
+			ty:    cty.List(cty.String),
+			value: cty.ListVal([]cty.Value{cty.UnknownVal(cty.String)}),
+		},
+		{
+			name:  "tuple",
+			ty:    cty.Tuple([]cty.Type{cty.String}),
+			value: cty.TupleVal([]cty.Value{cty.UnknownVal(cty.String)}),
+		},
+		{
+			name: "map",
+			ty:   cty.Map(cty.String),
+			value: cty.MapVal(map[string]cty.Value{
+				"child": cty.UnknownVal(cty.String),
+			}),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+				"value": {Type: tc.ty, Sensitive: true},
+			}}
+			spec, ds := Resolve(block, nil, nil)
+			if ds.HasErrors() {
+				t.Fatal(ds)
+			}
+			value := cty.ObjectVal(map[string]cty.Value{"value": tc.value})
+			if _, _, _, err := spec.Project(value); err == nil {
+				t.Fatal("Project accepted a shallow-known direct value with an unknown descendant")
+			}
+			raw, err := msgpack.Marshal(tc.value, tc.ty)
+			if err != nil {
+				t.Fatal(err)
+			}
+			public := json.RawMessage(`{"value":null}`)
+			sum := sha256.Sum256(public)
+			recovery, err := json.Marshal(recoveryPayload{
+				Version:            RecoveryVersion,
+				ContractVersion:    projectionContractVersion,
+				ProjectionSHA256:   sum[:],
+				ProjectionPaths:    spec.Paths(),
+				ProjectionRedacted: []string{"value"},
+				DirectPaths:        []string{"value"},
+				Values: []recoverySet{{
+					Path:  []recoveryPathStep{{Kind: "attr", Name: "value"}},
+					Value: raw,
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			resourceType := cty.Object(map[string]cty.Type{"value": tc.ty})
+			if _, err := spec.Restore(public, recovery, resourceType); err == nil {
+				t.Fatal("Restore accepted a shallow-known direct value with an unknown descendant")
+			}
+		})
+	}
+}
+
 func TestLegacyNullSensitiveMapWithoutRecoveryRemainsOperable(t *testing.T) {
 	mapType := cty.Map(cty.Set(cty.String))
 	resourceType := cty.Object(map[string]cty.Type{"groups": mapType})
@@ -1142,14 +1328,14 @@ func TestLegacySetRecoveryWithSensitiveMapMigratesToConfidentialProjection(t *te
 				t.Fatalf("SanitizeJSON rejected valid legacy projection: %v", err)
 			}
 			if strings.Contains(string(public), "privateKey") || strings.Contains(string(public), "private-value") {
-				t.Fatalf("v3 projection disclosed a sensitive map: %s", public)
+				t.Fatalf("current projection disclosed a sensitive map: %s", public)
 			}
 			rotated, err := spec.Restore(public, recovery, resourceType)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if !rotated.RawEquals(original) {
-				t.Fatal("v3 migration lost sensitive map authority")
+				t.Fatal("current migration lost sensitive map authority")
 			}
 		})
 	}
@@ -1244,6 +1430,95 @@ func TestCarryForwardPreservesOnlyOmittedPersistedSensitivePaths(t *testing.T) {
 	}
 	if !got.Type().Equals(ty) {
 		t.Fatalf("carried value type = %s, want %s", got.Type().FriendlyName(), ty.FriendlyName())
+	}
+}
+
+func TestCarryForwardPreservesInheritedSensitiveSiblingOmissions(t *testing.T) {
+	containerType := cty.Object(map[string]cty.Type{
+		"members": cty.Set(cty.String),
+		"token":   cty.String,
+		"labels":  cty.List(cty.String),
+	})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"container": {
+			Type: containerType, Sensitive: true,
+			NestedType: map[string]*provider.Attr{
+				"members": {Type: cty.Set(cty.String)},
+				"token":   {Type: cty.String},
+				"labels":  {Type: cty.List(cty.String)},
+			},
+		},
+	}}
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	priorContainer := cty.ObjectVal(map[string]cty.Value{
+		"members": cty.SetVal([]cty.Value{cty.StringVal("member")}),
+		"token":   cty.StringVal("prior-inherited-token"),
+		"labels":  cty.ListVal([]cty.Value{cty.StringVal("prior-inherited-label")}),
+	})
+	prior := cty.ObjectVal(map[string]cty.Value{"container": priorContainer})
+	refreshed := cty.ObjectVal(map[string]cty.Value{
+		"container": cty.ObjectVal(map[string]cty.Value{
+			"members": priorContainer.GetAttr("members"),
+			"token":   cty.NullVal(cty.String),
+			"labels":  cty.UnknownVal(cty.List(cty.String)),
+		}),
+	})
+	got, err := spec.CarryForward(prior, refreshed, spec.Paths())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.RawEquals(prior) {
+		t.Fatalf("CarryForward = %#v, want inherited-sensitive siblings from prior", got)
+	}
+}
+
+func TestCarryForwardRejectsInheritedSensitiveOmissionAtAmbiguousElement(t *testing.T) {
+	entryType := cty.Object(map[string]cty.Type{
+		"members": cty.Set(cty.String),
+		"token":   cty.String,
+	})
+	containerType := cty.Object(map[string]cty.Type{
+		"entries": cty.List(entryType),
+	})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"container": {
+			Type: containerType, Sensitive: true,
+			NestedType: map[string]*provider.Attr{
+				"entries": {
+					Type: cty.List(entryType),
+					NestedType: map[string]*provider.Attr{
+						"members": {Type: cty.Set(cty.String)},
+						"token":   {Type: cty.String},
+					},
+				},
+			},
+		},
+	}}
+	spec, ds := Resolve(block, nil, nil)
+	if ds.HasErrors() {
+		t.Fatal(ds)
+	}
+	entry := func(token cty.Value) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{
+			"members": cty.SetVal([]cty.Value{cty.StringVal("member")}),
+			"token":   token,
+		})
+	}
+	prior := cty.ObjectVal(map[string]cty.Value{
+		"container": cty.ObjectVal(map[string]cty.Value{
+			"entries": cty.ListVal([]cty.Value{entry(cty.StringVal("prior-token"))}),
+		}),
+	})
+	refreshed := cty.ObjectVal(map[string]cty.Value{
+		"container": cty.ObjectVal(map[string]cty.Value{
+			"entries": cty.ListVal([]cty.Value{entry(cty.NullVal(cty.String))}),
+		}),
+	})
+	if _, err := spec.CarryForward(prior, refreshed, spec.Paths()); err == nil {
+		t.Fatal("CarryForward accepted an inherited sensitive omission at an ambiguous collection element")
 	}
 }
 

@@ -191,13 +191,13 @@ func (s *Spec) project(v cty.Value, capture bool) (json.RawMessage, []string, []
 
 func (s *Spec) projectValue(v cty.Value, path cty.Path, logical string, capture, insideCaptured, inheritedSensitive, legacyMapProjection bool, redacted, unknown *[]string, values *[]recoverySet) ([]byte, error) {
 	instance := PathString(path)
-	sensitiveHere := inheritedSensitive
-	if contains(s.paths, logical) {
-		if literal, ok := s.exempt[instance]; !ok || !literalMatches(v, literal) {
-			sensitiveHere = true
-			if v.IsKnown() && !v.IsNull() {
-				*redacted = append(*redacted, instance)
-			}
+	literal, exempt := s.exempt[instance]
+	literalExempt := exempt && literalMatches(v, literal)
+	sensitiveHere := inheritedSensitive && !literalExempt
+	if contains(s.paths, logical) && !literalExempt {
+		sensitiveHere = true
+		if v.IsKnown() && !v.IsNull() {
+			*redacted = append(*redacted, instance)
 		}
 	}
 	if !v.IsKnown() {
@@ -217,7 +217,7 @@ func (s *Spec) projectValue(v cty.Value, path cty.Path, logical string, capture,
 		return []byte("null"), nil
 	}
 	if v.IsNull() {
-		if capture && s.capturesDirectValue(logical, instance, v, insideCaptured) {
+		if capture && s.capturesDirectValue(logical, instance, v, insideCaptured, sensitiveHere) {
 			if err := appendRecoveryValue(v, path, logical, "sensitive value", values); err != nil {
 				return nil, err
 			}
@@ -235,7 +235,7 @@ func (s *Spec) projectValue(v cty.Value, path cty.Path, logical string, capture,
 		}
 		insideCaptured = true
 	}
-	if capture && s.capturesDirectValue(logical, instance, v, insideCaptured) {
+	if capture && s.capturesDirectValue(logical, instance, v, insideCaptured, sensitiveHere) {
 		if err := appendRecoveryValue(v, path, logical, "sensitive value", values); err != nil {
 			return nil, err
 		}
@@ -489,7 +489,8 @@ func (s *Spec) restoreGeneration(public json.RawMessage, recovery []byte, ty cty
 		seen[key] = true
 		value, err := msgpack.Unmarshal(recovered.Value, want.Type)
 		if err != nil || !value.IsKnown() ||
-			(payload.Version >= 3 && want.Type.IsMapType() && !value.IsWhollyKnown()) ||
+			(payload.Version >= 4 && !value.IsWhollyKnown()) ||
+			(payload.Version == 3 && want.Type.IsMapType() && !value.IsWhollyKnown()) ||
 			(!want.AllowNull && value.IsNull()) || !value.Type().Equals(want.Type) {
 			return cty.NilVal, errors.New("invalid sensitive recovery value")
 		}
@@ -642,6 +643,9 @@ func (s *Spec) collectExpectedRecovery(v any, ty cty.Type, logical string, path 
 }
 
 func appendRecoveryValue(v cty.Value, path cty.Path, logical, label string, values *[]recoverySet) error {
+	if !v.IsNull() && !v.IsWhollyKnown() {
+		return fmt.Errorf("%s %q contains unknown values", label, logical)
+	}
 	raw, err := msgpack.Marshal(v, v.Type())
 	if err != nil {
 		return fmt.Errorf("encode %s %q: %w", label, logical, err)
@@ -674,7 +678,7 @@ func directRecoveryPaths(values []recoverySet, s *Spec) []string {
 	paths := make([]string, 0, len(values))
 	for _, value := range values {
 		logical := recoveryLogicalPath(value.Path)
-		if contains(s.paths, logical) && !s.hasSetAtOrBelow(logical) {
+		if coveredBySensitivePath(logical, s.paths) && !s.hasSetAtOrBelow(logical) {
 			paths = append(paths, logical)
 		}
 	}
@@ -752,11 +756,8 @@ func decodeJSON(raw []byte) (any, error) {
 	}
 	return value, nil
 }
-func (s *Spec) capturesDirectValue(logical, instance string, v cty.Value, insideCaptured bool) bool {
-	if insideCaptured || !contains(s.paths, logical) || s.hasSetAtOrBelow(logical) {
-		return false
-	}
-	if s.directRecoveryPaths != nil && !contains(s.directRecoveryPaths, logical) {
+func (s *Spec) capturesDirectValue(logical, instance string, v cty.Value, insideCaptured, sensitiveHere bool) bool {
+	if insideCaptured || !sensitiveHere || s.hasSetAtOrBelow(logical) {
 		return false
 	}
 	literal, exempt := s.exempt[instance]

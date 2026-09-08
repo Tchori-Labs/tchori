@@ -709,7 +709,7 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	ds = append(ds, applyDs...)
 	failed := applyDs.HasErrors()
 	if failed {
-		ds = append(ds, attemptedChangeSummary(addr, ch.Action, block, prior, planned)...)
+		ds = append(ds, attemptedChangeSummary(addr, ch.Action, block, spec, prior, planned)...)
 		if newState == cty.NilVal || newState.IsNull() || !newState.IsKnown() {
 			return ds
 		}
@@ -726,7 +726,7 @@ func (ex *executor) createOrUpdate(ctx context.Context, client *provider.Client,
 	// then the encoding guard below prevents it from being persisted.
 	var consistencyDs diag.Diagnostics
 	if !failed {
-		consistencyDs = checkResultConsistency(addr, block, planned, cfgVal, newState)
+		consistencyDs = checkResultConsistency(addr, block, spec, planned, cfgVal, newState)
 	}
 	if newState.IsNull() || !newState.IsKnown() {
 		return append(ds, consistencyDs...)

@@ -21,10 +21,6 @@ type Spec struct {
 	exempt         map[string]any
 	setPrefixes    []string
 	allSetPrefixes []string
-	// nil means capture direct sensitive paths under the current policy;
-	// non-nil limits capture to paths already present in the persisted policy
-	// while rotating a projection.
-	directRecoveryPaths []string
 }
 
 // Resolve is the single constructor used by persistence and planning paths.
@@ -93,9 +89,9 @@ func (s *Spec) carryForward(prior, refreshed cty.Value, persisted []string, stri
 	}
 	return cty.Transform(refreshed, func(path cty.Path, value cty.Value) (cty.Value, error) {
 		logical := logicalPath(path)
-		exact := contains(paths, logical)
+		effective := coveredBySensitivePath(logical, paths)
 		missing := value.IsNull() || !value.IsKnown()
-		if !exact {
+		if !effective {
 			if strict && missing && (logical == "" || hasSensitiveDescendant(logical, paths)) {
 				return cty.NilVal, fmt.Errorf("refresh omitted persisted sensitive path below %q", logical)
 			}
@@ -286,6 +282,20 @@ func typePathExists(ty cty.Type, parts []string) bool {
 		return true
 	}
 	return typePathExists(ty.AttributeType(parts[0]), parts[1:])
+}
+
+// RedactsDiagnosticPath reports whether path is sensitive itself, lies below
+// a sensitive path, or is an aggregate containing a sensitive descendant.
+// Diagnostic surfaces intentionally ignore raw-literal exemptions.
+func (s *Spec) RedactsDiagnosticPath(path cty.Path) bool {
+	if s == nil {
+		return false
+	}
+	logical := logicalPath(path)
+	if logical == "" {
+		return len(s.paths) != 0
+	}
+	return coveredBySensitivePath(logical, s.paths) || hasSensitiveDescendant(logical, s.paths)
 }
 
 // Paths returns the sorted effective path set. Literal exemptions never narrow it.

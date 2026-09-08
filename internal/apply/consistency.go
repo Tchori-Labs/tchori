@@ -11,6 +11,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/plan"
 	"github.com/tchori-labs/tchori/internal/provider"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 )
 
 type consistencySide struct {
@@ -28,7 +29,7 @@ type consistencyDivergence struct {
 // (shallow knownness), just like resolvePlannedUnknowns: a resource object
 // normally contains unknown computed leaves and must still be traversed.
 // IsWhollyKnown is reserved for values compared or rendered as a whole.
-func checkResultConsistency(addr string, block *provider.SchemaBlock, planned, cfgVal, newState cty.Value) diag.Diagnostics {
+func checkResultConsistency(addr string, block *provider.SchemaBlock, spec *sensitive.Spec, planned, cfgVal, newState cty.Value) diag.Diagnostics {
 	if newState.IsNull() {
 		return diag.Diagnostics{diag.Errorf(addr, "provider returned no state after apply",
 			"a create or update must return the resource object; nothing was persisted for this address")}
@@ -39,7 +40,7 @@ func checkResultConsistency(addr string, block *provider.SchemaBlock, planned, c
 	}
 
 	var divergences []consistencyDivergence
-	walkConsistency(nil, planned, cfgVal, newState, &divergences)
+	walkConsistency(nil, planned, cfgVal, newState, block, spec, true, &divergences)
 	if len(divergences) == 0 {
 		return nil
 	}
@@ -50,7 +51,7 @@ func checkResultConsistency(addr string, block *provider.SchemaBlock, planned, c
 	var detail strings.Builder
 	detail.WriteString("the provider accepted the apply without honouring these configured attributes:\n")
 	for _, d := range divergences {
-		redact := redactConsistencyValue(block, d.path)
+		redact := redactConsistencyValue(block, spec, d.path)
 		_, _ = fmt.Fprintf(&detail, "  %s: planned %s, applied %s\n",
 			renderedPath(d.path), renderConsistencySide(d.planned, redact), renderConsistencySide(d.applied, redact))
 	}
@@ -58,7 +59,7 @@ func checkResultConsistency(addr string, block *provider.SchemaBlock, planned, c
 	return diag.Diagnostics{diag.Errorf(addr, "provider produced inconsistent result after apply", detail.String())}
 }
 
-func walkConsistency(path cty.Path, planned, cfgVal, applied cty.Value, out *[]consistencyDivergence) {
+func walkConsistency(path cty.Path, planned, cfgVal, applied cty.Value, block *provider.SchemaBlock, spec *sensitive.Spec, aggregateSensitive bool, out *[]consistencyDivergence) {
 	// A null or shallow-unknown config node authors no promise. Classify all
 	// three values before any traversal: cty panics when null/unknown object
 	// and map values are indexed or iterated.
@@ -74,6 +75,16 @@ func walkConsistency(path cty.Path, planned, cfgVal, applied cty.Value, out *[]c
 	}
 
 	ty := planned.Type()
+	if aggregateSensitive && sensitiveDiagnosticCollection(block, spec, path, ty) {
+		var nested []consistencyDivergence
+		walkConsistency(path, planned, cfgVal, applied, block, spec, false, &nested)
+		if len(nested) != 0 {
+			*out = append(*out, consistencyDivergence{
+				path: copyPath(path), planned: consistencySide{value: planned}, applied: consistencySide{value: applied},
+			})
+		}
+		return
+	}
 	switch {
 	case ty.IsObjectType() || ty.IsMapType():
 		if !applied.IsKnown() || applied.IsNull() {
@@ -87,7 +98,7 @@ func walkConsistency(path cty.Path, planned, cfgVal, applied cty.Value, out *[]c
 			}
 			sort.Strings(names)
 			for _, name := range names {
-				walkConsistency(appendPath(path, cty.GetAttrStep{Name: name}), planned.GetAttr(name), cfgVal.GetAttr(name), applied.GetAttr(name), out)
+				walkConsistency(appendPath(path, cty.GetAttrStep{Name: name}), planned.GetAttr(name), cfgVal.GetAttr(name), applied.GetAttr(name), block, spec, aggregateSensitive, out)
 			}
 			return
 		}
@@ -124,7 +135,7 @@ func walkConsistency(path cty.Path, planned, cfgVal, applied cty.Value, out *[]c
 			case !pok && aok:
 				*out = append(*out, consistencyDivergence{path: keyPath, planned: consistencySide{absent: true}, applied: consistencySide{value: a}})
 			case pok && aok && cok:
-				walkConsistency(keyPath, p, c, a, out)
+				walkConsistency(keyPath, p, c, a, block, spec, aggregateSensitive, out)
 			}
 		}
 		return
@@ -148,7 +159,7 @@ func walkConsistency(path cty.Path, planned, cfgVal, applied cty.Value, out *[]c
 		cfgElems := cfgVal.AsValueSlice()
 		appliedElems := applied.AsValueSlice()
 		for i, p := range plannedElems {
-			walkConsistency(appendPath(path, cty.IndexStep{Key: cty.NumberIntVal(int64(i))}), p, cfgElems[i], appliedElems[i], out)
+			walkConsistency(appendPath(path, cty.IndexStep{Key: cty.NumberIntVal(int64(i))}), p, cfgElems[i], appliedElems[i], block, spec, aggregateSensitive, out)
 		}
 		return
 
@@ -213,11 +224,25 @@ func appendPath(path cty.Path, step cty.PathStep) cty.Path {
 	return append(out, step)
 }
 
-// redactConsistencyValue applies the two distinct schema rules: an ordinary
-// attribute's own Sensitive bit governs its complete subtree; a nested block
-// compared as a whole is redacted if any descendant is sensitive. Paths that
-// cannot be resolved fail closed.
-func redactConsistencyValue(block *provider.SchemaBlock, path cty.Path) bool {
+func sensitiveDiagnosticCollection(block *provider.SchemaBlock, spec *sensitive.Spec, path cty.Path, ty cty.Type) bool {
+	if len(path) == 0 || (!ty.IsMapType() && !ty.IsListType() && !ty.IsSetType() && !ty.IsTupleType()) {
+		return false
+	}
+	return redactConsistencyValue(block, spec, path)
+}
+
+// redactConsistencyValue applies both the effective resource sensitivity
+// contract and provider schema sensitivity. Effective paths redact their
+// complete subtree and any aggregate containing a sensitive descendant.
+// Schema paths that cannot be resolved fail closed.
+func redactConsistencyValue(block *provider.SchemaBlock, spec *sensitive.Spec, path cty.Path) bool {
+	if spec != nil && spec.RedactsDiagnosticPath(path) {
+		return true
+	}
+	return redactSchemaValue(block, path)
+}
+
+func redactSchemaValue(block *provider.SchemaBlock, path cty.Path) bool {
 	cur := block
 	for i := 0; i < len(path); i++ {
 		step, ok := path[i].(cty.GetAttrStep)
@@ -238,7 +263,7 @@ func redactConsistencyValue(block *provider.SchemaBlock, path cty.Path) bool {
 			if i >= len(path)-1 {
 				return blockHasSensitiveDescendant(nested)
 			}
-			return redactConsistencyValue(nested, path[i+1:])
+			return redactSchemaValue(nested, path[i+1:])
 		}
 		nb, ok := cur.Blocks[step.Name]
 		if !ok || nb == nil || nb.Block == nil {

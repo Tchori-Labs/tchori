@@ -9,6 +9,7 @@ import (
 
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/provider"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 )
 
 type attemptedChange struct {
@@ -19,7 +20,7 @@ type attemptedChange struct {
 // attemptedChanges walks the prior and planned values without traversing a
 // null or unknown container. Objects and maps have stable named
 // correspondence; ordered collections and sets are compared wholesale.
-func attemptedChanges(path cty.Path, prior, planned cty.Value, out *[]attemptedChange) {
+func attemptedChanges(path cty.Path, prior, planned cty.Value, block *provider.SchemaBlock, spec *sensitive.Spec, out *[]attemptedChange) {
 	if prior.RawEquals(planned) {
 		return
 	}
@@ -34,6 +35,10 @@ func attemptedChanges(path cty.Path, prior, planned cty.Value, out *[]attemptedC
 	}
 
 	ty := prior.Type()
+	if sensitiveDiagnosticCollection(block, spec, path, ty) {
+		*out = append(*out, attemptedChange{path: copyPath(path), before: prior, after: planned})
+		return
+	}
 	switch {
 	case ty.IsObjectType() && planned.Type().Equals(ty):
 		names := make([]string, 0, len(ty.AttributeTypes()))
@@ -42,7 +47,7 @@ func attemptedChanges(path cty.Path, prior, planned cty.Value, out *[]attemptedC
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			attemptedChanges(appendPath(path, cty.GetAttrStep{Name: name}), prior.GetAttr(name), planned.GetAttr(name), out)
+			attemptedChanges(appendPath(path, cty.GetAttrStep{Name: name}), prior.GetAttr(name), planned.GetAttr(name), block, spec, out)
 		}
 	case ty.IsMapType() && planned.Type().Equals(ty):
 		beforeElems := prior.AsValueMap()
@@ -68,7 +73,7 @@ func attemptedChanges(path cty.Path, prior, planned cty.Value, out *[]attemptedC
 			if !ok {
 				after = cty.NullVal(ty.ElementType())
 			}
-			attemptedChanges(appendPath(path, cty.IndexStep{Key: cty.StringVal(key)}), before, after, out)
+			attemptedChanges(appendPath(path, cty.IndexStep{Key: cty.StringVal(key)}), before, after, block, spec, out)
 		}
 	default:
 		*out = append(*out, attemptedChange{path: copyPath(path), before: prior, after: planned})
@@ -78,13 +83,13 @@ func attemptedChanges(path cty.Path, prior, planned cty.Value, out *[]attemptedC
 // attemptedChangeSummary describes the exact before/after values sent to an
 // ApplyResource update. Creates have no prior object and therefore no useful
 // before/after attribute list.
-func attemptedChangeSummary(addr, action string, block *provider.SchemaBlock, prior, planned cty.Value) diag.Diagnostics {
+func attemptedChangeSummary(addr, action string, block *provider.SchemaBlock, spec *sensitive.Spec, prior, planned cty.Value) diag.Diagnostics {
 	if !prior.IsKnown() || prior.IsNull() || !prior.Type().IsObjectType() {
 		return nil
 	}
 
 	var changes []attemptedChange
-	attemptedChanges(nil, prior, planned, &changes)
+	attemptedChanges(nil, prior, planned, block, spec, &changes)
 	if len(changes) == 0 {
 		return nil
 	}
@@ -95,7 +100,7 @@ func attemptedChangeSummary(addr, action string, block *provider.SchemaBlock, pr
 	var detail strings.Builder
 	_, _ = fmt.Fprintf(&detail, "the failing %s for %s attempted these changes:\n", action, addr)
 	for _, change := range changes {
-		redact := redactConsistencyValue(block, change.path)
+		redact := redactConsistencyValue(block, spec, change.path)
 		_, _ = fmt.Fprintf(&detail, "  %s: %s -> %s\n", renderedPath(change.path),
 			renderConsistencySide(consistencySide{value: change.before}, redact),
 			renderConsistencySide(consistencySide{value: change.after}, redact))

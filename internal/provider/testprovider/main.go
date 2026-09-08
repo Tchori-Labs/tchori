@@ -796,6 +796,28 @@ func (s *server) applySecretful(req *tfprotov6.ApplyResourceChangeRequest) (*tfp
 		return nil, err
 	}
 	if planned.IsNull() {
+		prior, err := req.PriorState.Unmarshal(secretfulType)
+		if err != nil {
+			return nil, err
+		}
+		if !prior.IsNull() {
+			var attrs map[string]tftypes.Value
+			if err := prior.As(&attrs); err != nil {
+				return nil, err
+			}
+			var name string
+			if err := attrs["name"].As(&name); err != nil {
+				return nil, err
+			}
+			token := attrs["token"]
+			if name == "literal-delete-authority" && (!token.IsKnown() || token.IsNull()) {
+				return &tfprotov6.ApplyResourceChangeResponse{Diagnostics: []*tfprotov6.Diagnostic{{
+					Severity: tfprotov6.DiagnosticSeverityError,
+					Summary:  "literal exemption authority was not recovered",
+					Detail:   "the provider did not receive the formerly exempt token",
+				}}}, nil
+			}
+		}
 		return &tfprotov6.ApplyResourceChangeResponse{NewState: req.PlannedState}, nil
 	}
 	var attrs map[string]tftypes.Value
@@ -1176,10 +1198,9 @@ func (s *server) applyServerAssigned(req *tfprotov6.ApplyResourceChangeRequest) 
 	}, nil
 }
 
-// applyNestedThing applies a tchoritest_nested_thing change. Like
-// planNestedThing, "settings" is never touched — only "id" is minted when
-// unknown — so a populated "settings" value must come back out of Apply
-// exactly as it went into Plan.
+// applyNestedThing normally passes settings through and mints only id.
+// Diagnostic fixture names exercise provider-error and inconsistent-result
+// reporting against an ordinary, config-declared sensitive settings leaf.
 func (s *server) applyNestedThing(req *tfprotov6.ApplyResourceChangeRequest) (*tfprotov6.ApplyResourceChangeResponse, error) {
 	planned, err := req.PlannedState.Unmarshal(nestedThingType)
 	if err != nil {
@@ -1197,8 +1218,26 @@ func (s *server) applyNestedThing(req *tfprotov6.ApplyResourceChangeRequest) (*t
 	if err := attrs["name"].As(&name); err != nil {
 		return nil, err
 	}
+	if name == "diagnostic_error" {
+		return &tfprotov6.ApplyResourceChangeResponse{
+			NewState: req.PriorState,
+			Diagnostics: []*tfprotov6.Diagnostic{{
+				Severity: tfprotov6.DiagnosticSeverityError,
+				Summary:  "diagnostic update failed",
+				Detail:   "the diagnostic fixture rejected the update",
+			}},
+		}, nil
+	}
 	if !attrs["id"].IsKnown() {
 		attrs["id"] = tftypes.NewValue(tftypes.String, s.prefix+"id-"+name)
+	}
+	if name == "diagnostic_inconsistent" {
+		var settings map[string]tftypes.Value
+		if err := attrs["settings"].As(&settings); err != nil {
+			return nil, err
+		}
+		settings["label"] = tftypes.NewValue(tftypes.String, "consistency-applied-sentinel")
+		attrs["settings"] = tftypes.NewValue(nestedSettingsType, settings)
 	}
 	newDV, err := tfprotov6.NewDynamicValue(nestedThingType, tftypes.NewValue(nestedThingType, attrs))
 	if err != nil {
