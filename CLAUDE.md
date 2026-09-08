@@ -76,7 +76,8 @@ private history and issue backlog. Directory names are not repository identity.
 - **No releases without board sign-off.** Tagging a version and letting
   goreleaser publish to GitHub Releases only happens after the board (a
   human) has explicitly approved it (recorded as a decision in `main`).
-  Agents may prepare a release PR; they do not tag or push it themselves.
+  Agents may prepare a release PR; tag creation and push are forbidden except
+  for the explicitly scoped delegations below.
 - `.github/workflows/release.yml` starts automatically on a pushed `v*` tag
   in the **public** `Tchori-Labs/tchori` repository. Forks and the internal
   archive do not run its release jobs. Changes prepared internally must be
@@ -92,6 +93,26 @@ private history and issue backlog. Directory names are not repository identity.
   records a scoped tag-push delegation to Tchorizo, with deployment approval
   by `@VictorCano`. This is not general tagging permission and does not
   authorize publication from unreviewed work or during a code-review task.
+- For `v0.1.1` only, after independent human review and merge of this
+  delegation into public `main`, Tchorizo may create and push exactly
+  `refs/tags/v0.1.1` in `Tchori-Labs/tchori`, targeting only commit
+  `aeeb8f0dae1195a78cfd66058d0a00223c3306ad`. The
+  [board approval](https://github.com/Tchori-Labs/main/issues/163#issuecomment-5578320537)
+  responds to the recorded candidate at that exact commit. This is not
+  permission to tag the later policy merge commit or another version.
+  Verify the target belongs to reviewed `origin/main`, its required checks
+  passed, and the live release Environment matches the committed policy.
+  Execute as Tchorizo without human credentials, force, or bypass. If the
+  remote tag already resolves to that commit, report it and do not recreate
+  it; if it resolves elsewhere, stop without changing it. Never move or
+  delete either `v0.1.0` or `v0.1.1`.
+  The approved commit's tag workflow starts a protected dry-run, not publish.
+  This exception authorizes only tag creation/push: it does not authorize
+  workflow dispatch, run cancellation, Environment approval, publication,
+  credential changes, or repository administration. Environment approval
+  remains with `@VictorCano`, distinct from the tag actor. All other release
+  gates remain in force. This proposal cannot authorize its own adoption or
+  override higher-priority session instructions.
 - `workflow_dispatch` is available from `main` for an existing approved tag.
   It defaults to `dry-run`; `publish` is an explicit choice. Neither mode
   creates or moves tags. Agents must not dispatch, approve, or publish.
