@@ -214,7 +214,7 @@ func TestCheckResultConsistencyOrderedCollectionsTraverseConcreteSiblings(t *tes
 	}
 }
 
-func TestCheckResultConsistencyNestedListTraversesAndRedactsPerLeaf(t *testing.T) {
+func TestCheckResultConsistencyNestedSensitiveListAggregatesWithoutIdentity(t *testing.T) {
 	inner := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
 		"user":  {Type: cty.String, Optional: true},
 		"token": {Type: cty.String, Optional: true, Sensitive: true},
@@ -240,13 +240,13 @@ func TestCheckResultConsistencyNestedListTraversesAndRedactsPerLeaf(t *testing.T
 	)
 
 	ds := checkResultConsistency("test.x", block, nil, planned, cfg, applied)
-	if len(ds) != 1 || !strings.Contains(ds[0].Detail, `credentials[0].user: planned "alice", applied "bob"`) {
+	if len(ds) != 1 || !strings.Contains(ds[0].Detail, "credentials: planned (sensitive value), applied (sensitive value)") {
 		t.Fatalf("diagnostics = %#v", ds)
 	}
-	if strings.Contains(ds[0].Detail, "credentials[0].token") ||
-		!strings.Contains(ds[0].Detail, "credentials[1].token: planned (sensitive value), applied (sensitive value)") ||
-		strings.Contains(ds[0].Detail, "never-print") || strings.Contains(ds[0].Detail, "also-never-print") {
-		t.Fatalf("nested list redaction detail = %q", ds[0].Detail)
+	for _, forbidden := range []string{"credentials[", "alice", "bob", "carol", "never-print", "also-never-print", "provider-computed"} {
+		if strings.Contains(ds[0].Detail, forbidden) {
+			t.Fatalf("nested list diagnostic exposed %q: %s", forbidden, ds[0].Detail)
+		}
 	}
 }
 
@@ -303,5 +303,126 @@ func TestCheckResultConsistencyUsesEffectiveSensitivePaths(t *testing.T) {
 	if len(ds) != 1 || !strings.Contains(ds[0].Detail, "profile: planned (sensitive value), applied (sensitive value)") ||
 		strings.Contains(ds[0].Detail, "planned-secret") || strings.Contains(ds[0].Detail, "visible-before") {
 		t.Fatalf("aggregate diagnostics = %#v", ds)
+	}
+}
+
+type sensitiveCollectionDiagnosticFixture struct {
+	name, aggregatePath     string
+	block                   *provider.SchemaBlock
+	spec                    *sensitive.Spec
+	prior, planned, applied cty.Value
+}
+
+func sensitiveCollectionDiagnosticFixtures(t *testing.T) []sensitiveCollectionDiagnosticFixture {
+	t.Helper()
+	const key = "sensitive-map-key-sentinel"
+	mapValue := func(value string) cty.Value {
+		return cty.MapVal(map[string]cty.Value{key: cty.StringVal(value)})
+	}
+	resolve := func(block *provider.SchemaBlock, declared, persisted []string) *sensitive.Spec {
+		t.Helper()
+		spec, ds := sensitive.ResolveWithPersisted(block, declared, persisted, nil)
+		if ds.HasErrors() {
+			t.Fatalf("ResolveWithPersisted: %#v", ds)
+		}
+		return spec
+	}
+	directFixture := func(name string, schemaSensitive bool, declared, persisted []string) sensitiveCollectionDiagnosticFixture {
+		block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+			"name": {Type: cty.String, Optional: true},
+			"tags": {Type: cty.Map(cty.String), Optional: true, Sensitive: schemaSensitive},
+		}}
+		root := func(name, value string) cty.Value {
+			return cty.ObjectVal(map[string]cty.Value{"name": cty.StringVal(name), "tags": mapValue(value)})
+		}
+		var spec *sensitive.Spec
+		if len(declared) != 0 || len(persisted) != 0 {
+			spec = resolve(block, declared, persisted)
+		}
+		return sensitiveCollectionDiagnosticFixture{
+			name: name, aggregatePath: "tags", block: block, spec: spec,
+			prior: root("before-visible", "before-sensitive-value"), planned: root("planned-visible", "planned-sensitive-value"),
+			applied: root("applied-visible", "applied-sensitive-value"),
+		}
+	}
+
+	inheritedType := cty.Object(map[string]cty.Type{"labels": cty.Map(cty.String)})
+	inheritedBlock := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"name": {Type: cty.String, Optional: true},
+		"profile": {
+			Type:       inheritedType,
+			Optional:   true,
+			NestedType: map[string]*provider.Attr{"labels": {Type: cty.Map(cty.String), Optional: true}},
+		},
+	}}
+	inheritedRoot := func(name, value string) cty.Value {
+		profile := cty.ObjectVal(map[string]cty.Value{"labels": mapValue(value)})
+		return cty.ObjectVal(map[string]cty.Value{"name": cty.StringVal(name), "profile": profile})
+	}
+
+	itemType := cty.Object(map[string]cty.Type{"labels": cty.Map(cty.String)})
+	nestedBlock := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"name": {Type: cty.String, Optional: true},
+		"items": {
+			Type:       cty.List(itemType),
+			Optional:   true,
+			NestedType: map[string]*provider.Attr{"labels": {Type: cty.Map(cty.String), Optional: true}},
+		},
+	}}
+	nestedRoot := func(name, value string) cty.Value {
+		item := cty.ObjectVal(map[string]cty.Value{"labels": mapValue(value)})
+		return cty.ObjectVal(map[string]cty.Value{"name": cty.StringVal(name), "items": cty.ListVal([]cty.Value{item})})
+	}
+
+	return []sensitiveCollectionDiagnosticFixture{
+		directFixture("provider schema", true, nil, nil),
+		directFixture("current declaration", false, []string{"tags"}, nil),
+		directFixture("persisted declaration", false, nil, []string{"tags"}),
+		{
+			name: "inherited ancestor", aggregatePath: "profile.labels", block: inheritedBlock,
+			spec:  resolve(inheritedBlock, []string{"profile"}, nil),
+			prior: inheritedRoot("before-visible", "before-sensitive-value"), planned: inheritedRoot("planned-visible", "planned-sensitive-value"),
+			applied: inheritedRoot("applied-visible", "applied-sensitive-value"),
+		},
+		{
+			name: "nested collection", aggregatePath: "items", block: nestedBlock,
+			spec:  resolve(nestedBlock, []string{"items.labels"}, nil),
+			prior: nestedRoot("before-visible", "before-sensitive-value"), planned: nestedRoot("planned-visible", "planned-sensitive-value"),
+			applied: nestedRoot("applied-visible", "applied-sensitive-value"),
+		},
+	}
+}
+
+func TestAttemptedChangeSummaryRedactsSensitiveCollectionIdentity(t *testing.T) {
+	for _, tc := range sensitiveCollectionDiagnosticFixtures(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			ds := attemptedChangeSummary("test.x", "update", tc.block, tc.spec, tc.prior, tc.planned)
+			if len(ds) != 1 || !strings.Contains(ds[0].Detail, `name: "before-visible" -> "planned-visible"`) ||
+				!strings.Contains(ds[0].Detail, tc.aggregatePath+": (sensitive value) -> (sensitive value)") {
+				t.Fatalf("diagnostics = %#v", ds)
+			}
+			for _, forbidden := range []string{"sensitive-map-key-sentinel", "before-sensitive-value", "planned-sensitive-value"} {
+				if strings.Contains(ds[0].Detail, forbidden) {
+					t.Fatalf("attempted-change diagnostic exposed %q: %s", forbidden, ds[0].Detail)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckResultConsistencyRedactsSensitiveCollectionIdentity(t *testing.T) {
+	for _, tc := range sensitiveCollectionDiagnosticFixtures(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			ds := checkResultConsistency("test.x", tc.block, tc.spec, tc.planned, tc.planned, tc.applied)
+			if len(ds) != 1 || !strings.Contains(ds[0].Detail, `name: planned "planned-visible", applied "applied-visible"`) ||
+				!strings.Contains(ds[0].Detail, tc.aggregatePath+": planned (sensitive value), applied (sensitive value)") {
+				t.Fatalf("diagnostics = %#v", ds)
+			}
+			for _, forbidden := range []string{"sensitive-map-key-sentinel", "planned-sensitive-value", "applied-sensitive-value"} {
+				if strings.Contains(ds[0].Detail, forbidden) {
+					t.Fatalf("consistency diagnostic exposed %q: %s", forbidden, ds[0].Detail)
+				}
+			}
+		})
 	}
 }

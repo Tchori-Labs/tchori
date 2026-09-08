@@ -127,6 +127,9 @@ func (s *server) applyLossy(req *tfprotov6.ApplyResourceChangeRequest) (*tfproto
 				attrs["tags"] = tftypes.NewValue(tftypes.Map{ElementType: tftypes.String}, nil)
 			} else {
 				delete(tags, "dropped")
+				if name == "diagnostic_key_inconsistent" {
+					delete(tags, "sensitive-map-key-sentinel")
+				}
 				_, inject := tags["inject"]
 				if len(tags) == 0 || inject {
 					tags["injected"] = tftypes.NewValue(tftypes.String, "by-provider")

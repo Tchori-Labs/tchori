@@ -2674,6 +2674,73 @@ func TestApplyConsistencyRedactsEffectiveSensitiveAttribute(t *testing.T) {
 	}
 }
 
+func TestApplyProviderErrorRedactsSensitiveMapIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		oldKey, newKey    string
+		removeDeclaration bool
+	}{
+		{name: "current policy", oldKey: "current-old-key-sentinel", newKey: "current-new-key-sentinel"},
+		{name: "persisted policy after config removal", oldKey: "persisted-old-key-sentinel", newKey: "persisted-new-key-sentinel", removeDeclaration: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resource := thing("map-redaction", "stable")
+			resource.Config["tags"] = map[string]any{tc.oldKey: "old-map-value-sentinel"}
+			resource.SensitiveAttributes = []string{"tags"}
+			h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+			ctx := context.Background()
+
+			st := loadState(t, h.statePath)
+			if _, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+				t.Fatalf("seed Apply: %#v", ds)
+			}
+
+			resource.Config["name"] = "api_400"
+			resource.Config["tags"] = map[string]any{tc.newKey: "new-map-value-sentinel"}
+			if tc.removeDeclaration {
+				resource.SensitiveAttributes = nil
+			}
+			st = loadState(t, h.statePath)
+			_, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+			attempted := diagnosticWithSummary(ds, "attempted change")
+			if !ds.HasErrors() || attempted == nil {
+				t.Fatalf("Apply diagnostics = %#v, want provider error with attempted-change context", ds)
+			}
+			if !strings.Contains(attempted.Detail, `name: "stable" -> "api_400"`) ||
+				!strings.Contains(attempted.Detail, "tags: (sensitive value) -> (sensitive value)") {
+				t.Fatalf("attempted-change diagnostic lost useful aggregate context: %q", attempted.Detail)
+			}
+			for _, forbidden := range []string{tc.oldKey, tc.newKey, "old-map-value-sentinel", "new-map-value-sentinel"} {
+				if strings.Contains(attempted.Detail, forbidden) {
+					t.Fatalf("attempted-change diagnostic exposed %q: %s", forbidden, attempted.Detail)
+				}
+			}
+		})
+	}
+}
+
+func TestApplyConsistencyRedactsSensitiveMapIdentity(t *testing.T) {
+	resource := lossyThing("diagnostic_key_inconsistent", map[string]any{
+		"flag": true,
+		"tags": map[string]any{"sensitive-map-key-sentinel": "sensitive-map-value-sentinel"},
+	})
+	resource.SensitiveAttributes = []string{"tags"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	st := loadState(t, h.statePath)
+
+	_, ds := apply.Apply(context.Background(), h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	consistency := diagnosticWithSummary(ds, "provider produced inconsistent result after apply")
+	if consistency == nil || !strings.Contains(consistency.Detail, "flag: planned true, applied false") ||
+		!strings.Contains(consistency.Detail, "tags: planned (sensitive value), applied (sensitive value)") {
+		t.Fatalf("diagnostics = %#v, want visible public difference and redacted map aggregate", ds)
+	}
+	for _, forbidden := range []string{"sensitive-map-key-sentinel", "sensitive-map-value-sentinel", "injected"} {
+		if strings.Contains(consistency.Detail, forbidden) {
+			t.Fatalf("consistency diagnostic exposed %q: %s", forbidden, consistency.Detail)
+		}
+	}
+}
+
 func TestApplyIndependentChangesContinueAfterFirstAndMiddleFailure(t *testing.T) {
 	for _, tc := range []struct {
 		name        string

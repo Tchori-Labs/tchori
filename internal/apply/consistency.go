@@ -40,7 +40,7 @@ func checkResultConsistency(addr string, block *provider.SchemaBlock, spec *sens
 	}
 
 	var divergences []consistencyDivergence
-	walkConsistency(nil, planned, cfgVal, newState, &divergences)
+	walkConsistency(nil, planned, cfgVal, newState, block, spec, true, &divergences)
 	if len(divergences) == 0 {
 		return nil
 	}
@@ -59,7 +59,7 @@ func checkResultConsistency(addr string, block *provider.SchemaBlock, spec *sens
 	return diag.Diagnostics{diag.Errorf(addr, "provider produced inconsistent result after apply", detail.String())}
 }
 
-func walkConsistency(path cty.Path, planned, cfgVal, applied cty.Value, out *[]consistencyDivergence) {
+func walkConsistency(path cty.Path, planned, cfgVal, applied cty.Value, block *provider.SchemaBlock, spec *sensitive.Spec, aggregateSensitive bool, out *[]consistencyDivergence) {
 	// A null or shallow-unknown config node authors no promise. Classify all
 	// three values before any traversal: cty panics when null/unknown object
 	// and map values are indexed or iterated.
@@ -75,6 +75,16 @@ func walkConsistency(path cty.Path, planned, cfgVal, applied cty.Value, out *[]c
 	}
 
 	ty := planned.Type()
+	if aggregateSensitive && sensitiveDiagnosticCollection(block, spec, path, ty) {
+		var nested []consistencyDivergence
+		walkConsistency(path, planned, cfgVal, applied, block, spec, false, &nested)
+		if len(nested) != 0 {
+			*out = append(*out, consistencyDivergence{
+				path: copyPath(path), planned: consistencySide{value: planned}, applied: consistencySide{value: applied},
+			})
+		}
+		return
+	}
 	switch {
 	case ty.IsObjectType() || ty.IsMapType():
 		if !applied.IsKnown() || applied.IsNull() {
@@ -88,7 +98,7 @@ func walkConsistency(path cty.Path, planned, cfgVal, applied cty.Value, out *[]c
 			}
 			sort.Strings(names)
 			for _, name := range names {
-				walkConsistency(appendPath(path, cty.GetAttrStep{Name: name}), planned.GetAttr(name), cfgVal.GetAttr(name), applied.GetAttr(name), out)
+				walkConsistency(appendPath(path, cty.GetAttrStep{Name: name}), planned.GetAttr(name), cfgVal.GetAttr(name), applied.GetAttr(name), block, spec, aggregateSensitive, out)
 			}
 			return
 		}
@@ -125,7 +135,7 @@ func walkConsistency(path cty.Path, planned, cfgVal, applied cty.Value, out *[]c
 			case !pok && aok:
 				*out = append(*out, consistencyDivergence{path: keyPath, planned: consistencySide{absent: true}, applied: consistencySide{value: a}})
 			case pok && aok && cok:
-				walkConsistency(keyPath, p, c, a, out)
+				walkConsistency(keyPath, p, c, a, block, spec, aggregateSensitive, out)
 			}
 		}
 		return
@@ -149,7 +159,7 @@ func walkConsistency(path cty.Path, planned, cfgVal, applied cty.Value, out *[]c
 		cfgElems := cfgVal.AsValueSlice()
 		appliedElems := applied.AsValueSlice()
 		for i, p := range plannedElems {
-			walkConsistency(appendPath(path, cty.IndexStep{Key: cty.NumberIntVal(int64(i))}), p, cfgElems[i], appliedElems[i], out)
+			walkConsistency(appendPath(path, cty.IndexStep{Key: cty.NumberIntVal(int64(i))}), p, cfgElems[i], appliedElems[i], block, spec, aggregateSensitive, out)
 		}
 		return
 
@@ -212,6 +222,13 @@ func appendPath(path cty.Path, step cty.PathStep) cty.Path {
 	out := make(cty.Path, len(path), len(path)+1)
 	copy(out, path)
 	return append(out, step)
+}
+
+func sensitiveDiagnosticCollection(block *provider.SchemaBlock, spec *sensitive.Spec, path cty.Path, ty cty.Type) bool {
+	if len(path) == 0 || (!ty.IsMapType() && !ty.IsListType() && !ty.IsSetType() && !ty.IsTupleType()) {
+		return false
+	}
+	return redactConsistencyValue(block, spec, path)
 }
 
 // redactConsistencyValue applies both the effective resource sensitivity

@@ -82,13 +82,13 @@ func TestAttemptedChangesMapKeyUnionAndEmptyMaps(t *testing.T) {
 		"added":   cty.StringVal("new"),
 		"changed": cty.StringVal("after"),
 	})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{"tags": {Type: cty.Map(cty.String), Optional: true}}, Blocks: map[string]*provider.NestedBlock{}}
 	var changes []attemptedChange
-	attemptedChanges(cty.Path{cty.GetAttrStep{Name: "tags"}}, before, after, &changes)
+	attemptedChanges(cty.Path{cty.GetAttrStep{Name: "tags"}}, before, after, block, nil, &changes)
 	if len(changes) != 3 {
 		t.Fatalf("changes = %#v", changes)
 	}
 
-	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{"tags": {Type: cty.Map(cty.String), Optional: true}}, Blocks: map[string]*provider.NestedBlock{}}
 	root := func(v cty.Value) cty.Value { return cty.ObjectVal(map[string]cty.Value{"tags": v}) }
 	ds := attemptedChangeSummary("test.x", "update", block, nil, root(before), root(after))
 	for _, want := range []string{
@@ -106,7 +106,7 @@ func TestAttemptedChangesMapKeyUnionAndEmptyMaps(t *testing.T) {
 	empty := cty.MapValEmpty(cty.String)
 	for _, pair := range [][2]cty.Value{{empty, after}, {before, empty}} {
 		changes = nil
-		attemptedChanges(nil, pair[0], pair[1], &changes)
+		attemptedChanges(nil, pair[0], pair[1], nil, nil, &changes)
 		if len(changes) == 0 {
 			t.Fatalf("empty-map pair produced no changes: %#v", pair)
 		}
@@ -124,7 +124,7 @@ func TestAttemptedChangesCollectionsComparedWholesale(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			path := cty.Path{cty.GetAttrStep{Name: "collection"}}
 			var changes []attemptedChange
-			attemptedChanges(path, tc.before, tc.after, &changes)
+			attemptedChanges(path, tc.before, tc.after, nil, nil, &changes)
 			if len(changes) != 1 || renderedPath(changes[0].path) != "collection" {
 				t.Fatalf("changes = %#v", changes)
 			}
