@@ -11,6 +11,7 @@ import (
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/plan"
 	"github.com/tchori-labs/tchori/internal/provider"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 )
 
 type consistencySide struct {
@@ -28,7 +29,7 @@ type consistencyDivergence struct {
 // (shallow knownness), just like resolvePlannedUnknowns: a resource object
 // normally contains unknown computed leaves and must still be traversed.
 // IsWhollyKnown is reserved for values compared or rendered as a whole.
-func checkResultConsistency(addr string, block *provider.SchemaBlock, planned, cfgVal, newState cty.Value) diag.Diagnostics {
+func checkResultConsistency(addr string, block *provider.SchemaBlock, spec *sensitive.Spec, planned, cfgVal, newState cty.Value) diag.Diagnostics {
 	if newState.IsNull() {
 		return diag.Diagnostics{diag.Errorf(addr, "provider returned no state after apply",
 			"a create or update must return the resource object; nothing was persisted for this address")}
@@ -50,7 +51,7 @@ func checkResultConsistency(addr string, block *provider.SchemaBlock, planned, c
 	var detail strings.Builder
 	detail.WriteString("the provider accepted the apply without honouring these configured attributes:\n")
 	for _, d := range divergences {
-		redact := redactConsistencyValue(block, d.path)
+		redact := redactConsistencyValue(block, spec, d.path)
 		_, _ = fmt.Fprintf(&detail, "  %s: planned %s, applied %s\n",
 			renderedPath(d.path), renderConsistencySide(d.planned, redact), renderConsistencySide(d.applied, redact))
 	}
@@ -213,11 +214,18 @@ func appendPath(path cty.Path, step cty.PathStep) cty.Path {
 	return append(out, step)
 }
 
-// redactConsistencyValue applies the two distinct schema rules: an ordinary
-// attribute's own Sensitive bit governs its complete subtree; a nested block
-// compared as a whole is redacted if any descendant is sensitive. Paths that
-// cannot be resolved fail closed.
-func redactConsistencyValue(block *provider.SchemaBlock, path cty.Path) bool {
+// redactConsistencyValue applies both the effective resource sensitivity
+// contract and provider schema sensitivity. Effective paths redact their
+// complete subtree and any aggregate containing a sensitive descendant.
+// Schema paths that cannot be resolved fail closed.
+func redactConsistencyValue(block *provider.SchemaBlock, spec *sensitive.Spec, path cty.Path) bool {
+	if spec != nil && spec.RedactsDiagnosticPath(path) {
+		return true
+	}
+	return redactSchemaValue(block, path)
+}
+
+func redactSchemaValue(block *provider.SchemaBlock, path cty.Path) bool {
 	cur := block
 	for i := 0; i < len(path); i++ {
 		step, ok := path[i].(cty.GetAttrStep)
@@ -238,7 +246,7 @@ func redactConsistencyValue(block *provider.SchemaBlock, path cty.Path) bool {
 			if i >= len(path)-1 {
 				return blockHasSensitiveDescendant(nested)
 			}
-			return redactConsistencyValue(nested, path[i+1:])
+			return redactSchemaValue(nested, path[i+1:])
 		}
 		nb, ok := cur.Blocks[step.Name]
 		if !ok || nb == nil || nb.Block == nil {

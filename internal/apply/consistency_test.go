@@ -8,6 +8,7 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/tchori-labs/tchori/internal/provider"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 )
 
 func scalarBlock(sensitive bool) *provider.SchemaBlock {
@@ -26,7 +27,7 @@ func TestNestedTypeConsistencyDiagnosticRedactsSecret(t *testing.T) {
 	}}
 	planned := cty.ObjectVal(map[string]cty.Value{"credentials": cty.ObjectVal(map[string]cty.Value{"token": cty.StringVal("synthetic-before")})})
 	applied := cty.ObjectVal(map[string]cty.Value{"credentials": cty.ObjectVal(map[string]cty.Value{"token": cty.StringVal("synthetic-after")})})
-	ds := checkResultConsistency("test.demo", block, planned, planned, applied)
+	ds := checkResultConsistency("test.demo", block, nil, planned, planned, applied)
 	if !ds.HasErrors() {
 		t.Fatal("changed authored value must report inconsistency")
 	}
@@ -48,7 +49,7 @@ func TestCheckResultConsistencyTraversesShallowKnownRoot(t *testing.T) {
 	if planned.IsWhollyKnown() {
 		t.Fatal("fixture planned root unexpectedly wholly known")
 	}
-	ds := checkResultConsistency("test.x", scalarBlock(false), planned, cfg, applied)
+	ds := checkResultConsistency("test.x", scalarBlock(false), nil, planned, cfg, applied)
 	if len(ds) != 1 || ds[0].Summary != "provider produced inconsistent result after apply" {
 		t.Fatalf("diagnostics = %#v", ds)
 	}
@@ -69,7 +70,7 @@ func TestCheckResultConsistencyRootResultsAreNamed(t *testing.T) {
 		{"unknown", "provider returned unknown state after apply", cty.UnknownVal(ty)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ds := checkResultConsistency("test.x", scalarBlock(false), planned, cfg, tc.state)
+			ds := checkResultConsistency("test.x", scalarBlock(false), nil, planned, cfg, tc.state)
 			if len(ds) != 1 || ds[0].Summary != tc.summary {
 				t.Fatalf("diagnostics = %#v", ds)
 			}
@@ -109,7 +110,7 @@ func TestCheckResultConsistencyMapKeySet(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			nullSecret := cty.NullVal(cty.String)
-			ds := checkResultConsistency("test.x", mapBlock(false), mapRoot(tc.plan, nullSecret), mapRoot(tc.cfg, nullSecret), mapRoot(tc.got, nullSecret))
+			ds := checkResultConsistency("test.x", mapBlock(false), nil, mapRoot(tc.plan, nullSecret), mapRoot(tc.cfg, nullSecret), mapRoot(tc.got, nullSecret))
 			if len(tc.want) == 0 {
 				if len(ds) != 0 {
 					t.Fatalf("diagnostics = %#v", ds)
@@ -137,11 +138,11 @@ func TestCheckResultConsistencyMapAuthorshipAndRedaction(t *testing.T) {
 	nullSecret := cty.NullVal(cty.String)
 
 	// A null map container is wholly unauthored, including its key set.
-	if ds := checkResultConsistency("test.x", mapBlock(false), mapRoot(plan, nullSecret), mapRoot(cty.NullVal(cty.Map(cty.String)), nullSecret), mapRoot(got, nullSecret)); len(ds) != 0 {
+	if ds := checkResultConsistency("test.x", mapBlock(false), nil, mapRoot(plan, nullSecret), mapRoot(cty.NullVal(cty.Map(cty.String)), nullSecret), mapRoot(got, nullSecret)); len(ds) != 0 {
 		t.Fatalf("unauthored map diagnostics = %#v", ds)
 	}
 
-	ds := checkResultConsistency("test.x", mapBlock(true), mapRoot(plan, nullSecret), mapRoot(plan, nullSecret), mapRoot(got, nullSecret))
+	ds := checkResultConsistency("test.x", mapBlock(true), nil, mapRoot(plan, nullSecret), mapRoot(plan, nullSecret), mapRoot(got, nullSecret))
 	if len(ds) != 1 || strings.Contains(ds[0].Detail, `"p"`) || !strings.Contains(ds[0].Detail, "(sensitive value)") {
 		t.Fatalf("sensitive detail = %#v", ds)
 	}
@@ -151,7 +152,7 @@ func TestCheckResultConsistencyContainerAndWholesaleUnknowns(t *testing.T) {
 	block := mapBlock(false)
 	tags := cty.MapVal(map[string]cty.Value{"a": cty.StringVal("visible")})
 	nullSecret := cty.NullVal(cty.String)
-	ds := checkResultConsistency("test.x", block, mapRoot(tags, nullSecret), mapRoot(tags, nullSecret), mapRoot(cty.NullVal(cty.Map(cty.String)), nullSecret))
+	ds := checkResultConsistency("test.x", block, nil, mapRoot(tags, nullSecret), mapRoot(tags, nullSecret), mapRoot(cty.NullVal(cty.Map(cty.String)), nullSecret))
 	if len(ds) != 1 || !strings.Contains(ds[0].Detail, `tags: planned {"a":"visible"}, applied null`) {
 		t.Fatalf("null container detail = %#v", ds)
 	}
@@ -160,10 +161,10 @@ func TestCheckResultConsistencyContainerAndWholesaleUnknowns(t *testing.T) {
 	root := func(v cty.Value) cty.Value { return cty.ObjectVal(map[string]cty.Value{"items": v}) }
 	planned := cty.ListVal([]cty.Value{cty.StringVal("a")})
 	partial := cty.ListVal([]cty.Value{cty.UnknownVal(cty.String)})
-	if ds := checkResultConsistency("test.x", listBlock, root(partial), root(planned), root(planned)); len(ds) != 0 {
+	if ds := checkResultConsistency("test.x", listBlock, nil, root(partial), root(planned), root(planned)); len(ds) != 0 {
 		t.Fatalf("partially unknown config should be skipped: %#v", ds)
 	}
-	ds = checkResultConsistency("test.x", listBlock, root(planned), root(planned), root(partial))
+	ds = checkResultConsistency("test.x", listBlock, nil, root(planned), root(planned), root(partial))
 	if len(ds) != 1 || !strings.Contains(ds[0].Detail, "applied (unknown value)") || strings.Contains(ds[0].Detail, "marshal") {
 		t.Fatalf("partially unknown applied detail = %#v", ds)
 	}
@@ -202,7 +203,7 @@ func TestCheckResultConsistencyOrderedCollectionsTraverseConcreteSiblings(t *tes
 			cfg := tc.make(unknown, cty.StringVal("planned"))
 			applied := tc.make(cty.StringVal("provider-computed"), cty.StringVal("applied"))
 
-			ds := checkResultConsistency("test.x", block, root(planned), root(cfg), root(applied))
+			ds := checkResultConsistency("test.x", block, nil, root(planned), root(cfg), root(applied))
 			if len(ds) != 1 || !strings.Contains(ds[0].Detail, `items[1]: planned "planned", applied "applied"`) {
 				t.Fatalf("diagnostics = %#v", ds)
 			}
@@ -238,7 +239,7 @@ func TestCheckResultConsistencyNestedListTraversesAndRedactsPerLeaf(t *testing.T
 		entry(cty.StringVal("carol"), cty.StringVal("also-never-print")),
 	)
 
-	ds := checkResultConsistency("test.x", block, planned, cfg, applied)
+	ds := checkResultConsistency("test.x", block, nil, planned, cfg, applied)
 	if len(ds) != 1 || !strings.Contains(ds[0].Detail, `credentials[0].user: planned "alice", applied "bob"`) {
 		t.Fatalf("diagnostics = %#v", ds)
 	}
@@ -261,8 +262,46 @@ func TestCheckResultConsistencyNestedBlockRedaction(t *testing.T) {
 	planned := cty.ObjectVal(map[string]cty.Value{"endpoints": cty.ListVal([]cty.Value{endpoint}), "probes": cty.SetVal([]cty.Value{probe})})
 	cfg := planned
 	applied := cty.ObjectVal(map[string]cty.Value{"endpoints": cty.ListValEmpty(endpoint.Type()), "probes": cty.SetValEmpty(probe.Type())})
-	ds := checkResultConsistency("test.x", block, planned, cfg, applied)
+	ds := checkResultConsistency("test.x", block, nil, planned, cfg, applied)
 	if len(ds) != 1 || strings.Contains(ds[0].Detail, "never-print") || !strings.Contains(ds[0].Detail, "endpoints: planned (sensitive value), applied (sensitive value)") || !strings.Contains(ds[0].Detail, `"/ok"`) {
 		t.Fatalf("nested detail = %#v", ds)
+	}
+}
+
+func TestCheckResultConsistencyUsesEffectiveSensitivePaths(t *testing.T) {
+	profileType := cty.Object(map[string]cty.Type{"label": cty.String, "token": cty.String})
+	block := &provider.SchemaBlock{Attributes: map[string]*provider.Attr{
+		"profile": {
+			Type:       profileType,
+			Optional:   true,
+			NestedType: map[string]*provider.Attr{"label": {Type: cty.String, Optional: true}, "token": {Type: cty.String, Optional: true}},
+		},
+	}}
+	spec, resolveDs := sensitive.Resolve(block, []string{"profile.token"}, map[string]any{
+		"profile": map[string]any{"label": "visible-before", "token": "planned-secret"},
+	})
+	if resolveDs.HasErrors() {
+		t.Fatalf("Resolve: %#v", resolveDs)
+	}
+	profile := func(label, token string) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{"label": cty.StringVal(label), "token": cty.StringVal(token)})
+	}
+	root := func(value cty.Value) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{"profile": value})
+	}
+	planned := root(profile("visible-before", "planned-secret"))
+	applied := root(profile("visible-after", "applied-secret"))
+
+	ds := checkResultConsistency("test.x", block, spec, planned, planned, applied)
+	if len(ds) != 1 || !strings.Contains(ds[0].Detail, `profile.label: planned "visible-before", applied "visible-after"`) ||
+		!strings.Contains(ds[0].Detail, "profile.token: planned (sensitive value), applied (sensitive value)") ||
+		strings.Contains(ds[0].Detail, "planned-secret") || strings.Contains(ds[0].Detail, "applied-secret") {
+		t.Fatalf("leaf diagnostics = %#v", ds)
+	}
+
+	ds = checkResultConsistency("test.x", block, spec, planned, planned, root(cty.NullVal(profileType)))
+	if len(ds) != 1 || !strings.Contains(ds[0].Detail, "profile: planned (sensitive value), applied (sensitive value)") ||
+		strings.Contains(ds[0].Detail, "planned-secret") || strings.Contains(ds[0].Detail, "visible-before") {
+		t.Fatalf("aggregate diagnostics = %#v", ds)
 	}
 }

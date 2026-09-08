@@ -9,6 +9,7 @@ import (
 
 	"github.com/tchori-labs/tchori/internal/diag"
 	"github.com/tchori-labs/tchori/internal/provider"
+	"github.com/tchori-labs/tchori/internal/sensitive"
 )
 
 type attemptedChange struct {
@@ -78,7 +79,7 @@ func attemptedChanges(path cty.Path, prior, planned cty.Value, out *[]attemptedC
 // attemptedChangeSummary describes the exact before/after values sent to an
 // ApplyResource update. Creates have no prior object and therefore no useful
 // before/after attribute list.
-func attemptedChangeSummary(addr, action string, block *provider.SchemaBlock, prior, planned cty.Value) diag.Diagnostics {
+func attemptedChangeSummary(addr, action string, block *provider.SchemaBlock, spec *sensitive.Spec, prior, planned cty.Value) diag.Diagnostics {
 	if !prior.IsKnown() || prior.IsNull() || !prior.Type().IsObjectType() {
 		return nil
 	}
@@ -95,7 +96,7 @@ func attemptedChangeSummary(addr, action string, block *provider.SchemaBlock, pr
 	var detail strings.Builder
 	_, _ = fmt.Fprintf(&detail, "the failing %s for %s attempted these changes:\n", action, addr)
 	for _, change := range changes {
-		redact := redactConsistencyValue(block, change.path)
+		redact := redactConsistencyValue(block, spec, change.path)
 		_, _ = fmt.Fprintf(&detail, "  %s: %s -> %s\n", renderedPath(change.path),
 			renderConsistencySide(consistencySide{value: change.before}, redact),
 			renderConsistencySide(consistencySide{value: change.after}, redact))

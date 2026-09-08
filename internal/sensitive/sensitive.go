@@ -284,6 +284,20 @@ func typePathExists(ty cty.Type, parts []string) bool {
 	return typePathExists(ty.AttributeType(parts[0]), parts[1:])
 }
 
+// RedactsDiagnosticPath reports whether path is sensitive itself, lies below
+// a sensitive path, or is an aggregate containing a sensitive descendant.
+// Diagnostic surfaces intentionally ignore raw-literal exemptions.
+func (s *Spec) RedactsDiagnosticPath(path cty.Path) bool {
+	if s == nil {
+		return false
+	}
+	logical := logicalPath(path)
+	if logical == "" {
+		return len(s.paths) != 0
+	}
+	return coveredBySensitivePath(logical, s.paths) || hasSensitiveDescendant(logical, s.paths)
+}
+
 // Paths returns the sorted effective path set. Literal exemptions never narrow it.
 func (s *Spec) Paths() []string { return append([]string(nil), s.paths...) }
 

@@ -2594,6 +2594,86 @@ func TestApplyReportsPartialProgressAndAttemptedUpdateAfterProvider400(t *testin
 	}
 }
 
+func TestApplyProviderErrorRedactsEffectiveSensitiveAttribute(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		oldValue, newValue string
+		removeDeclaration  bool
+	}{
+		{name: "current policy", oldValue: "provider-error-old-sentinel", newValue: "provider-error-new-sentinel"},
+		{name: "persisted policy after config removal", oldValue: "persisted-old-sentinel", newValue: "persisted-new-sentinel", removeDeclaration: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const envName = "TCHORI_TEST_DIAGNOSTIC_LABEL"
+			t.Setenv(envName, tc.oldValue)
+			resource := nestedThing("redaction", "stable", map[string]any{
+				"label": map[string]any{"env": envName},
+			})
+			resource.SensitiveAttributes = []string{"settings.label"}
+			h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+			ctx := context.Background()
+
+			st := loadState(t, h.statePath)
+			if _, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+				t.Fatalf("seed Apply: %#v", ds)
+			}
+
+			t.Setenv(envName, tc.newValue)
+			resource.Config["name"] = "diagnostic_error"
+			if tc.removeDeclaration {
+				resource.SensitiveAttributes = nil
+			}
+			st = loadState(t, h.statePath)
+			_, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+			if !ds.HasErrors() || diagnosticWithSummary(ds, "diagnostic update failed") == nil {
+				t.Fatalf("Apply diagnostics = %#v, want provider error", ds)
+			}
+			attempted := diagnosticWithSummary(ds, "attempted change")
+			if attempted == nil {
+				t.Fatalf("diagnostics = %#v, want attempted-change context", ds)
+			}
+			if strings.Contains(attempted.Detail, tc.oldValue) || strings.Contains(attempted.Detail, tc.newValue) ||
+				!strings.Contains(attempted.Detail, "settings.label: (sensitive value) -> (sensitive value)") {
+				t.Fatalf("attempted-change diagnostic exposed effective sensitive value: %q", attempted.Detail)
+			}
+		})
+	}
+}
+
+func TestApplyConsistencyRedactsEffectiveSensitiveAttribute(t *testing.T) {
+	const (
+		envName  = "TCHORI_TEST_CONSISTENCY_LABEL"
+		oldValue = "consistency-old-sentinel"
+		newValue = "consistency-new-sentinel"
+	)
+	t.Setenv(envName, oldValue)
+	resource := nestedThing("consistency", "stable", map[string]any{
+		"label": map[string]any{"env": envName},
+	})
+	resource.SensitiveAttributes = []string{"settings.label"}
+	h := newHarness(t, map[string]*config.Resource{resource.Address: resource})
+	ctx := context.Background()
+
+	st := loadState(t, h.statePath)
+	if _, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath); ds.HasErrors() {
+		t.Fatalf("seed Apply: %#v", ds)
+	}
+
+	t.Setenv(envName, newValue)
+	resource.Config["name"] = "diagnostic_inconsistent"
+	st = loadState(t, h.statePath)
+	_, ds := apply.Apply(ctx, h.plan(t, st, false), h.cfg, h.providers, h.schemas, st, h.statePath)
+	consistency := diagnosticWithSummary(ds, "provider produced inconsistent result after apply")
+	if consistency == nil {
+		t.Fatalf("diagnostics = %#v, want inconsistent-result error", ds)
+	}
+	if strings.Contains(consistency.Detail, oldValue) || strings.Contains(consistency.Detail, newValue) ||
+		strings.Contains(consistency.Detail, "consistency-applied-sentinel") ||
+		!strings.Contains(consistency.Detail, "settings.label: planned (sensitive value), applied (sensitive value)") {
+		t.Fatalf("consistency diagnostic exposed effective sensitive value: %q", consistency.Detail)
+	}
+}
+
 func TestApplyIndependentChangesContinueAfterFirstAndMiddleFailure(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
