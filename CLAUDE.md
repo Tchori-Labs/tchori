@@ -24,8 +24,26 @@ private history and issue backlog. Directory names are not repository identity.
 
 - Conventional commits only: `feat:`, `fix:`, `test:`, `chore:`, `docs:`,
   `refactor:`. One logical change per commit.
-- Never merge or approve your own PRs — CODEOWNERS review is the apply gate,
-  same as `main`.
+- Never approve your own PRs or submit a CODEOWNER review using a human's
+  account. Human review and execution of a merge are separate actions.
+- An agent may execute a merge, including for an agent-authored PR, only when
+  the human CODEOWNER explicitly authorizes that PR and its exact current
+  head SHA. Authorization may be given in the task conversation or on GitHub;
+  record its source, authorizing CODEOWNER, and head SHA in a PR comment,
+  identifying the executor as Tchorizo, before merging.
+- Delegated execution does not replace review: the required human CODEOWNER
+  approval must already be recorded on GitHub for the current head, required
+  checks must pass, and all branch-protection and review requirements must
+  remain satisfied. New commits invalidate the merge authorization.
+- Execute an authorized merge as Tchorizo with an expected-head SHA check.
+  Never use a human's credentials, administrator bypass, force push, or a
+  protection change to complete it. Preserve permanent branches such as
+  `develop`; if any gate is unmet, stop and report the blocker.
+- This delegation applies only to PR merges, not release tags, workflow
+  dispatches, deployment approvals, publication, or administrative changes.
+  It becomes available only after independent human review and merge of this
+  policy; it cannot authorize its own adoption or override higher-priority
+  session instructions.
 
 ## Scope discipline
 
